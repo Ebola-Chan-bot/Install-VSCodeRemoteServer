@@ -289,7 +289,7 @@ $最大恢复次数 = [int]'__最大恢复次数__'
 $超时秒数 = [int]'__超时秒数__'
 $系统架构 = 取-系统架构标识
 $最终安装目录 = 取-安装目录 -通道 $发布通道 -版本提交号 $提交号
-$压缩包路径 = Join-Path $最终安装目录 'vscode-server.zip'
+$压缩包路径 = Join-Path $最终安装目录 ('vscode-server-{0}.zip' -f ([guid]::NewGuid().ToString('N')))
 $上传压缩包路径 = Join-Path $HOME 'vscode-server-upload-temp.zip'
 $下载地址 = 取-下载地址 -通道 $发布通道 -版本提交号 $提交号 -架构 $系统架构
 $任务名称 = 'VSCode远程服务-' + $提交号 + '-' + ([guid]::NewGuid().ToString('N'))
@@ -309,16 +309,23 @@ if (Test-Path $最终安装目录) {
 }
 Write-Host '步骤D: 创建安装目录...'
 New-Item -ItemType Directory -Force $最终安装目录 | Out-Null
-if (Test-Path $压缩包路径) {
-	Write-Host '步骤D1: 清理旧压缩包...'
-	Remove-Item $压缩包路径 -Force -ErrorAction SilentlyContinue
-}
+Write-Host '步骤D1: 清理旧压缩包...'
+Get-ChildItem -Path $最终安装目录 -Filter 'vscode-server*.zip' -ErrorAction SilentlyContinue |
+	ForEach-Object {
+		Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+	}
 Write-Host '步骤E: 检查已上传压缩包...'
 if (-not (Test-Path $上传压缩包路径)) {
 	throw ('未找到已上传的压缩包: {0}' -f $上传压缩包路径)
 }
 Write-Host '步骤F: 移动已上传压缩包到安装目录...'
-Move-Item -Path $上传压缩包路径 -Destination $压缩包路径 -Force
+try {
+	Move-Item -Path $上传压缩包路径 -Destination $压缩包路径 -Force -ErrorAction Stop
+} catch {
+	Write-Host ('移动失败，改用复制+删除: {0}' -f $_.Exception.Message)
+	Copy-Item -Path $上传压缩包路径 -Destination $压缩包路径 -Force -ErrorAction Stop
+	Remove-Item -Path $上传压缩包路径 -Force -ErrorAction SilentlyContinue
+}
 Write-Host '步骤G: 压缩包已就位。'
 
 if (-not (Test-Path $压缩包路径)) {

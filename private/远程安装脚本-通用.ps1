@@ -183,7 +183,7 @@ $最大恢复次数 = [int]'__最大恢复次数__'
 $超时秒数 = [int]'__超时秒数__'
 $系统架构 = 取-系统架构标识
 $最终安装目录 = 取-安装目录 -通道 $发布通道 -版本提交号 $提交号
-$压缩包路径 = Join-Path $最终安装目录 'vscode-server.zip'
+$下载压缩包路径 = Join-Path $最终安装目录 ('vscode-server-download-{0}.zip' -f ([guid]::NewGuid().ToString('N')))
 $下载地址 = 取-下载地址 -通道 $发布通道 -版本提交号 $提交号 -架构 $系统架构
 $任务名称 = 'VSCode远程服务-' + $提交号
 
@@ -202,17 +202,17 @@ if (Test-Path $最终安装目录) {
 New-Item -ItemType Directory -Force $最终安装目录 | Out-Null
 Start-Service BITS -ErrorAction SilentlyContinue
 
-$旧任务 = 取-BITS任务 -任务名称 $任务名称 -目标路径 $压缩包路径
+$旧任务 = 取-BITS任务 -任务名称 $任务名称 -目标路径 $下载压缩包路径
 if ($null -ne $旧任务) {
 	Remove-BitsTransfer -BitsJob $旧任务 -Confirm:$false -ErrorAction SilentlyContinue
 }
 
 Write-Host '开始通过 BITS 下载压缩包。'
-Start-BitsTransfer -Source $下载地址 -Destination $压缩包路径 -DisplayName $任务名称 -Asynchronous | Out-Null
+Start-BitsTransfer -Source $下载地址 -Destination $下载压缩包路径 -DisplayName $任务名称 -Asynchronous | Out-Null
 
 $新任务 = $null
 for ($序号 = 0; $序号 -lt 10; $序号++) {
-	$新任务 = 取-BITS任务 -任务名称 $任务名称 -目标路径 $压缩包路径
+	$新任务 = 取-BITS任务 -任务名称 $任务名称 -目标路径 $下载压缩包路径
 	if ($null -ne $新任务) {
 		break
 	}
@@ -224,14 +224,14 @@ if ($null -eq $新任务) {
 	throw '已发起下载，但未找到新建的 BITS 任务。'
 }
 
-等待-BITS任务完成 -任务名称 $任务名称 -目标路径 $压缩包路径 -恢复上限 $最大恢复次数 -等待秒数 $轮询秒数 -超时秒数 $超时秒数
+等待-BITS任务完成 -任务名称 $任务名称 -目标路径 $下载压缩包路径 -恢复上限 $最大恢复次数 -等待秒数 $轮询秒数 -超时秒数 $超时秒数
 
-if (-not (Test-Path $压缩包路径)) {
-	throw ('下载完成后未找到压缩包: {0}' -f $压缩包路径)
+if (-not (Test-Path $下载压缩包路径)) {
+	throw ('下载完成后未找到压缩包: {0}' -f $下载压缩包路径)
 }
 
 Write-Host '下载完成，开始解压。'
-展开-服务器压缩包 -压缩包路径 $压缩包路径 -目标目录 $最终安装目录
+展开-服务器压缩包 -压缩包路径 $下载压缩包路径 -目标目录 $最终安装目录
 
 Write-Host '安装完成，当前目录内容如下。'
 Get-ChildItem -Force $最终安装目录 | Select-Object Name, Length, Mode | Format-Table -AutoSize

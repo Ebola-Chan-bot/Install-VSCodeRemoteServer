@@ -1,6 +1,6 @@
 @{
 	RootModule           = '安装-VSCode远程服务.psm1'
-	ModuleVersion        = '1.0.2'
+	ModuleVersion        = '1.0.3'
 	GUID                 = '2e2606a2-1d8b-418e-9d6d-a714a7704bdc'
 	Author               = '埃博拉酱-机器人'
 	CompanyName          = '一致行动党'
@@ -18,7 +18,7 @@
 			LicenseUri   = 'https://opensource.org/licenses/MIT'
 			ProjectUri   = ''
 			ReleaseNotes = @'
-支持Win7
+远程压缩包改用唯一文件名并清理同类残留，避免旧 zip 被占用导致下载或移动失败（0x80070020）。
 '@
 		}
 	}
