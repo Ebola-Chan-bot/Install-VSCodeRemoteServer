@@ -16,7 +16,7 @@
 		PSData = @{
 			Tags         = @('PowerShell', 'VSCode', 'RemoteSSH', 'VSCodeServer', 'Windows', 'Linux', 'BITS', 'SSH')
 			LicenseUri   = 'https://opensource.org/licenses/MIT'
-			ProjectUri   = ''
+			ProjectUri   = 'https://github.com/Ebola-Chan-bot/Install-VSCodeRemoteServer'
 			ReleaseNotes = @'
 新增 Linux 远程主机支持：自动检测远程系统类型（无需用户输入），Linux 主机通过 sh 脚本安装 VS Code Server，自动检测系统架构（x64/arm64/armhf），支持 prss 与官方备用下载源。
 '@
