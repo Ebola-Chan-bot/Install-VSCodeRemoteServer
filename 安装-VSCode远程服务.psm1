@@ -5,6 +5,11 @@
 $script:模块根目录 = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:远程脚本_通用 = Get-Content -Path (Join-Path $script:模块根目录 'private\远程安装脚本-通用.ps1') -Raw -Encoding UTF8
 $script:远程脚本_Win7 = Get-Content -Path (Join-Path $script:模块根目录 'private\远程安装脚本-Win7.ps1') -Raw -Encoding UTF8
+$script:远程脚本_Linux = Get-Content -Path (Join-Path $script:模块根目录 'private\远程安装脚本-Linux.sh') -Raw -Encoding UTF8
+
+# SSH 密码复用状态（由 初始化-SSH密码复用 设置）
+$script:SSH密码选项 = @()
+$script:密码已注入 = $false
 
 function 安装-VSCode远程服务 {
 	[CmdletBinding()]
@@ -52,8 +57,14 @@ function 安装-VSCode远程服务 {
 				return $null
 			}
 
-			$版本输出 = & $命令路径 --version 2>$null
-			if ($LASTEXITCODE -ne 0 -or $版本输出.Count -lt 2) {
+			# --version 失败属于预期情况（命令存在但无法执行或输出格式不符），
+			# 其 stderr 在 PS 5.1 下会被提升为终止性错误，此处静默捕获并返回 $null，不影响后续版本探测逻辑
+			try {
+				$版本输出 = & $命令路径 --version
+				if ($LASTEXITCODE -ne 0 -or $版本输出.Count -lt 2) {
+					return $null
+				}
+			} catch {
 				return $null
 			}
 
@@ -112,6 +123,67 @@ function 安装-VSCode远程服务 {
 		return ('{0}@{1}' -f $账户, $主机)
 	}
 
+	function 初始化-SSH密码复用 {
+		param(
+			[string]$连接目标,
+			[int]$端口
+		)
+
+		$script:SSH密码选项 = @()
+		$script:密码已注入 = $false
+
+		$ssh命令 = Get-Command ssh -ErrorAction SilentlyContinue | Select-Object -First 1
+		if ($null -eq $ssh命令) {
+			throw '未找到 ssh 命令，无法连接远程服务器。'
+		}
+
+		# 先用 BatchMode 探测：免密（密钥/agent）可直接成功；需要密码时会立即失败。
+		# 认证失败的 stderr 在 PS 5.1 下会被提升为终止性错误，此处静默捕获并视为"需要密码"，进入密码收集流程，不影响功能
+		try {
+			& $ssh命令.Source '-p' $端口 '-o' 'BatchMode=yes' '-o' 'ConnectTimeout=10' $连接目标 'true' | Out-Null
+			if ($LASTEXITCODE -eq 0) {
+				Write-Host '检测到远程主机已配置免密登录，无需输入密码。'
+				return
+			}
+		} catch {
+			# 已知且无害：BatchMode 下密码认证必失败，这正是进入密码收集流程的信号
+		}
+
+		# 需要密码：交互收集一次，之后通过 SSH_ASKPASS 注入到后续每次 ssh/scp 调用
+		$安全密码 = Read-Host ('请输入 {0} 的 SSH 密码（仅本次会话使用，不会保存）' -f $连接目标) -AsSecureString
+		$密码指针 = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($安全密码)
+		try {
+			$明文密码 = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($密码指针)
+		} finally {
+			[System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($密码指针)
+		}
+
+		if ([string]::IsNullOrEmpty($明文密码)) {
+			throw '密码不能为空。'
+		}
+
+		# SSH_ASKPASS 协议要求一个可执行程序：ssh 需要密码时执行它并把 stdout 第一行当作密码。
+		# 密码本体只保存在当前进程的环境变量中（不写盘），模块自带的 bat 负责把该环境变量打印出来。
+		$env:VSCODE_SSH密码 = $明文密码
+		$env:SSH_ASKPASS = Join-Path $script:模块根目录 'private\SSH密码回显.bat'
+		$env:SSH_ASKPASS_REQUIRE = 'force'
+		# 注意：不要加 BatchMode=yes——它会禁用 askpass 机制，导致密码无法注入
+		$script:SSH密码选项 = @()
+		$script:密码已注入 = $true
+
+		Write-Host '密码已收集，后续所有 SSH/SCP 操作将自动复用，无需再次输入。'
+	}
+
+	function 清除-SSH密码复用 {
+		# 清理敏感状态（无害清理，逐条容错）
+		if ($script:密码已注入) {
+			Remove-Item Env:VSCODE_SSH密码 -ErrorAction SilentlyContinue
+			Remove-Item Env:SSH_ASKPASS -ErrorAction SilentlyContinue
+			Remove-Item Env:SSH_ASKPASS_REQUIRE -ErrorAction SilentlyContinue
+			$script:密码已注入 = $false
+		}
+	}
+
 	function 执行-SSH命令 {
 		param(
 			[string]$连接目标,
@@ -125,7 +197,7 @@ function 安装-VSCode远程服务 {
 			throw '未找到 ssh 命令，无法连接远程服务器。'
 		}
 
-		$ssh参数 = @('-p', $端口)
+		$ssh参数 = @('-p', $端口) + $script:SSH密码选项
 		if ($TTY) { $ssh参数 += '-t' }
 		$ssh参数 += $连接目标
 		$ssh参数 += $命令文本
@@ -146,12 +218,12 @@ function 安装-VSCode远程服务 {
 
 		$SCP命令 = Get-Command scp -ErrorAction SilentlyContinue | Select-Object -First 1
 		if ($null -eq $SCP命令) {
-			throw '未找到 scp 命令，无法上传远程安装脚本。'
+			throw '未找到 scp 命令。请确保已安装 OpenSSH 客户端。'
 		}
 
-		& $SCP命令.Source '-P' $端口 $本地路径 ('{0}:{1}' -f $连接目标, $远程路径)
+		& $SCP命令.Source (@('-P', $端口) + $script:SSH密码选项 + @($本地路径, ('{0}:{1}' -f $连接目标, $远程路径)))
 		if ($LASTEXITCODE -ne 0) {
-			throw ('SCP 上传失败，退出码: {0}' -f $LASTEXITCODE)
+			throw ('SCP 上传失败，退出码: {0}。请检查网络连接与远程主机权限。' -f $LASTEXITCODE)
 		}
 	}
 
@@ -186,7 +258,11 @@ function 安装-VSCode远程服务 {
 
 		if (-not (Test-Path $本地压缩包路径)) {
 			Write-Host ('本机开始下载 VS Code Server 压缩包: {0}' -f $下载地址)
-			Invoke-WebRequest -Uri $下载地址 -OutFile $本地压缩包路径 -UseBasicParsing
+			try {
+				Invoke-WebRequest -Uri $下载地址 -OutFile $本地压缩包路径 -UseBasicParsing
+			} catch {
+				throw ('本机下载 VS Code Server 压缩包失败: {0}' -f $_.Exception.Message)
+			}
 		}
 
 		if (-not (Test-Path $本地压缩包路径)) {
@@ -196,30 +272,58 @@ function 安装-VSCode远程服务 {
 		return $本地压缩包路径
 	}
 
+	function 探测-远程系统类型 {
+		param(
+			[string]$连接目标,
+			[int]$端口
+		)
+
+		$ssh命令 = Get-Command ssh -ErrorAction SilentlyContinue | Select-Object -First 1
+		if ($null -eq $ssh命令) {
+			throw '未找到 ssh 命令，无法探测远程系统类型。'
+		}
+
+		# Windows 远程主机的默认 shell（cmd）没有 uname 命令，只有 Linux 会原样输出内核名。
+		# Windows 主机执行 uname 必失败，其 stderr 在 PS 5.1 下会被提升为终止性错误，
+		# 此处静默捕获并视为 Windows，这是预期的判别路径，不影响功能
+		try {
+			$输出 = & $ssh命令.Source (@('-p', $端口) + $script:SSH密码选项 + @($连接目标, 'uname -s'))
+			if ($LASTEXITCODE -eq 0 -and @($输出 | Where-Object { $_ -and $_.Trim() -eq 'Linux' }).Count -gt 0) {
+				Write-Host '检测到远程系统类型: Linux'
+				return 'Linux'
+			}
+
+			# uname 执行失败但认证已通过（LASTEXITCODE 非 0 但不是认证问题），视为 Windows
+			# 认证失败的退出码通常是 255，且伴随 Permission denied；此处简化处理：非 0 即 Windows
+			Write-Host '检测到远程系统类型: Windows'
+			return 'Windows'
+		} catch {
+			# 已知且无害：Windows 无 uname 命令，失败即代表远程是 Windows
+			Write-Host '检测到远程系统类型: Windows'
+			return 'Windows'
+		}
+	}
+
 	function 探测-远程PS版本 {
 		param(
 			[string]$连接目标,
 			[int]$端口
 		)
 
-		try {
-			$输出 = & (Get-Command ssh -ErrorAction SilentlyContinue | Select-Object -First 1).Source '-p' $端口 $连接目标 'powershell -NoProfile -Command "Write-Output $PSVersionTable.PSVersion.Major"'
-			if ($LASTEXITCODE -eq 0 -and $输出) {
-				foreach ($行 in $输出) {
-					$行 = $行.Trim()
-					# 跳过 SSH 诊断信息（CNAME 警告等）
-					if ($行 -match '^\d+$') {
-						$主版本 = [int]$行
-						Write-Host ('检测到远程 PowerShell 主版本: {0}' -f $主版本)
-						return $主版本
-					}
+		$输出 = & (Get-Command ssh -ErrorAction SilentlyContinue | Select-Object -First 1).Source (@('-p', $端口) + $script:SSH密码选项 + @($连接目标, 'powershell -NoProfile -Command "Write-Output $PSVersionTable.PSVersion.Major"'))
+		if ($LASTEXITCODE -eq 0 -and $输出) {
+			foreach ($行 in $输出) {
+				$行 = $行.Trim()
+				# 跳过 SSH 诊断信息（CNAME 警告等）
+				if ($行 -match '^\d+$') {
+					$主版本 = [int]$行
+					Write-Host ('检测到远程 PowerShell 主版本: {0}' -f $主版本)
+					return $主版本
 				}
 			}
-		} catch {
-			Write-Host ('远程 PowerShell 版本检测失败: {0}' -f $_)
 		}
 
-		return $null
+		throw '无法从远程主机获取 PowerShell 版本。请确认远程主机已安装 PowerShell 且可通过 SSH 执行。'
 	}
 
 	function 选择-远程脚本 {
@@ -240,10 +344,7 @@ function 安装-VSCode远程服务 {
 			}
 			'自动' {
 				$远程PS版本 = 探测-远程PS版本 -连接目标 $连接目标 -端口 $端口
-				if ($null -eq $远程PS版本) {
-					Write-Host '无法检测远程 PowerShell 版本，使用通用版远程脚本。'
-					return $script:远程脚本_通用
-				} elseif ($远程PS版本 -le 2) {
+				if ($远程PS版本 -le 2) {
 					Write-Host ('检测到远程 PowerShell {0}.0，使用 Win7 适配版远程脚本。' -f $远程PS版本)
 					return $script:远程脚本_Win7
 				} else {
@@ -277,6 +378,7 @@ function 安装-VSCode远程服务 {
 			}
 			执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('powershell -NoProfile -ExecutionPolicy Bypass -File "%USERPROFILE%\{0}"' -f $远程临时脚本文件名) -TTY
 		} finally {
+			# 清理临时文件（无害操作，失败不影响主流程）
 			if (Test-Path $本地临时脚本路径) {
 				Remove-Item $本地临时脚本路径 -Force -ErrorAction SilentlyContinue
 			}
@@ -284,6 +386,38 @@ function 安装-VSCode远程服务 {
 			try {
 				执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('del /q "%USERPROFILE%\{0}" 2>nul' -f $远程临时脚本文件名)
 			} catch {
+				# 远程清理失败不影响主流程，临时文件会被系统定期清理
+			}
+		}
+	}
+
+	function 执行-Linux远程安装脚本 {
+		param(
+			[string]$连接目标,
+			[int]$端口,
+			[string]$脚本文本
+		)
+
+		$本地临时脚本路径 = Join-Path $env:TEMP ('临时安装-VSCode远程服务-{0}.sh' -f ([guid]::NewGuid().ToString('N')))
+		$远程临时脚本文件名 = 'vscode-server-install-temp.sh'
+		$远程临时脚本路径 = ('./{0}' -f $远程临时脚本文件名)
+
+		try {
+			# Linux sh 脚本要求 LF 行尾，且不得带 BOM，否则 shebang 与语法会出错
+			$脚本文本 = $脚本文本 -replace "`r`n", "`n"
+			[System.IO.File]::WriteAllText($本地临时脚本路径, $脚本文本, [System.Text.UTF8Encoding]::new($false))
+			上传-文件到远程 -本地路径 $本地临时脚本路径 -连接目标 $连接目标 -端口 $端口 -远程路径 $远程临时脚本路径
+			执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('sh ~/{0}' -f $远程临时脚本文件名) -TTY
+		} finally {
+			# 清理临时文件（无害操作，失败不影响主流程）
+			if (Test-Path $本地临时脚本路径) {
+				Remove-Item $本地临时脚本路径 -Force -ErrorAction SilentlyContinue
+			}
+
+			try {
+				执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('rm -f ~/{0}' -f $远程临时脚本文件名)
+			} catch {
+				# 远程清理失败不影响主流程，临时文件会被系统定期清理
 			}
 		}
 	}
@@ -296,12 +430,32 @@ function 安装-VSCode远程服务 {
 	$本地附加压缩包路径 = $null
 	$远程附加压缩包文件名 = $null
 
+	# 检测是否免密；需要密码时收集一次并注入 SSH_ASKPASS，后续调用自动复用
+	初始化-SSH密码复用 -连接目标 $连接目标 -端口 $SSH端口
+
 	Write-Host ('本机自动检测到的 VS Code 命令: {0}' -f $本地信息.命令路径)
 	Write-Host ('本机自动检测到的发布通道: {0}' -f $本地信息.发布通道)
 	Write-Host ('本机自动检测到的提交号: {0}' -f $本地信息.提交号)
 	Write-Host ('远程连接目标: {0}' -f $连接目标)
 
-	# 选择远程脚本
+	# 自动检测远程系统类型
+	$远程系统类型 = 探测-远程系统类型 -连接目标 $连接目标 -端口 $SSH端口
+
+	if ($远程系统类型 -eq 'Linux') {
+		# Linux 远程主机直接走 sh 安装流程
+		$远程安装脚本 = $script:远程脚本_Linux
+		$远程安装脚本 = $远程安装脚本.Replace('__提交号__', $本地信息.提交号)
+		$远程安装脚本 = $远程安装脚本.Replace('__发布通道__', $本地信息.发布通道)
+		$远程安装脚本 = $远程安装脚本.Replace('__轮询秒数__', [string]$轮询秒数)
+		$远程安装脚本 = $远程安装脚本.Replace('__最大恢复次数__', [string]$最大恢复次数)
+		$远程安装脚本 = $远程安装脚本.Replace('__超时秒数__', [string]$超时秒数)
+
+		执行-Linux远程安装脚本 -连接目标 $连接目标 -端口 $SSH端口 -脚本文本 $远程安装脚本
+		清除-SSH密码复用
+		return
+	}
+
+	# Windows 远程主机：按用户指定或自动检测选择脚本版本
 	$远程安装脚本 = 选择-远程脚本 -连接目标 $连接目标 -端口 $SSH端口 -指定版本 $远程脚本版本
 	if ($远程安装脚本 -eq $script:远程脚本_Win7) {
 		$本地附加压缩包路径 = 下载-本地服务器压缩包 -发布通道 $本地信息.发布通道 -提交号 $本地信息.提交号 -架构 'win32-x64'
@@ -316,6 +470,7 @@ function 安装-VSCode远程服务 {
 	$远程安装脚本 = $远程安装脚本.Replace('__超时秒数__', [string]$超时秒数)
 
 	执行-远程安装脚本 -连接目标 $连接目标 -端口 $SSH端口 -脚本文本 $远程安装脚本 -本地附加压缩包路径 $本地附加压缩包路径 -远程附加压缩包文件名 $远程附加压缩包文件名
+	清除-SSH密码复用
 }
 
 # 导出公共函数
