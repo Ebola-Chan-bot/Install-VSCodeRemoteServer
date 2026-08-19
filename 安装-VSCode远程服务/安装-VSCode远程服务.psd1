@@ -1,4 +1,4 @@
-@{
+﻿@{
 	RootModule           = '安装-VSCode远程服务.psm1'
 	ModuleVersion        = '1.1.0'
 	GUID                 = '2e2606a2-1d8b-418e-9d6d-a714a7704bdc'
@@ -17,7 +17,9 @@
 - 出错即中止，抛出真实错误，不带病继续
 
 使用语法：
-  安装-VSCode远程服务 -远程主机 <主机名或IP> [-远程账户 <账户>] [-SSH端口 <端口>] [-本地版本 <预览版|稳定版>] [-轮询秒数 <秒>] [-最大恢复次数 <次数>] [-超时秒数 <秒>] [-远程脚本版本 <自动|通用|Win7>]
+  安装-VSCode远程服务 -远程主机 <主机名或IP> [-远程账户 <账户>] [-SSH端口 <端口>] [-本地版本 <预览版|稳定版>]
+
+下载行为：Windows BITS / Linux curl+wget 下载均无限重试、无超时，轮询间隔动态递增（1秒、2秒、3秒……）。
 
 常用示例：
   # 基本用法（自动检测系统与版本）
@@ -25,11 +27,6 @@
 
   # 指定端口与预览版
   安装-VSCode远程服务 10.15.49.6 -SSH端口 22112 -本地版本 预览版 -远程账户 v-jiamh
-
-  # 强制使用 Win7 兼容脚本（仅 Windows 远程）
-  安装-VSCode远程服务 192.168.1.200 -远程脚本版本 Win7
-
-项目地址：https://github.com/Ebola-Chan-bot/Install-VSCodeRemoteServer
 '@
 	PowerShellVersion    = '5.1'
 	RequiredModules      = @()
@@ -44,6 +41,7 @@
 			ProjectUri   = 'https://github.com/Ebola-Chan-bot/Install-VSCodeRemoteServer'
 			ReleaseNotes = @'
 新增 Linux 远程主机支持：自动检测远程系统类型（无需用户输入），Linux 主机通过 sh 脚本安装 VS Code Server，自动检测系统架构（x64/arm64/armhf），支持 prss 与官方备用下载源。
+删除 轮询秒数/最大恢复次数/超时秒数/远程脚本版本 四个参数。下载一律无限等待、无限重试：轮询间隔动态递增（1秒、2秒、3秒……），进度输出带时间戳；Windows 远程脚本版本一律自动探测，不允许手动指定。
 '@
 		}
 	}

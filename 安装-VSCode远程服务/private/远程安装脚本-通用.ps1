@@ -1,4 +1,4 @@
-# 远程安装脚本（通用版）
+﻿# 远程安装脚本（通用版）
 # 要求远程 PowerShell 3.0+
 # 此文件通过主脚本上传到远程主机执行，__占位符__ 会在上传前被替换为实际值。
 
@@ -85,14 +85,12 @@ function 取-BITS任务 {
 function 等待-BITS任务完成 {
 	param(
 		[string]$任务名称,
-		[string]$目标路径,
-		[int]$恢复上限,
-		[int]$等待秒数,
-		[int]$超时秒数
+		[string]$目标路径
 	)
 
+	# 无限等待、无限重试：轮询间隔动态递增，第 1 次 1 秒、第 2 次 2 秒、第 3 次 3 秒……
 	$已恢复次数 = 0
-	$开始时间 = Get-Date
+	$当前轮询秒数 = 1
 
 	while ($true) {
 		$当前任务 = 取-BITS任务 -任务名称 $任务名称 -目标路径 $目标路径
@@ -119,7 +117,7 @@ function 等待-BITS任务完成 {
 			[string]$总字节数
 		}
 
-		Write-Host ('状态: {0} | 进度: {1}% | {2} / {3} 字节' -f $当前状态, $当前进度, $已传字节数, $总字节显示)
+		Write-Host ('[{0}] 状态: {1} | 进度: {2}% | {3} / {4} 字节' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $当前状态, $当前进度, $已传字节数, $总字节显示)
 
 		if ($当前状态 -eq 'Transferred') {
 			Complete-BitsTransfer -BitsJob $当前任务
@@ -127,23 +125,13 @@ function 等待-BITS任务完成 {
 		}
 
 		if ($当前状态 -eq 'TransientError' -or $当前状态 -eq 'Error') {
-			if ($已恢复次数 -ge $恢复上限) {
-				throw ('BITS 下载失败，超过最大恢复次数。当前状态: {0}' -f $当前状态)
-			}
-
 			$已恢复次数++
-			Write-Host ('检测到传输中断，开始第 {0} 次恢复。' -f $已恢复次数)
+			Write-Host ('[{0}] 检测到传输中断，开始第 {1} 次恢复。' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $已恢复次数)
 			Resume-BitsTransfer -BitsJob $当前任务 -Asynchronous
 		}
 
-		if ($超时秒数 -gt 0) {
-			$已耗时 = ((Get-Date) - $开始时间).TotalSeconds
-			if ($已耗时 -gt $超时秒数) {
-				throw ('BITS 下载超时（{0} 秒），当前状态: {1}' -f $超时秒数, $当前状态)
-			}
-		}
-
-		Start-Sleep -Seconds $等待秒数
+		Start-Sleep -Seconds $当前轮询秒数
+		$当前轮询秒数++
 	}
 }
 
@@ -178,9 +166,6 @@ function 展开-服务器压缩包 {
 
 $提交号 = '__提交号__'
 $发布通道 = '__发布通道__'
-$轮询秒数 = [int]'__轮询秒数__'
-$最大恢复次数 = [int]'__最大恢复次数__'
-$超时秒数 = [int]'__超时秒数__'
 $系统架构 = 取-系统架构标识
 $最终安装目录 = 取-安装目录 -通道 $发布通道 -版本提交号 $提交号
 $下载压缩包路径 = Join-Path $最终安装目录 ('vscode-server-download-{0}.zip' -f ([guid]::NewGuid().ToString('N')))
@@ -224,7 +209,7 @@ if ($null -eq $新任务) {
 	throw '已发起下载，但未找到新建的 BITS 任务。'
 }
 
-等待-BITS任务完成 -任务名称 $任务名称 -目标路径 $下载压缩包路径 -恢复上限 $最大恢复次数 -等待秒数 $轮询秒数 -超时秒数 $超时秒数
+等待-BITS任务完成 -任务名称 $任务名称 -目标路径 $下载压缩包路径
 
 if (-not (Test-Path $下载压缩包路径)) {
 	throw ('下载完成后未找到压缩包: {0}' -f $下载压缩包路径)

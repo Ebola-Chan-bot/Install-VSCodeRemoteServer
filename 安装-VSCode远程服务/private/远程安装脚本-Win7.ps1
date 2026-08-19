@@ -1,4 +1,4 @@
-# 远程安装脚本（Win7 适配版）
+﻿# 远程安装脚本（Win7 适配版）
 # 兼容 PowerShell 2.0 / Windows 7
 # 此文件通过主脚本上传到远程主机执行，__占位符__ 会在上传前被替换为实际值。
 
@@ -108,107 +108,6 @@ function 停止-占用安装目录的进程 {
 	}
 }
 
-function 取-BITS任务状态 {
-	param(
-		[string]$任务名称
-	)
-
-	$输出 = & bitsadmin.exe /info $任务名称 /verbose 2>&1
-	if ($LASTEXITCODE -ne 0) {
-		return $null
-	}
-
-	$状态 = $null
-	$总字节数 = 0
-	$已传字节数 = 0
-	foreach ($行 in $输出) {
-		if ($行 -match 'STATE:\s+(.*)$') {
-			$状态 = $Matches[1].Trim()
-		}
-		if ($行 -match 'BYTES TOTAL:\s+(\d+)') {
-			$总字节数 = [double]$Matches[1]
-		}
-		if ($行 -match 'BYTES TRANSFERRED:\s+(\d+)') {
-			$已传字节数 = [double]$Matches[1]
-		}
-	}
-
-	return [pscustomobject]@{
-		状态 = $状态
-		总字节数 = $总字节数
-		已传字节数 = $已传字节数
-	}
-}
-
-function 等待-BITS任务完成 {
-	param(
-		[string]$任务名称,
-		[string]$目标路径,
-		[int]$恢复上限,
-		[int]$等待秒数,
-		[int]$超时秒数
-	)
-
-	$已恢复次数 = 0
-	$开始时间 = Get-Date
-
-	while ($true) {
-		$当前任务 = 取-BITS任务状态 -任务名称 $任务名称
-		if ($null -eq $当前任务) {
-			if (Test-Path $目标路径) {
-				return
-			}
-
-			throw '未找到正在执行的 BITS 下载任务。'
-		}
-
-		$当前状态 = [string]$当前任务.状态
-		$总字节数 = [double]$当前任务.总字节数
-		$已传字节数 = [double]$当前任务.已传字节数
-		$总大小未知 = ($总字节数 -le 0)
-		$当前进度 = if ((-not $总大小未知) -and $总字节数 -gt 0) {
-			try {
-				[math]::Round(($已传字节数 * 100.0) / $总字节数, 1)
-			} catch {
-				0
-			}
-		} else {
-			0
-		}
-		$总字节显示 = if ($总大小未知) {
-			'未知'
-		} else {
-			[string][long]$总字节数
-		}
-
-		Write-Host ('状态: {0} | 进度: {1}% | {2} / {3} 字节' -f $当前状态, $当前进度, [long]$已传字节数, $总字节显示)
-
-		if ($当前状态 -match 'TRANSFERRED') {
-			& bitsadmin.exe /complete $任务名称 | Out-Null
-			return
-		}
-
-		if ($当前状态 -match 'ERROR|TRANSIENT_ERROR') {
-			if ($已恢复次数 -ge $恢复上限) {
-				throw ('BITS 下载失败，超过最大恢复次数。当前状态: {0}' -f $当前状态)
-			}
-
-			$已恢复次数++
-			Write-Host ('检测到传输中断，开始第 {0} 次恢复。' -f $已恢复次数)
-			& bitsadmin.exe /resume $任务名称 | Out-Null
-		}
-
-		if ($超时秒数 -gt 0) {
-			$已耗时 = ((Get-Date) - $开始时间).TotalSeconds
-			if ($已耗时 -gt $超时秒数) {
-				throw ('BITS 下载超时（{0} 秒），当前状态: {1}' -f $超时秒数, $当前状态)
-			}
-		}
-
-		Start-Sleep -Seconds $等待秒数
-	}
-}
-
 function 展开-服务器压缩包 {
 	param(
 		[string]$压缩包路径,
@@ -284,15 +183,11 @@ Write-Host 'WinHTTP 配置完成，开始安装流程。'
 
 $提交号 = '__提交号__'
 $发布通道 = '__发布通道__'
-$轮询秒数 = [int]'__轮询秒数__'
-$最大恢复次数 = [int]'__最大恢复次数__'
-$超时秒数 = [int]'__超时秒数__'
 $系统架构 = 取-系统架构标识
 $最终安装目录 = 取-安装目录 -通道 $发布通道 -版本提交号 $提交号
 $压缩包路径 = Join-Path $最终安装目录 ('vscode-server-{0}.zip' -f ([guid]::NewGuid().ToString('N')))
 $上传压缩包路径 = Join-Path $HOME 'vscode-server-upload-temp.zip'
 $下载地址 = 取-下载地址 -通道 $发布通道 -版本提交号 $提交号 -架构 $系统架构
-$任务名称 = 'VSCode远程服务-' + $提交号 + '-' + ([guid]::NewGuid().ToString('N'))
 
 Write-Host ('准备安装 VS Code 远程服务，提交号: {0}' -f $提交号)
 Write-Host ('发布通道: {0}' -f $发布通道)

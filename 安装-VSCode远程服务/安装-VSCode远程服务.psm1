@@ -1,4 +1,4 @@
-# 安装-VSCode远程服务 Module
+﻿# 安装-VSCode远程服务 Module
 # 通过 SSH 与 BITS 在远程 Windows 主机上安装 VS Code Server
 
 # 加载私有远程脚本模板
@@ -23,16 +23,7 @@ function 安装-VSCode远程服务 {
 		[int]$SSH端口 = 22,
 
 		[ValidateSet('预览版', '稳定版')]
-		[string]$本地版本,
-
-		[int]$轮询秒数 = 3,
-
-		[int]$最大恢复次数 = 5,
-
-		[int]$超时秒数 = 600,
-
-		[ValidateSet('通用', 'Win7', '自动')]
-		[string]$远程脚本版本 = '自动'
+		[string]$本地版本
 	)
 
 	function 取-本地VSCode信息 {
@@ -138,15 +129,20 @@ function 安装-VSCode远程服务 {
 		}
 
 		# 先用 BatchMode 探测：免密（密钥/agent）可直接成功；需要密码时会立即失败。
-		# 认证失败的 stderr 在 PS 5.1 下会被提升为终止性错误，此处静默捕获并视为"需要密码"，进入密码收集流程，不影响功能
+		# 探测命令必须用 'exit 0' 而非 'true'：Windows 远程主机（无论默认 shell 是 cmd 还是 PowerShell）
+		# 都没有 true 命令，会导致认证虽成功但命令退出码非 0，被误判为需要密码。'exit 0' 在
+		# PowerShell、cmd、bash/sh 下均是合法且退出码为 0 的命令。
+		# 注意：此处绝不能对 stderr 做任何重定向（2>$null / 2>&1）。外层作用域 EAP=Stop 时，
+		# 一旦被重定向，stderr 的每一行（如 CNAME 警告）都会被提升为 NativeCommandError 终止性错误，
+		# 被 catch 误判为认证失败而错误进入密码收集流程。不重定向让 stderr 直达控制台（与手动 ssh 行为一致），仅凭 $LASTEXITCODE 判断。
 		try {
-			& $ssh命令.Source '-p' $端口 '-o' 'BatchMode=yes' '-o' 'ConnectTimeout=10' $连接目标 'true' | Out-Null
+			& $ssh命令.Source '-p' $端口 '-o' 'BatchMode=yes' '-o' 'ConnectTimeout=10' $连接目标 'exit 0' | Out-Null
 			if ($LASTEXITCODE -eq 0) {
 				Write-Host '检测到远程主机已配置免密登录，无需输入密码。'
 				return
 			}
 		} catch {
-			# 已知且无害：BatchMode 下密码认证必失败，这正是进入密码收集流程的信号
+			# 仅捕获 ssh 无法启动等真正异常；BatchMode 下密码认证失败以非 0 退出码体现，由下面流程处理
 		}
 
 		# 需要密码：交互收集一次，之后通过 SSH_ASKPASS 注入到后续每次 ssh/scp 调用
@@ -329,32 +325,18 @@ function 安装-VSCode远程服务 {
 	function 选择-远程脚本 {
 		param(
 			[string]$连接目标,
-			[int]$端口,
-			[string]$指定版本
+			[int]$端口
 		)
 
-		switch ($指定版本) {
-			'通用' {
-				Write-Host '按用户指定使用通用版远程脚本。'
-				return $script:远程脚本_通用
-			}
-			'Win7' {
-				Write-Host '按用户指定使用 Win7 适配版远程脚本。'
-				return $script:远程脚本_Win7
-			}
-			'自动' {
-				$远程PS版本 = 探测-远程PS版本 -连接目标 $连接目标 -端口 $端口
-				if ($远程PS版本 -le 2) {
-					Write-Host ('检测到远程 PowerShell {0}.0，使用 Win7 适配版远程脚本。' -f $远程PS版本)
-					return $script:远程脚本_Win7
-				} else {
-					Write-Host ('检测到远程 PowerShell {0}.0，使用通用版远程脚本。' -f $远程PS版本)
-					return $script:远程脚本_通用
-				}
-			}
+		# 一律自动探测：按远程 PowerShell 版本决定使用 Win7 兼容版还是通用版
+		$远程PS版本 = 探测-远程PS版本 -连接目标 $连接目标 -端口 $端口
+		if ($远程PS版本 -le 2) {
+			Write-Host ('检测到远程 PowerShell {0}.0，使用 Win7 适配版远程脚本。' -f $远程PS版本)
+			return $script:远程脚本_Win7
+		} else {
+			Write-Host ('检测到远程 PowerShell {0}.0，使用通用版远程脚本。' -f $远程PS版本)
+			return $script:远程脚本_通用
 		}
-
-		throw ('未知的远程脚本版本: {0}' -f $指定版本)
 	}
 
 	function 执行-远程安装脚本 {
@@ -384,7 +366,9 @@ function 安装-VSCode远程服务 {
 			}
 
 			try {
-				执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('del /q "%USERPROFILE%\{0}" 2>nul' -f $远程临时脚本文件名)
+				# 远程默认 shell 可能是 PowerShell 也可能是 cmd，cmd 专属语法（del、2>nul）在 PowerShell 下会报错，
+				# 统一用 powershell 包装，两种 shell 下都能正确执行且静默失败
+				执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('powershell -NoProfile -Command "Remove-Item $env:USERPROFILE\{0} -Force -ErrorAction SilentlyContinue"' -f $远程临时脚本文件名)
 			} catch {
 				# 远程清理失败不影响主流程，临时文件会被系统定期清理
 			}
@@ -446,17 +430,14 @@ function 安装-VSCode远程服务 {
 		$远程安装脚本 = $script:远程脚本_Linux
 		$远程安装脚本 = $远程安装脚本.Replace('__提交号__', $本地信息.提交号)
 		$远程安装脚本 = $远程安装脚本.Replace('__发布通道__', $本地信息.发布通道)
-		$远程安装脚本 = $远程安装脚本.Replace('__轮询秒数__', [string]$轮询秒数)
-		$远程安装脚本 = $远程安装脚本.Replace('__最大恢复次数__', [string]$最大恢复次数)
-		$远程安装脚本 = $远程安装脚本.Replace('__超时秒数__', [string]$超时秒数)
 
 		执行-Linux远程安装脚本 -连接目标 $连接目标 -端口 $SSH端口 -脚本文本 $远程安装脚本
 		清除-SSH密码复用
 		return
 	}
 
-	# Windows 远程主机：按用户指定或自动检测选择脚本版本
-	$远程安装脚本 = 选择-远程脚本 -连接目标 $连接目标 -端口 $SSH端口 -指定版本 $远程脚本版本
+	# Windows 远程主机：一律自动探测脚本版本（按远程 PowerShell 版本选择）
+	$远程安装脚本 = 选择-远程脚本 -连接目标 $连接目标 -端口 $SSH端口
 	if ($远程安装脚本 -eq $script:远程脚本_Win7) {
 		$本地附加压缩包路径 = 下载-本地服务器压缩包 -发布通道 $本地信息.发布通道 -提交号 $本地信息.提交号 -架构 'win32-x64'
 		$远程附加压缩包文件名 = 'vscode-server-upload-temp.zip'
@@ -465,9 +446,6 @@ function 安装-VSCode远程服务 {
 	# 替换占位符
 	$远程安装脚本 = $远程安装脚本.Replace('__提交号__', $本地信息.提交号)
 	$远程安装脚本 = $远程安装脚本.Replace('__发布通道__', $本地信息.发布通道)
-	$远程安装脚本 = $远程安装脚本.Replace('__轮询秒数__', [string]$轮询秒数)
-	$远程安装脚本 = $远程安装脚本.Replace('__最大恢复次数__', [string]$最大恢复次数)
-	$远程安装脚本 = $远程安装脚本.Replace('__超时秒数__', [string]$超时秒数)
 
 	执行-远程安装脚本 -连接目标 $连接目标 -端口 $SSH端口 -脚本文本 $远程安装脚本 -本地附加压缩包路径 $本地附加压缩包路径 -远程附加压缩包文件名 $远程附加压缩包文件名
 	清除-SSH密码复用

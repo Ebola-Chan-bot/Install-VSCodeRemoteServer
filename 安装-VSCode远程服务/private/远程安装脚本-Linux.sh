@@ -8,9 +8,6 @@ set -eu
 # ===== 由主模块替换的参数 =====
 COMMIT='__提交号__'
 CHANNEL='__发布通道__'
-RETRY_INTERVAL=__轮询秒数__
-MAX_RETRIES=__最大恢复次数__
-MAX_SECONDS=__超时秒数__
 
 # ===== 自动检测系统架构 =====
 detect_arch() {
@@ -58,6 +55,11 @@ else
 	exit 1
 fi
 
+# 时间戳输出辅助函数
+log() {
+	echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
 echo "准备安装 VS Code 远程服务，提交号: $COMMIT"
 echo "发布通道: $CHANNEL"
 echo "自动检测到的系统架构: $ARCH"
@@ -73,27 +75,30 @@ fi
 rm -rf "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 
-# ===== 带重试与备用地址的下载 =====
+# ===== 无限重试与备用地址的下载 =====
 download_file() {
 	url="$1"
 	output="$2"
 	if [ "$DOWNLOADER" = 'curl' ]; then
-		curl -fL --connect-timeout 30 --max-time "$MAX_SECONDS" -o "$output" "$url"
+		curl -fL --connect-timeout 30 -o "$output" "$url"
 	else
 		wget -q -O "$output" "$url"
 	fi
 }
 
 ATTEMPT=0
+WAIT_SECONDS=0
 SUCCESS=''
-while [ "$ATTEMPT" -le "$MAX_RETRIES" ]; do
+# 无限重试：第 1 次失败后等 1 秒，第 2 次失败后等 2 秒，依此类推，每多重试一次多等 1 秒
+while [ -z "$SUCCESS" ]; do
 	ATTEMPT=$((ATTEMPT + 1))
 	if [ "$ATTEMPT" -gt 1 ]; then
-		echo "等待 $RETRY_INTERVAL 秒后开始第 $ATTEMPT 次重试..."
-		sleep "$RETRY_INTERVAL"
+		WAIT_SECONDS=$((ATTEMPT - 1))
+		log "上次下载失败，等待 $WAIT_SECONDS 秒后开始第 $ATTEMPT 次重试..."
+		sleep "$WAIT_SECONDS"
 	fi
 	for URL in "$URL_PRIMARY" "$URL_FALLBACK"; do
-		echo "开始下载: $URL"
+		log "开始下载: $URL"
 		if download_file "$URL" "$PACKAGE_PATH" && [ -s "$PACKAGE_PATH" ]; then
 			SUCCESS='是'
 			break
@@ -102,14 +107,9 @@ while [ "$ATTEMPT" -le "$MAX_RETRIES" ]; do
 	if [ -n "$SUCCESS" ]; then
 		break
 	fi
-	echo '本次下载失败，清理残留文件。'
+	log '本次下载失败，清理残留文件。'
 	rm -f "$PACKAGE_PATH"
 done
-
-if [ -z "$SUCCESS" ]; then
-	echo "错误: 下载失败，已重试 $MAX_RETRIES 次。" >&2
-	exit 1
-fi
 
 echo '下载完成，开始解压。'
 
