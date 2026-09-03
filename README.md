@@ -3,7 +3,7 @@
 # 功能特性
 
 - **自动系统检测**：通过 `uname` 判别远程是 Linux 还是 Windows，无需用户指定
-- **Windows 支持**：使用 BITS 后台下载，按远程 PowerShell 版本自动选择通用版或 Win7 兼容版安装脚本
+- **Windows 支持**：使用 HTTP 断点续传下载（基于 Range 头），按远程 PowerShell 版本自动选择通用版或 Win7 兼容版安装脚本
 - **Linux 支持**：使用 sh 脚本直接下载安装，自动检测 x64 / arm64 / armhf 架构，支持 curl / wget，含备用下载源
 - **版本严格匹配**：自动读取本机 VS Code 的提交号与发布通道（稳定版 / 预览版），下载与之完全对应的服务端
 

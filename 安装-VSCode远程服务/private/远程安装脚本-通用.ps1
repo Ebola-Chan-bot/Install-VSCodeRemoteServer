@@ -71,67 +71,95 @@ function 停止-占用安装目录的进程 {
 	}
 }
 
-function 取-BITS任务 {
+function 通过HTTP断点续传下载 {
 	param(
-		[string]$任务名称,
+		[string]$下载地址,
 		[string]$目标路径
 	)
 
-	return Get-BitsTransfer -ErrorAction SilentlyContinue |
-		Where-Object { $_.DisplayName -eq $任务名称 -or $_.Destination -eq $目标路径 } |
-		Select-Object -First 1
-}
-
-function 等待-BITS任务完成 {
-	param(
-		[string]$任务名称,
-		[string]$目标路径
-	)
-
-	# 无限等待、无限重试：轮询间隔动态递增，第 1 次 1 秒、第 2 次 2 秒、第 3 次 3 秒……
-	$已恢复次数 = 0
-	$当前轮询秒数 = 1
-
+	# 基于 HTTP Range 头的断点续传：本地已存在部分文件时从偏移处继续。
+	# 不限重试次数与总时长，失败等待秒数逐次递增（1秒、2秒、3秒……），所有输出带时间戳。
+	$重试次数 = 0
 	while ($true) {
-		$当前任务 = 取-BITS任务 -任务名称 $任务名称 -目标路径 $目标路径
-		if ($null -eq $当前任务) {
-			if (Test-Path $目标路径) {
-				return
+		$重试次数++
+		$已存在字节数 = 0
+		if (Test-Path $目标路径) {
+			$已存在字节数 = (Get-Item $目标路径).Length
+		}
+
+		try {
+			$Web请求 = [System.Net.HttpWebRequest]::Create($下载地址)
+			$Web请求.Timeout = 60000
+			$Web请求.ReadWriteTimeout = 60000
+			if ($已存在字节数 -gt 0) {
+				$Web请求.AddRange($已存在字节数)
+				Write-Host ('[{0}] 从 {1} 字节处断点续传（第 {2} 次尝试）: {3}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $已存在字节数, $重试次数, $下载地址)
+			} else {
+				Write-Host ('[{0}] 开始下载（第 {1} 次尝试）: {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $重试次数, $下载地址)
 			}
 
-			throw '未找到正在执行的 BITS 下载任务。'
-		}
+			$响应 = $Web请求.GetResponse()
+			$状态码 = [int]$响应.StatusCode
+			$响应流 = $null
+			$文件流 = $null
+			try {
+				if ($状态码 -eq 206) {
+					# 服务器支持断点续传：以追加方式写入剩余内容，文件总长度 = 已有部分 + 本次 ContentLength
+					$内容总长度 = $已存在字节数 + $响应.ContentLength
+					if ($响应.ContentLength -lt 0) { $内容总长度 = 0 }
+					$文件流 = [System.IO.File]::Open($目标路径, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write)
+				} elseif ($状态码 -eq 200) {
+					if ($已存在字节数 -gt 0) {
+						Write-Host ('[{0}] 服务器未响应 Range 请求（返回 200），将重新完整下载。' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+					}
 
-		$当前状态 = [string]$当前任务.JobState
-		$总字节数 = [uint64]$当前任务.BytesTotal
-		$已传字节数 = [uint64]$当前任务.BytesTransferred
-		$总大小未知 = ($总字节数 -eq [uint64]::MaxValue)
-		$当前进度 = if ((-not $总大小未知) -and $总字节数 -gt 0) {
-			[math]::Round(($已传字节数 * 100.0) / $总字节数, 1)
-		} else {
-			0
-		}
-		$总字节显示 = if ($总大小未知) {
-			'未知'
-		} else {
-			[string]$总字节数
-		}
+					$内容总长度 = $响应.ContentLength
+					if ($内容总长度 -lt 0) { $内容总长度 = 0 }
+					$文件流 = [System.IO.File]::Open($目标路径, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+				} else {
+					throw ('收到意外的 HTTP 状态码: {0}' -f $状态码)
+				}
 
-		Write-Host ('[{0}] 状态: {1} | 进度: {2}% | {3} / {4} 字节' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $当前状态, $当前进度, $已传字节数, $总字节显示)
+				$响应流 = $响应.GetResponseStream()
+				$缓冲区 = New-Object byte[] 65536
+				$已写入字节数 = 0
+				$上次报告时间 = [datetime]::MinValue
+				while ($true) {
+					$读取字节数 = $响应流.Read($缓冲区, 0, $缓冲区.Length)
+					if ($读取字节数 -le 0) { break }
 
-		if ($当前状态 -eq 'Transferred') {
-			Complete-BitsTransfer -BitsJob $当前任务
+					$文件流.Write($缓冲区, 0, $读取字节数)
+					$已写入字节数 += $读取字节数
+					$当前时间 = Get-Date
+					if (($当前时间 - $上次报告时间).TotalSeconds -ge 1) {
+						$上次报告时间 = $当前时间
+						$已传总字节数 = $已存在字节数 + $已写入字节数
+						if ($内容总长度 -gt 0) {
+							$进度 = [math]::Round(($已传总字节数 * 100.0) / $内容总长度, 1)
+							Write-Host ('[{0}] 状态: Transferring | 进度: {1}% | {2} / {3} 字节' -f ($当前时间.ToString('yyyy-MM-dd HH:mm:ss')), $进度, $已传总字节数, $内容总长度)
+						} else {
+							Write-Host ('[{0}] 状态: Transferring | 已传: {1} 字节' -f ($当前时间.ToString('yyyy-MM-dd HH:mm:ss')), $已传总字节数)
+						}
+					}
+				}
+			} finally {
+				if ($null -ne $响应流) { $响应流.Dispose() }
+				if ($null -ne $文件流) { $文件流.Dispose() }
+				$响应.Dispose()
+			}
+
+			if ($内容总长度 -gt 0 -and (Get-Item $目标路径).Length -lt $内容总长度) {
+				throw ('下载提前结束: 文件 {0} 字节，预期至少 {1} 字节。' -f (Get-Item $目标路径).Length, $内容总长度)
+			}
+
+			Write-Host ('[{0}] 下载完成。' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
 			return
+		} catch {
+			Write-Host ('[{0}] 第 {1} 次下载中断: {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $重试次数, $_.Exception.Message)
 		}
 
-		if ($当前状态 -eq 'TransientError' -or $当前状态 -eq 'Error') {
-			$已恢复次数++
-			Write-Host ('[{0}] 检测到传输中断，开始第 {1} 次恢复。' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $已恢复次数)
-			Resume-BitsTransfer -BitsJob $当前任务 -Asynchronous
-		}
-
-		Start-Sleep -Seconds $当前轮询秒数
-		$当前轮询秒数++
+		# 保留已下载的部分文件，等待递增秒数后自动续传重试（1秒、2秒、3秒……）
+		Start-Sleep -Seconds $重试次数
 	}
 }
 
@@ -168,9 +196,9 @@ $提交号 = '__提交号__'
 $发布通道 = '__发布通道__'
 $系统架构 = 取-系统架构标识
 $最终安装目录 = 取-安装目录 -通道 $发布通道 -版本提交号 $提交号
-$下载压缩包路径 = Join-Path $最终安装目录 ('vscode-server-download-{0}.zip' -f ([guid]::NewGuid().ToString('N')))
+# 固定文件名（不含随机后缀），使同一安装目录下的下载路径确定，便于识别与断点续传定位
+$下载压缩包路径 = Join-Path $最终安装目录 'vscode-server-download.zip'
 $下载地址 = 取-下载地址 -通道 $发布通道 -版本提交号 $提交号 -架构 $系统架构
-$任务名称 = 'VSCode远程服务-' + $提交号
 
 Write-Host ('准备安装 VS Code 远程服务，提交号: {0}' -f $提交号)
 Write-Host ('发布通道: {0}' -f $发布通道)
@@ -185,31 +213,9 @@ if (Test-Path $最终安装目录) {
 }
 
 New-Item -ItemType Directory -Force $最终安装目录 | Out-Null
-Start-Service BITS -ErrorAction SilentlyContinue
 
-$旧任务 = 取-BITS任务 -任务名称 $任务名称 -目标路径 $下载压缩包路径
-if ($null -ne $旧任务) {
-	Remove-BitsTransfer -BitsJob $旧任务 -Confirm:$false -ErrorAction SilentlyContinue
-}
-
-Write-Host '开始通过 BITS 下载压缩包。'
-Start-BitsTransfer -Source $下载地址 -Destination $下载压缩包路径 -DisplayName $任务名称 -Asynchronous | Out-Null
-
-$新任务 = $null
-for ($序号 = 0; $序号 -lt 10; $序号++) {
-	$新任务 = 取-BITS任务 -任务名称 $任务名称 -目标路径 $下载压缩包路径
-	if ($null -ne $新任务) {
-		break
-	}
-
-	Start-Sleep -Seconds 1
-}
-
-if ($null -eq $新任务) {
-	throw '已发起下载，但未找到新建的 BITS 任务。'
-}
-
-等待-BITS任务完成 -任务名称 $任务名称 -目标路径 $下载压缩包路径
+Write-Host '开始通过 HTTP 断点续传下载压缩包。'
+通过HTTP断点续传下载 -下载地址 $下载地址 -目标路径 $下载压缩包路径
 
 if (-not (Test-Path $下载压缩包路径)) {
 	throw ('下载完成后未找到压缩包: {0}' -f $下载压缩包路径)
