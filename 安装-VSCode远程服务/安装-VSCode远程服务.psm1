@@ -20,7 +20,8 @@ function 安装-VSCode远程服务 {
 
 		[string]$远程账户,
 
-		[int]$SSH端口 = 22,
+		# 0 表示未指定：将优先采用 ~/.ssh/config 中匹配到的 Port，仍无则用 22
+		[int]$SSH端口 = 0,
 
 		[ValidateSet('预览版', '稳定版')]
 		[string]$本地版本
@@ -99,6 +100,100 @@ function 安装-VSCode远程服务 {
 		if ($null -ne $稳定版信息) { return $稳定版信息 }
 
 		throw '本机未检测到可用的 VS Code 预览版或稳定版。'
+	}
+
+	function 测试-通配符匹配 {
+		param(
+			[string]$模式,
+			[string]$目标
+		)
+
+		# ssh 的 Host 模式支持 * 与 ? 通配符，转为正则后做整串匹配（大小写不敏感由 -match 默认行为保证）
+		$正则 = '^' + [regex]::Escape($模式).Replace('\*', '.*').Replace('\?', '.') + '$'
+		return $目标 -match $正则
+	}
+
+	function 取-SSH配置中的连接信息 {
+		param(
+			[string]$主机,
+			[int]$用户指定端口
+		)
+
+		# 模拟 ssh 解析 ~/.ssh/config：直接传裸 IP/主机名时，ssh 自身的 Host 匹配只认命令行输入的别名，会导致用户名回退为本机用户。这里额外按 HostName 指令反查（也兼容 Host 通配符模式），让“主机 → 账户/端口”能从配置中查回，多块命中时遵循 ssh“同一关键字首个值生效”的合并规则。
+		$配置文件路径 = Join-Path $env:USERPROFILE '.ssh\config'
+		if (-not (Test-Path $配置文件路径)) {
+			return [pscustomobject]@{ 用户 = ''; 端口 = 0 }
+		}
+
+		$块列表 = New-Object System.Collections.ArrayList
+		$当前块 = $null
+		foreach ($原始行 in (Get-Content $配置文件路径 -Encoding UTF8)) {
+			$行 = $原始行.Trim()
+			if ($行 -eq '' -or $行.StartsWith('#')) { continue }
+
+			if ($行 -match '^([^=\s]+)\s*=\s*(.*)$') {
+				$关键字 = $Matches[1]
+				$参数 = $Matches[2].Trim()
+			} elseif ($行 -match '^(\S+)\s+(.*)$') {
+				$关键字 = $Matches[1]
+				$参数 = $Matches[2].Trim()
+			} else {
+				continue
+			}
+
+			if ($关键字 -ieq 'Match') {
+				# Match 块的条件由 ssh 运行时求值，无法本地模拟，保守地忽略其下指令，避免误取配置
+				$当前块 = $null
+				continue
+			}
+
+			if ($关键字 -ieq 'Host') {
+				if ($null -ne $当前块) { [void]$块列表.Add($当前块) }
+				$当前块 = @{ 模式列表 = @($参数 -split '\s+'); 主机名 = ''; 端口 = 0; 用户 = '' }
+				continue
+			}
+
+			if ($null -eq $当前块) { continue }
+
+			# ssh 语义：同一关键字首个出现的值生效
+			if ($关键字 -ieq 'HostName' -and $当前块.主机名 -eq '') {
+				$当前块.主机名 = $参数
+			} elseif ($关键字 -ieq 'Port' -and $当前块.端口 -eq 0 -and $参数 -match '^\d+$') {
+				$当前块.端口 = [int]$参数
+			} elseif ($关键字 -ieq 'User' -and $当前块.用户 -eq '') {
+				$当前块.用户 = $参数
+			}
+		}
+
+		if ($null -ne $当前块) { [void]$块列表.Add($当前块) }
+
+		$结果用户 = ''
+		$结果端口 = 0
+		foreach ($块 in $块列表) {
+			# ssh 模式语义：任一否定模式（!开头）命中则整块排除；否则任一肯定模式命中即匹配；
+			# 扩展点：HostName 指令与目标主机精确相等也视为命中（这是本机回退问题的修复核心）
+			$被排除 = $false
+			$正向命中 = $false
+			foreach ($模式 in $块.模式列表) {
+				if ($模式.StartsWith('!')) {
+					if (测试-通配符匹配 -模式 $模式.Substring(1) -目标 $主机) { $被排除 = $true; break }
+				} elseif (测试-通配符匹配 -模式 $模式 -目标 $主机) {
+					$正向命中 = $true
+				}
+			}
+
+			if ($被排除) { continue }
+			if (-not ($正向命中 -or ($块.主机名 -ieq $主机))) { continue }
+
+			# 用户已显式指定端口时，只接受未限定端口或端口一致的块，避免跨服务串账户
+			if ($用户指定端口 -ne 0 -and $块.端口 -ne 0 -and $块.端口 -ne $用户指定端口) { continue }
+
+			if ($结果用户 -eq '' -and $块.用户 -ne '') { $结果用户 = $块.用户 }
+			if ($结果端口 -eq 0 -and $块.端口 -ne 0) { $结果端口 = $块.端口 }
+			if ($结果用户 -ne '' -and $结果端口 -ne 0) { break }
+		}
+
+		return [pscustomobject]@{ 用户 = $结果用户; 端口 = $结果端口 }
 	}
 
 	function 取-SSH连接目标 {
@@ -217,10 +312,38 @@ function 安装-VSCode远程服务 {
 			throw '未找到 scp 命令。请确保已安装 OpenSSH 客户端。'
 		}
 
-		& $SCP命令.Source (@('-P', $端口) + $script:SSH密码选项 + @($本地路径, ('{0}:{1}' -f $连接目标, $远程路径)))
-		if ($LASTEXITCODE -ne 0) {
-			throw ('SCP 上传失败，退出码: {0}。请检查网络连接与远程主机权限。' -f $LASTEXITCODE)
+		$scp参数 = @('-P', $端口) + $script:SSH密码选项 + @($本地路径, ('{0}:{1}' -f $连接目标, $远程路径))
+
+		# PS 5.1 下原生命令的 stderr 一旦被重定向就会变成终止性错误，因此探测与捕获期间临时切换为 Continue，并在 finally 中恢复
+		$原始EAP = $ErrorActionPreference
+		try {
+			$ErrorActionPreference = 'Continue'
+			# 默认走 SFTP 协议上传
+			& $SCP命令.Source $scp参数 2>&1 | Out-Null
+		} finally {
+			$ErrorActionPreference = $原始EAP
 		}
+
+		if ($LASTEXITCODE -eq 0) {
+			return
+		}
+
+		# SFTP 协议失败时，远端常只给出模糊的 "close remote: Failure"，掩盖真实原因（实测它对应的往往是 Linux 端的 "Disk quota exceeded"）；经典 SCP 协议（-O）会把远端真实错误原样回显。用它补传一次：成功则上传就此完成；仍失败则取其输出作为直白的报错依据
+		$原始EAP = $ErrorActionPreference
+		try {
+			$ErrorActionPreference = 'Continue'
+			$诊断输出 = @(& $SCP命令.Source (@('-O') + $scp参数) 2>&1)
+		} finally {
+			$ErrorActionPreference = $原始EAP
+		}
+
+		if ($LASTEXITCODE -eq 0) {
+			return
+		}
+
+		$远端错误 = ($诊断输出 | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() }) -join "`n"
+
+		throw ('SCP 上传失败，退出码: {0}。{1}{2}' -f $LASTEXITCODE, "`n", $远端错误)
 	}
 
 	function 取-服务器压缩包文件名 {
@@ -410,6 +533,19 @@ function 安装-VSCode远程服务 {
 
 	$ErrorActionPreference = 'Stop'
 	$本地信息 = 取-本地VSCode信息 -指定版本 $本地版本
+
+	# 裸 IP/主机名不允许回退本机用户名：先从 ~/.ssh/config 反查该主机对应的账户与端口。若用户已内嵌账户（如 user@host）或显式给了 -远程账户，则以用户输入为准
+	$SSH配置信息 = 取-SSH配置中的连接信息 -主机 $远程主机 -用户指定端口 $SSH端口
+	if ([string]::IsNullOrWhiteSpace($远程账户) -and $远程主机 -notmatch '@' -and $SSH配置信息.用户 -ne '') {
+		Write-Host ('已从 ~/.ssh/config 解析到该主机的登录账户: {0}' -f $SSH配置信息.用户)
+		$远程账户 = $SSH配置信息.用户
+	}
+
+	if ($SSH端口 -eq 0) {
+		$SSH端口 = if ($SSH配置信息.端口 -gt 0) { $SSH配置信息.端口 } else { 22 }
+		Write-Host ('使用 SSH 端口: {0}' -f $SSH端口)
+	}
+
 	$连接目标 = 取-SSH连接目标 -主机 $远程主机 -账户 $远程账户
 	$本地附加压缩包路径 = $null
 	$远程附加压缩包文件名 = $null

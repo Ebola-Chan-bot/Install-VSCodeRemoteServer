@@ -9,7 +9,7 @@
 通过 SSH 在远程主机上安装与本机 VS Code 版本严格匹配的 VS Code Server。
 
 功能特性：
-- 自动检测远程系统类型（Windows / Linux），无需用户指定
+- 自动检测远程系统类型（Windows / Linux），无需用户指定；裸 IP/主机名连接时会从 ~/.ssh/config 反查该主机对应的账户与端口
 - Windows 使用 HTTP 断点续传下载（基于 Range 头，中断后自动从已下载字节数处续传），按远程 PowerShell 版本自动选择通用版或 Win7 兼容版脚本；Win7 版压缩包由本机下载后中转上传，不在远程发起下载
 - Linux 使用 sh 脚本下载安装，自动检测 x64 / arm64 / armhf 架构，支持 curl / wget，含备用下载源
 - 自动读取本机 VS Code 提交号与发布通道（稳定版 / 预览版），下载与之完全对应的服务端
@@ -17,6 +17,7 @@
 
 使用语法：
   安装-VSCode远程服务 -远程主机 <主机名或IP> [-远程账户 <账户>] [-SSH端口 <端口>] [-本地版本 <预览版|稳定版>]
+  未指定账户或端口时，从 ~/.ssh/config 反查匹配项（优先 Host 精确/通配匹配，其次 HostName 等于主机名）
 
 下载行为：Windows HTTP 断点续传 / Linux curl+wget 下载均无限重试、无超时；失败后等待间隔逐次递增，进度输出带时间戳
 
@@ -40,6 +41,7 @@
 			ProjectUri   = 'https://github.com/Ebola-Chan-bot/Install-VSCodeRemoteServer'
 			ReleaseNotes = @'
 Windows 通用版脚本不再使用 BITS（SSH 远程登录会话下 BITS 必然报 0x800704DD），改为基于 HTTP Range 头的断点续传下载：单次运行内任何传输中断都会自动从已下载字节数处续传，无限重试、无超时，失败等待间隔逐次递增。
+裸 IP/主机名连接不再回退本机用户名：未指定 -远程账户/-SSH端口 时，从 ~/.ssh/config 按 Host（精确与通配符）、HostName、Port 反查匹配的账户与端口；显式指定时仍以用户输入为准。
 '@
 		}
 	}
