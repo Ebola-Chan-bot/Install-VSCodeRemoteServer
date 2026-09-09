@@ -1,6 +1,6 @@
 ﻿@{
 	RootModule           = '安装-VSCode远程服务.psm1'
-	ModuleVersion        = '1.1.1'
+	ModuleVersion        = '2.0.0'
 	GUID                 = '2e2606a2-1d8b-418e-9d6d-a714a7704bdc'
 	Author               = '埃博拉酱-机器人'
 	CompanyName          = '一致行动党'
@@ -42,6 +42,7 @@
 			ReleaseNotes = @'
 Windows 通用版脚本不再使用 BITS（SSH 远程登录会话下 BITS 必然报 0x800704DD），改为基于 HTTP Range 头的断点续传下载：单次运行内任何传输中断都会自动从已下载字节数处续传，无限重试、无超时，失败等待间隔逐次递增。
 裸 IP/主机名连接不再回退本机用户名：未指定 -远程账户/-SSH端口 时，从 ~/.ssh/config 按 Host（精确与通配符）、HostName、Port 反查匹配的账户与端口；显式指定时仍以用户输入为准。
+安装目录改为新版 exec server 布局（<数据目录>/cli/servers/<质量名>-<提交号>/server，质量名按通道取 Insiders/Stable），旧 bin/<提交号> 布局弃用，Windows 三个脚本与 Linux 脚本同步修改；实测（远程机 cli/servers 目录时间线）Remote-SSH 自 VS Code 1.126（Insiders，2026-06）起开始使用新布局并自 1.137 起完全落地，早于 1.126 的 VS Code 只识别旧 bin 布局，本模块安装的服务端对其不再生效。
 '@
 		}
 	}

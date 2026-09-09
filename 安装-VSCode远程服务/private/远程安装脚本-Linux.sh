@@ -31,13 +31,15 @@ detect_arch() {
 
 ARCH=$(detect_arch)
 
-# ===== 推导安装目录 =====
+# ===== 推导安装目录（新版 exec server 布局: <数据目录>/cli/servers/<质量名>-<提交号>/server，旧 bin 布局已弃用） =====
 if [ "$CHANNEL" = 'insider' ]; then
-	INSTALL_ROOT="$HOME/.vscode-server-insiders/bin"
+	DATA_DIR="$HOME/.vscode-server-insiders"
+	QUALITY='Insiders'
 else
-	INSTALL_ROOT="$HOME/.vscode-server/bin"
+	DATA_DIR="$HOME/.vscode-server"
+	QUALITY='Stable'
 fi
-INSTALL_DIR="$INSTALL_ROOT/$COMMIT"
+INSTALL_DIR="$DATA_DIR/cli/servers/$QUALITY-$COMMIT/server"
 PACKAGE_PATH="$INSTALL_DIR/vscode-server-download-$$.tar.gz"
 
 # ===== 生成候选下载地址（第一个失败则尝试下一个） =====

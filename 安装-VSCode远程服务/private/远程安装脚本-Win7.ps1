@@ -66,13 +66,16 @@ function 取-安装目录 {
 		[string]$版本提交号
 	)
 
-	$安装根目录 = if ($通道 -eq 'insider') {
-		Join-Path $HOME '.vscode-server-insiders\bin'
+	# 新版 exec server 布局：<数据目录>\cli\servers\<质量名>-<提交号>\server
+	# 旧版 bin\<提交号> 布局已不再写入（Remote-SSH 的 CLI 只认新布局）
+	$质量名 = if ($通道 -eq 'insider') { 'Insiders' } else { 'Stable' }
+	$数据目录 = if ($通道 -eq 'insider') {
+		Join-Path $HOME '.vscode-server-insiders'
 	} else {
-		Join-Path $HOME '.vscode-server\bin'
+		Join-Path $HOME '.vscode-server'
 	}
 
-	return Join-Path $安装根目录 $版本提交号
+	return Join-Path $数据目录 ('cli\servers\{0}-{1}\server' -f $质量名, $版本提交号)
 }
 
 function 取-下载地址 {
