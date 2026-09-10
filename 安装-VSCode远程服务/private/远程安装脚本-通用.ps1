@@ -44,6 +44,75 @@ function 取-安装目录 {
 	return Join-Path $数据目录 ('cli\servers\{0}-{1}\server' -f $质量名, $版本提交号)
 }
 
+function 取-CLI安装信息 {
+	param(
+		[string]$通道,
+		[string]$版本提交号,
+		[string]$架构
+	)
+
+	# Remote-SSH 引导的契约：数据根目录下需存在 <cli名>-<提交号>[.exe]，cli 名稳定版为 code、预览版为 code-insiders；Windows 的 CLI 下载 artifact 为 cli-win32-<架构>，包内可执行文件不带提交号，落地后按上述规则重命名
+	$cli基础名 = if ($通道 -eq 'insider') { 'code-insiders' } else { 'code' }
+	$cli落地名 = ('{0}-{1}.exe' -f $cli基础名, $版本提交号)
+	$数据目录 = if ($通道 -eq 'insider') {
+		Join-Path $HOME '.vscode-server-insiders'
+	} else {
+		Join-Path $HOME '.vscode-server'
+	}
+
+	return [pscustomobject]@{
+		包内可执行名 = ('{0}.exe' -f $cli基础名)
+		落地路径 = (Join-Path $数据目录 $cli落地名)
+		下载地址 = ('https://update.code.visualstudio.com/commit:{0}/cli-win32-{1}/{2}' -f $版本提交号, $架构, $通道)
+	}
+}
+
+function 安装-远程CLI {
+	param(
+		[pscustomobject]$CLI信息
+	)
+
+	# 仅补装缺失的 CLI（Remote-SSH 引导仅做文件存在性检查，存在即视为已安装）；CLI 压缩包约 30MB，直接整包下载，无需断点续传，失败按递增间隔无限重试
+	if (Test-Path -LiteralPath $CLI信息.落地路径) {
+		Write-Host ('[{0}] CLI 已存在，跳过安装: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $CLI信息.落地路径)
+		return
+	}
+
+	$数据目录 = Split-Path -Parent $CLI信息.落地路径
+	New-Item -ItemType Directory -Force $数据目录 | Out-Null
+	$cli压缩包路径 = Join-Path $数据目录 ('vscode-cli-{0}.zip' -f [System.IO.Path]::GetFileNameWithoutExtension($CLI信息.落地路径))
+
+	$重试次数 = 0
+	while ($true) {
+		$重试次数++
+		try {
+			Write-Host ('[{0}] 开始下载远程 CLI（第 {1} 次尝试）: {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $重试次数, $CLI信息.下载地址)
+			Invoke-WebRequest -Uri $CLI信息.下载地址 -OutFile $cli压缩包路径 -UseBasicParsing
+
+			$临时解压目录 = Join-Path $数据目录 ('cli-unpack-{0}' -f ([System.IO.Path]::GetRandomFileName()))
+			try {
+				Expand-Archive -Path $cli压缩包路径 -DestinationPath $临时解压目录 -Force
+				$包内路径 = Join-Path $临时解压目录 $CLI信息.包内可执行名
+				if (-not (Test-Path -LiteralPath $包内路径)) {
+					throw ('CLI 压缩包内未找到 {0}。' -f $CLI信息.包内可执行名)
+				}
+
+				Copy-Item -LiteralPath $包内路径 -Destination $CLI信息.落地路径 -Force
+			} finally {
+				Remove-Item $临时解压目录 -Recurse -Force -ErrorAction SilentlyContinue
+				Remove-Item $cli压缩包路径 -Force -ErrorAction SilentlyContinue
+			}
+
+			Write-Host ('[{0}] 远程 CLI 安装完成: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $CLI信息.落地路径)
+			return
+		} catch {
+			Write-Host ('[{0}] 第 {1} 次 CLI 下载中断: {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $重试次数, $_.Exception.Message)
+		}
+
+		Start-Sleep -Seconds $重试次数
+	}
+}
+
 function 取-下载地址 {
 	param(
 		[string]$通道,
@@ -202,12 +271,24 @@ $最终安装目录 = 取-安装目录 -通道 $发布通道 -版本提交号 $�
 # 固定文件名（不含随机后缀），使同一安装目录下的下载路径确定，便于识别与断点续传定位
 $下载压缩包路径 = Join-Path $最终安装目录 'vscode-server-download.zip'
 $下载地址 = 取-下载地址 -通道 $发布通道 -版本提交号 $提交号 -架构 $系统架构
+$CLI信息 = 取-CLI安装信息 -通道 $发布通道 -版本提交号 $提交号 -架构 $系统架构
 
 Write-Host ('准备安装 VS Code 远程服务，提交号: {0}' -f $提交号)
 Write-Host ('发布通道: {0}' -f $发布通道)
 Write-Host ('自动检测到的系统架构: {0}' -f $系统架构)
 Write-Host ('自动检测到的安装目录: {0}' -f $最终安装目录)
 Write-Host ('下载地址: {0}' -f $下载地址)
+
+# 远程服务端的启动入口是 CLI（code[-insiders]-<提交号>.exe），由它按需拉起 server，二者缺一不可，故先补 CLI
+安装-远程CLI -CLI信息 $CLI信息
+
+$服务端已就绪 = (Test-Path -LiteralPath (Join-Path $最终安装目录 'product.json')) -and (Test-Path -LiteralPath (Join-Path $最终安装目录 'bin'))
+if ($服务端已就绪) {
+	# Remote-SSH 的 CLI 用 server 目录下的 product.json 与 bin 判定安装完整性，同提交号且结构完整则直接复用，避免重复下载约 190MB 的 Server 压缩包
+	Write-Host ('[{0}] 同提交号的 Server 已完整安装，跳过下载与解压: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $最终安装目录)
+	Get-ChildItem -Force $最终安装目录 | Select-Object Name, Length, Mode | Format-Table -AutoSize
+	return
+}
 
 停止-占用安装目录的进程 -安装目录 $最终安装目录 -版本提交号 $提交号
 

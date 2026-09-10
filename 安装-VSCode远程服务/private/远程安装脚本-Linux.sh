@@ -42,6 +42,20 @@ fi
 INSTALL_DIR="$DATA_DIR/cli/servers/$QUALITY-$COMMIT/server"
 PACKAGE_PATH="$INSTALL_DIR/vscode-server-download-$$.tar.gz"
 
+# ===== CLI 名称与下载 artifact（Remote-SSH 引导契约：数据根目录需存在 <cli名>-<提交号>，cli 名稳定版 code、预览版 code-insiders；x64/arm64 用 cli-alpine-<架构>，armhf 用 cli-linux-armhf） =====
+if [ "$CHANNEL" = 'insider' ]; then
+	CLI_BASE_NAME='code-insiders'
+else
+	CLI_BASE_NAME='code'
+fi
+CLI_ON_DISK="$DATA_DIR/$CLI_BASE_NAME-$COMMIT"
+if [ "$ARCH" = 'linux-armhf' ]; then
+	CLI_ARTIFACT='cli-linux-armhf'
+else
+	CLI_ARTIFACT="cli-alpine-$(echo "$ARCH" | sed 's/^linux-//')"
+fi
+CLI_URL="https://update.code.visualstudio.com/commit:$COMMIT/$CLI_ARTIFACT/$CHANNEL"
+
 # ===== 生成候选下载地址（第一个失败则尝试下一个） =====
 URL_PRIMARY="https://vscode.download.prss.microsoft.com/dbazure/download/$CHANNEL/$COMMIT/vscode-server-$ARCH.tar.gz"
 URL_FALLBACK="https://update.code.visualstudio.com/commit:$COMMIT/server-$ARCH/$CHANNEL"
@@ -67,10 +81,52 @@ echo "发布通道: $CHANNEL"
 echo "自动检测到的系统架构: $ARCH"
 echo "自动检测到的安装目录: $INSTALL_DIR"
 echo "下载工具: $DOWNLOADER"
+echo "CLI 下载地址: $CLI_URL"
+
+# ===== 安装远程 CLI（Remote-SSH 引导的启动入口，server 由它拉起，二者缺一不可；仅缺失时补装，压缩包约 30MB 直接整包下载，失败按递增间隔无限重试） =====
+install_cli() {
+	if [ -f "$CLI_ON_DISK" ]; then
+		log "CLI 已存在，跳过安装: $CLI_ON_DISK"
+		return 0
+	fi
+
+	CLI_TAR="$DATA_DIR/vscode-cli-$COMMIT.tar.gz"
+	CLI_ATTEMPT=0
+	while true; do
+		CLI_ATTEMPT=$((CLI_ATTEMPT + 1))
+		if log "开始下载远程 CLI（第 $CLI_ATTEMPT 次尝试）: $CLI_URL" && download_file "$CLI_URL" "$CLI_TAR" && [ -s "$CLI_TAR" ]; then
+			CLI_TMP="$DATA_DIR/cli-unpack-$$"
+			rm -rf "$CLI_TMP"
+			mkdir -p "$CLI_TMP"
+			if tar -xzf "$CLI_TAR" -C "$CLI_TMP" && [ -f "$CLI_TMP/$CLI_BASE_NAME" ]; then
+				mv "$CLI_TMP/$CLI_BASE_NAME" "$CLI_ON_DISK"
+				chmod +x "$CLI_ON_DISK"
+				rm -rf "$CLI_TMP" "$CLI_TAR"
+				log "远程 CLI 安装完成: $CLI_ON_DISK"
+				return 0
+			fi
+			log "CLI 压缩包内容异常，清理后重试。"
+			rm -rf "$CLI_TMP" "$CLI_TAR"
+		else
+			rm -f "$CLI_TAR"
+		fi
+		sleep "$CLI_ATTEMPT"
+	done
+}
 
 # ===== 停止正在运行的旧版服务进程 =====
 if command -v pkill >/dev/null 2>&1; then
 	pkill -f "$COMMIT" 2>/dev/null || true
+fi
+
+# ===== CLI 下载器已在上方确定，此处先补 CLI 再处理 server =====
+install_cli
+
+# 同提交号且结构完整（product.json 与 bin 并存）的 server 直接复用，避免重复下载
+if [ -f "$INSTALL_DIR/product.json" ] && [ -d "$INSTALL_DIR/bin" ]; then
+	log "同提交号的 Server 已完整安装，跳过下载与解压: $INSTALL_DIR"
+	ls -la "$INSTALL_DIR"
+	exit 0
 fi
 
 # ===== 清理并重建安装目录 =====
