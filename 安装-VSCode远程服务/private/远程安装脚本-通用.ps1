@@ -51,9 +51,10 @@ function 取-CLI安装信息 {
 		[string]$架构
 	)
 
-	# Remote-SSH 引导的契约：数据根目录下需存在 <cli名>-<提交号>[.exe]，cli 名稳定版为 code、预览版为 code-insiders；Windows 的 CLI 下载 artifact 为 cli-win32-<架构>，包内可执行文件不带提交号，落地后按上述规则重命名
+	# Remote-SSH 引导的契约：数据根目录下需存在 <cli名>-<提交号>[.exe]，cli 名稳定版为 code、预览版为 code-insiders；Windows 的 CLI 下载 artifact 为 cli-win32-<短架构>（如 cli-win32-x64），与服务器压缩包的 win32-x64 标识不同，需去掉 win32- 前缀取短架构；包内可执行文件不带提交号，落地后按上述规则重命名
 	$cli基础名 = if ($通道 -eq 'insider') { 'code-insiders' } else { 'code' }
 	$cli落地名 = ('{0}-{1}.exe' -f $cli基础名, $版本提交号)
+	$短架构 = $架构 -replace '^win32-', ''
 	$数据目录 = if ($通道 -eq 'insider') {
 		Join-Path $HOME '.vscode-server-insiders'
 	} else {
@@ -63,7 +64,7 @@ function 取-CLI安装信息 {
 	return [pscustomobject]@{
 		包内可执行名 = ('{0}.exe' -f $cli基础名)
 		落地路径 = (Join-Path $数据目录 $cli落地名)
-		下载地址 = ('https://update.code.visualstudio.com/commit:{0}/cli-win32-{1}/{2}' -f $版本提交号, $架构, $通道)
+		下载地址 = ('https://update.code.visualstudio.com/commit:{0}/cli-win32-{1}/{2}' -f $版本提交号, $短架构, $通道)
 	}
 }
 
@@ -196,6 +197,8 @@ function 通过HTTP断点续传下载 {
 				$缓冲区 = New-Object byte[] 65536
 				$已写入字节数 = 0
 				$上次报告时间 = [datetime]::MinValue
+				# 报告周期从 1 秒起：进度不足 2/3 时每个周期比上个周期多 1 秒，超过 2/3 后每个周期比上个周期少 1 秒，不低于 1 秒
+				$报告周期秒数 = 1
 				while ($true) {
 					$读取字节数 = $响应流.Read($缓冲区, 0, $缓冲区.Length)
 					if ($读取字节数 -le 0) { break }
@@ -203,14 +206,22 @@ function 通过HTTP断点续传下载 {
 					$文件流.Write($缓冲区, 0, $读取字节数)
 					$已写入字节数 += $读取字节数
 					$当前时间 = Get-Date
-					if (($当前时间 - $上次报告时间).TotalSeconds -ge 1) {
+					if (($当前时间 - $上次报告时间).TotalSeconds -ge $报告周期秒数) {
 						$上次报告时间 = $当前时间
 						$已传总字节数 = $已存在字节数 + $已写入字节数
 						if ($内容总长度 -gt 0) {
 							$进度 = [math]::Round(($已传总字节数 * 100.0) / $内容总长度, 1)
-							Write-Host ('[{0}] 状态: Transferring | 进度: {1}% | {2} / {3} 字节' -f ($当前时间.ToString('yyyy-MM-dd HH:mm:ss')), $进度, $已传总字节数, $内容总长度)
+							Write-Host ('[{0}] 状态: Transferring | 进度: {1}% | {2} / {3} 字节' -f ($当前时间.ToString('HH:mm:ss')), $进度, $已传总字节数, $内容总长度)
+							# 按当前进度决定下个周期：不足 2/3 递增，超过 2/3 递减（下限 1 秒）
+							if ($已传总字节数 * 3 -gt $内容总长度 * 2) {
+								if ($报告周期秒数 -gt 1) { $报告周期秒数-- }
+							} else {
+								$报告周期秒数++
+							}
 						} else {
-							Write-Host ('[{0}] 状态: Transferring | 已传: {1} 字节' -f ($当前时间.ToString('yyyy-MM-dd HH:mm:ss')), $已传总字节数)
+							Write-Host ('[{0}] 状态: Transferring | 已传: {1} 字节' -f ($当前时间.ToString('HH:mm:ss')), $已传总字节数)
+							# 总大小未知时无法计算进度比例，按未达 2/3 处理递增周期
+							$报告周期秒数++
 						}
 					}
 				}

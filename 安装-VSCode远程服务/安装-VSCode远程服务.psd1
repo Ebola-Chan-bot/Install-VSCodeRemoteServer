@@ -19,7 +19,7 @@
   安装-VSCode远程服务 -远程主机 <主机名或IP> [-远程账户 <账户>] [-SSH端口 <端口>] [-本地版本 <预览版|稳定版>]
   未指定账户或端口时，从 ~/.ssh/config 反查匹配项（优先 Host 精确/通配匹配，其次 HostName 等于主机名）
 
-下载行为：Windows HTTP 断点续传 / Linux curl+wget 下载均无限重试、无超时；失败后等待间隔逐次递增，进度输出带时间戳
+下载行为：Windows HTTP 断点续传 / Linux curl+wget 下载均无限重试、无超时
 
 常用示例：
   # 基本用法（自动检测系统与版本）
@@ -44,6 +44,7 @@ Windows 通用版脚本不再使用 BITS（SSH 远程登录会话下 BITS 必然
 裸 IP/主机名连接不再回退本机用户名：未指定 -远程账户/-SSH端口 时，从 ~/.ssh/config 按 Host（精确与通配符）、HostName、Port 反查匹配的账户与端口；显式指定时仍以用户输入为准。
 安装目录改为新版 exec server 布局（<数据目录>/cli/servers/<质量名>-<提交号>/server，质量名按通道取 Insiders/Stable），旧 bin/<提交号> 布局弃用，Windows 三个脚本与 Linux 脚本同步修改；实测（远程机 cli/servers 目录时间线）Remote-SSH 自 VS Code 1.126（Insiders，2026-06）起开始使用新布局并自 1.137 起完全落地，早于 1.126 的 VS Code 只识别旧 bin 布局，本模块安装的服务端对其不再生效。
 补装 Remote-SSH 引导所需的远程 CLI（数据根目录下 <code|code-insiders>-<提交号>[.exe]，Windows 取 cli-win32-<架构> 包，Linux 按架构取 cli-alpine-* 或 cli-linux-armhf 包，均含递增间隔的无限重试）；同提交号且结构完整（product.json 与 bin 并存）的 Server 直接复用，不再重复下载。
+进度显示周期改为动态调整：进度不足 2/3 时每个报告周期比上个周期多 1 秒，超过 2/3 后每个周期比上个周期少 1 秒（下限 1 秒）；进度信息的时间戳仅保留时分秒，不再包含日期。
 '@
 		}
 	}
