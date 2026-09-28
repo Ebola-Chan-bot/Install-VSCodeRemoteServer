@@ -45,6 +45,9 @@ Windows 通用版脚本不再使用 BITS（SSH 远程登录会话下 BITS 必然
 安装目录改为新版 exec server 布局（<数据目录>/cli/servers/<质量名>-<提交号>/server，质量名按通道取 Insiders/Stable），旧 bin/<提交号> 布局弃用，Windows 三个脚本与 Linux 脚本同步修改；实测（远程机 cli/servers 目录时间线）Remote-SSH 自 VS Code 1.126（Insiders，2026-06）起开始使用新布局并自 1.137 起完全落地，早于 1.126 的 VS Code 只识别旧 bin 布局，本模块安装的服务端对其不再生效。
 补装 Remote-SSH 引导所需的远程 CLI（数据根目录下 <code|code-insiders>-<提交号>[.exe]，Windows 取 cli-win32-<架构> 包，Linux 按架构取 cli-alpine-* 或 cli-linux-armhf 包，均含递增间隔的无限重试）；同提交号且结构完整（product.json 与 bin 并存）的 Server 直接复用，不再重复下载。
 进度显示周期改为动态调整：进度不足 2/3 时每个报告周期比上个周期多 1 秒，超过 2/3 后每个周期比上个周期少 1 秒（下限 1 秒）；进度信息的时间戳仅保留时分秒，不再包含日期。
+SCP 上传失败的报错信息在远端空间不足类错误（quota exceeded、No space left 等）时额外指明完整上传目标路径（连接目标:远程路径），便于定位是哪台主机的哪个路径空间不足。
+上传目标路径改为绝对路径：安装前先解析远端登录目录（Linux 取 $HOME、Windows 取 %USERPROFILE%），scp 上传目标以该目录为基准拼成完整绝对路径，报错时不再出现 ./xxx 相对路径而无法判断具体位置；解析失败时退回相对路径。
+空间不足类上传报错补充要上传的文件大小，便于估算需要腾出的远端空间。
 '@
 		}
 	}

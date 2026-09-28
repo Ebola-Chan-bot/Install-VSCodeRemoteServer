@@ -343,6 +343,13 @@ function 安装-VSCode远程服务 {
 
 		$远端错误 = ($诊断输出 | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() }) -join "`n"
 
+		# 空间不足类错误额外指明出问题的目标路径（含主机）与要上传的文件大小，便于定位是哪台机器的哪个路径空间不足、需要腾出多少空间
+		if ($远端错误 -match 'quota exceeded|No space left|空间不足|磁盘已满|配额') {
+			$文件信息 = Get-Item -LiteralPath $本地路径 -ErrorAction SilentlyContinue
+			$大小显示 = if ($null -ne $文件信息) { ('{0} 字节' -f $文件信息.Length) } else { '未知' }
+			throw ('SCP 上传失败，退出码: {0}。上传到目标路径 {1}:{2} 时远端空间不足，要上传的文件大小为 {3}。{4}{5}' -f $LASTEXITCODE, $连接目标, $远程路径, $大小显示, "`n", $远端错误)
+		}
+
 		throw ('SCP 上传失败，退出码: {0}。{1}{2}' -f $LASTEXITCODE, "`n", $远端错误)
 	}
 
@@ -423,6 +430,47 @@ function 安装-VSCode远程服务 {
 		}
 	}
 
+	function 取-远程登录目录 {
+		param(
+			[string]$连接目标,
+			[int]$端口,
+			[string]$远程系统类型
+		)
+
+		# 取远程登录目录（scp 相对路径的基准目录），用于把上传目标拼成绝对路径，报错时能指明完整目标路径
+		$查询命令 = if ($远程系统类型 -eq 'Linux') {
+			'printf %s "$HOME"'
+		} else {
+			'powershell -NoProfile -Command "Write-Output $env:USERPROFILE"'
+		}
+
+		$ssh命令 = Get-Command ssh -ErrorAction SilentlyContinue | Select-Object -First 1
+		if ($null -eq $ssh命令) {
+			return ''
+		}
+
+		# 解析失败属可降级场景，返回空串由调用方退回相对路径，故不抛错
+		try {
+			$输出 = @(& $ssh命令.Source (@('-p', $端口) + $script:SSH密码选项 + @($连接目标, $查询命令)))
+		} catch {
+			return ''
+		}
+
+		if ($LASTEXITCODE -ne 0) {
+			return ''
+		}
+
+		# 取最后一个非空行：登录横幅等杂项输出在前，真实目录在命令输出末尾
+		for ($序号 = $输出.Count - 1; $序号 -ge 0; $序号--) {
+			$文本 = ([string]$输出[$序号]).Trim().TrimEnd('/', '\')
+			if (-not [string]::IsNullOrWhiteSpace($文本)) {
+				return $文本
+			}
+		}
+
+		return ''
+	}
+
 	function 探测-远程PS版本 {
 		param(
 			[string]$连接目标,
@@ -468,18 +516,21 @@ function 安装-VSCode远程服务 {
 			[int]$端口,
 			[string]$脚本文本,
 			[string]$本地附加压缩包路径,
-			[string]$远程附加压缩包文件名
+			[string]$远程附加压缩包文件名,
+			[string]$远程登录目录
 		)
 
 		$本地临时脚本路径 = Join-Path $env:TEMP ('临时安装-VSCode远程服务-{0}.ps1' -f ([guid]::NewGuid().ToString('N')))
 		$远程临时脚本文件名 = 'vscode-server-install-temp.ps1'
-		$远程临时脚本路径 = ('./{0}' -f $远程临时脚本文件名)
+		# 已知远程登录目录时上传目标用绝对路径，报错可直接显示完整目标路径；否则退回登录目录下的相对路径
+		$远程路径前缀 = if ([string]::IsNullOrWhiteSpace($远程登录目录)) { './' } else { $远程登录目录.TrimEnd('\', '/') + '\' }
+		$远程临时脚本路径 = $远程路径前缀 + $远程临时脚本文件名
 
 		try {
 			[System.IO.File]::WriteAllText($本地临时脚本路径, $脚本文本, [System.Text.UTF8Encoding]::new($true))
 			上传-文件到远程 -本地路径 $本地临时脚本路径 -连接目标 $连接目标 -端口 $端口 -远程路径 $远程临时脚本路径
 			if (-not [string]::IsNullOrWhiteSpace($本地附加压缩包路径) -and -not [string]::IsNullOrWhiteSpace($远程附加压缩包文件名)) {
-				上传-文件到远程 -本地路径 $本地附加压缩包路径 -连接目标 $连接目标 -端口 $端口 -远程路径 ('./{0}' -f $远程附加压缩包文件名)
+				上传-文件到远程 -本地路径 $本地附加压缩包路径 -连接目标 $连接目标 -端口 $端口 -远程路径 ($远程路径前缀 + $远程附加压缩包文件名)
 			}
 			执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('powershell -NoProfile -ExecutionPolicy Bypass -File "%USERPROFILE%\{0}"' -f $远程临时脚本文件名) -TTY
 		} finally {
@@ -502,12 +553,15 @@ function 安装-VSCode远程服务 {
 		param(
 			[string]$连接目标,
 			[int]$端口,
-			[string]$脚本文本
+			[string]$脚本文本,
+			[string]$远程登录目录
 		)
 
 		$本地临时脚本路径 = Join-Path $env:TEMP ('临时安装-VSCode远程服务-{0}.sh' -f ([guid]::NewGuid().ToString('N')))
 		$远程临时脚本文件名 = 'vscode-server-install-temp.sh'
-		$远程临时脚本路径 = ('./{0}' -f $远程临时脚本文件名)
+		# 已知远程登录目录时上传目标用绝对路径，报错可直接显示完整目标路径；否则退回登录目录下的相对路径
+		$远程路径前缀 = if ([string]::IsNullOrWhiteSpace($远程登录目录)) { './' } else { $远程登录目录.TrimEnd('\', '/') + '/' }
+		$远程临时脚本路径 = $远程路径前缀 + $远程临时脚本文件名
 
 		try {
 			# Linux sh 脚本要求 LF 行尾，且不得带 BOM，否则 shebang 与语法会出错
@@ -561,13 +615,21 @@ function 安装-VSCode远程服务 {
 	# 自动检测远程系统类型
 	$远程系统类型 = 探测-远程系统类型 -连接目标 $连接目标 -端口 $SSH端口
 
+	# 解析远程登录目录：后续上传目标使用绝对路径，报错时能指明完整目标路径
+	$远程登录目录 = 取-远程登录目录 -连接目标 $连接目标 -端口 $SSH端口 -远程系统类型 $远程系统类型
+	if ([string]::IsNullOrWhiteSpace($远程登录目录)) {
+		Write-Host '未能解析远程登录目录，上传目标将使用相对路径。'
+	} else {
+		Write-Host ('远程登录目录: {0}' -f $远程登录目录)
+	}
+
 	if ($远程系统类型 -eq 'Linux') {
 		# Linux 远程主机直接走 sh 安装流程
 		$远程安装脚本 = $script:远程脚本_Linux
 		$远程安装脚本 = $远程安装脚本.Replace('__提交号__', $本地信息.提交号)
 		$远程安装脚本 = $远程安装脚本.Replace('__发布通道__', $本地信息.发布通道)
 
-		执行-Linux远程安装脚本 -连接目标 $连接目标 -端口 $SSH端口 -脚本文本 $远程安装脚本
+		执行-Linux远程安装脚本 -连接目标 $连接目标 -端口 $SSH端口 -脚本文本 $远程安装脚本 -远程登录目录 $远程登录目录
 		清除-SSH密码复用
 		return
 	}
@@ -583,7 +645,7 @@ function 安装-VSCode远程服务 {
 	$远程安装脚本 = $远程安装脚本.Replace('__提交号__', $本地信息.提交号)
 	$远程安装脚本 = $远程安装脚本.Replace('__发布通道__', $本地信息.发布通道)
 
-	执行-远程安装脚本 -连接目标 $连接目标 -端口 $SSH端口 -脚本文本 $远程安装脚本 -本地附加压缩包路径 $本地附加压缩包路径 -远程附加压缩包文件名 $远程附加压缩包文件名
+	执行-远程安装脚本 -连接目标 $连接目标 -端口 $SSH端口 -脚本文本 $远程安装脚本 -本地附加压缩包路径 $本地附加压缩包路径 -远程附加压缩包文件名 $远程附加压缩包文件名 -远程登录目录 $远程登录目录
 	清除-SSH密码复用
 }
 
