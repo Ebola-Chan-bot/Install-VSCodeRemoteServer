@@ -1,6 +1,6 @@
 ﻿@{
 	RootModule           = '安装-VSCode远程服务.psm1'
-	ModuleVersion        = '2.0.0'
+	ModuleVersion        = '2.0.1'
 	GUID                 = '2e2606a2-1d8b-418e-9d6d-a714a7704bdc'
 	Author               = '埃博拉酱-机器人'
 	CompanyName          = '一致行动党'
@@ -40,14 +40,9 @@
 			LicenseUri   = 'https://opensource.org/licenses/MIT'
 			ProjectUri   = 'https://github.com/Ebola-Chan-bot/Install-VSCodeRemoteServer'
 			ReleaseNotes = @'
-Windows 通用版脚本不再使用 BITS（SSH 远程登录会话下 BITS 必然报 0x800704DD），改为基于 HTTP Range 头的断点续传下载：单次运行内任何传输中断都会自动从已下载字节数处续传，无限重试、无超时，失败等待间隔逐次递增。
-裸 IP/主机名连接不再回退本机用户名：未指定 -远程账户/-SSH端口 时，从 ~/.ssh/config 按 Host（精确与通配符）、HostName、Port 反查匹配的账户与端口；显式指定时仍以用户输入为准。
-安装目录改为新版 exec server 布局（<数据目录>/cli/servers/<质量名>-<提交号>/server，质量名按通道取 Insiders/Stable），旧 bin/<提交号> 布局弃用，Windows 三个脚本与 Linux 脚本同步修改；实测（远程机 cli/servers 目录时间线）Remote-SSH 自 VS Code 1.126（Insiders，2026-06）起开始使用新布局并自 1.137 起完全落地，早于 1.126 的 VS Code 只识别旧 bin 布局，本模块安装的服务端对其不再生效。
-补装 Remote-SSH 引导所需的远程 CLI（数据根目录下 <code|code-insiders>-<提交号>[.exe]，Windows 取 cli-win32-<架构> 包，Linux 按架构取 cli-alpine-* 或 cli-linux-armhf 包，均含递增间隔的无限重试）；同提交号且结构完整（product.json 与 bin 并存）的 Server 直接复用，不再重复下载。
-进度显示周期改为动态调整：进度不足 2/3 时每个报告周期比上个周期多 1 秒，超过 2/3 后每个周期比上个周期少 1 秒（下限 1 秒）；进度信息的时间戳仅保留时分秒，不再包含日期。
-SCP 上传失败的报错信息在远端空间不足类错误（quota exceeded、No space left 等）时额外指明完整上传目标路径（连接目标:远程路径），便于定位是哪台主机的哪个路径空间不足。
-上传目标路径改为绝对路径：安装前先解析远端登录目录（Linux 取 $HOME、Windows 取 %USERPROFILE%），scp 上传目标以该目录为基准拼成完整绝对路径，报错时不再出现 ./xxx 相对路径而无法判断具体位置；解析失败时退回相对路径。
-空间不足类上传报错补充要上传的文件大小，便于估算需要腾出的远端空间。
+环境试探合并为单次 SSH 调用：一条跨 shell 兼容的多行探测命令一次取回系统类型、登录目录与 PowerShell 版本，并与免密探测合并（免密主机全程仅一次试探连接）；报告不完整时退回逐项试探保证正确性；Windows OpenSSH 不支持 ControlMaster 连接复用，故采用合并命令而非复用连接。
+断点续传时进度报告周期不再重置为 1 秒：报告周期变量移到重试循环外初始化，跨续传段继承上一段的周期值。
+修复老版 sshd（Win7 自带）挂起：探测类 ssh 调用全部加 -n（stdin 重定向 NUL）。此前在 Win7 主机上远程 powershell 命令输出后 sshd 仍等待 stdin 关闭，ssh 客户端永久挂起，导致逐项试探卡死；已在四台真实主机（Linux x2 / Win10+ / Win7 PS2）验证。
 '@
 		}
 	}
