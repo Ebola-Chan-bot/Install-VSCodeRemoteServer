@@ -6,6 +6,7 @@ $script:模块根目录 = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:远程脚本_通用 = Get-Content -Path (Join-Path $script:模块根目录 'private\远程安装脚本-通用.ps1') -Raw -Encoding UTF8
 $script:远程脚本_Win7 = Get-Content -Path (Join-Path $script:模块根目录 'private\远程安装脚本-Win7.ps1') -Raw -Encoding UTF8
 $script:远程脚本_Linux = Get-Content -Path (Join-Path $script:模块根目录 'private\远程安装脚本-Linux.sh') -Raw -Encoding UTF8
+$script:脚本_sysroot部署 = Get-Content -Path (Join-Path $script:模块根目录 'private\sysroot部署脚本.sh') -Raw -Encoding UTF8
 
 # SSH 密码复用状态（由 初始化-SSH会话 设置）
 $script:SSH密码选项 = @()
@@ -212,11 +213,7 @@ function 安装-VSCode远程服务 {
 	function 取-环境探测命令 {
 		# 单条跨 shell 兼容（sh / cmd / PowerShell 5.1）的多行探测命令：每行在不适用的平台上要么输出可识别的垃圾、要么报非致命错误，解析端按标记/值形态筛选。
 		# 行序有讲究：Windows 关键行在前（PowerShell 默认 shell 若配置文件设了 EAP=Stop，不存在的命令会终止后续行，此时 Linux 专用行丢失也无妨），Linux 关键行在后
-		# 硬约束：命令行内绝不得出现双引号与圆括号——
-		# PS 5.1 向原生命令传字符串参数时不转义内部双引号，远端收到时已被剥掉；
-		# 剥掉后裸露的 ( 对远端 bash 是语法错误，会中止整段脚本导致后续所有关键行丢失
-		# （实测：含括号的 ARCH_PS 行让 Linux 主机报告退化为不完整，每次都回退逐项试探）。
-		# 因此所有取值行都用裸值输出，由解析端按值形态识别（Linux 词汇 / Windows 大写架构名 / 盘符路径 / 纯数字）
+		# 硬约束：命令行内绝不得出现双引号与圆括号——PS 5.1 向原生命令传字符串参数时不转义内部双引号，远端收到时已被剥掉；剥掉后裸露的 ( 对远端 bash 是语法错误，会中止整段脚本导致后续所有关键行丢失（实测：含括号的 ARCH_PS 行让 Linux 主机报告退化为不完整，每次都回退逐项试探）。因此所有取值行都用裸值输出，由解析端按值形态识别（Linux 词汇 / Windows 大写架构名 / 盘符路径 / 纯数字）
 		return @'
 echo HOMEDIR_CMD=%USERPROFILE%
 powershell -NoProfile -Command Write-Output $PSVersionTable.PSVersion.Major
@@ -245,8 +242,7 @@ echo PROBE_END
 				continue
 			}
 
-			# 裸架构行：Linux 侧来自 uname -m（x86_64/aarch64/armv7l 等，位于 Linux 行之后），
-			# Windows 侧来自 powershell 行输出的 %PROCESSOR_ARCHITECTURE% 值（AMD64/ARM64 等）。
+			# 裸架构行：Linux 侧来自 uname -m（x86_64/aarch64/armv7l 等，位于 Linux 行之后），Windows 侧来自 powershell 行输出的 %PROCESSOR_ARCHITECTURE% 值（AMD64/ARM64 等）。
 			# -match 默认大小写不敏感；竞速按需，缺失只影响竞速是否启用，不影响报告完整性
 			if ($原始架构 -eq '' -and $行 -match '^(x86_64|amd64|aarch64|arm64|armv7l|armv6l|armhf|arm|x86)$') {
 				$原始架构 = $行
@@ -815,10 +811,7 @@ echo PROBE_END
 		)
 
 		# 官方 sysroot 妥协方案的全自动部署（VS Code 1.99+ 对旧 glibc 系统的 workaround）：
-		# 在远程家目录组装 vscode-sysroot（glibc 2.28 库 + patchelf 0.18），并向 ~/.bashrc 顶部注入
-		# VSCODE_SERVER_CUSTOM_GLIBC_LINKER / VSCODE_SERVER_CUSTOM_GLIBC_PATH / VSCODE_SERVER_PATCHELF_PATH
-		# 三个环境变量，Remote-SSH 后续安装时即自动用 sysroot patch server 而不报 glibc 先决条件错误。
-		# 已部署过则幂等跳过。返回 sysroot 目录路径；部署失败抛异常由调用方决定容忍度。
+		# 在远程家目录组装 vscode-sysroot（glibc 2.28 库 + patchelf 0.18），并向 ~/.bashrc 顶部注入 VSCODE_SERVER_CUSTOM_GLIBC_LINKER / VSCODE_SERVER_CUSTOM_GLIBC_PATH / VSCODE_SERVER_PATCHELF_PATH 三个环境变量，Remote-SSH 后续安装时即自动用 sysroot patch server 而不报 glibc 先决条件错误。已部署过则幂等跳过。返回 sysroot 目录路径；部署失败抛异常由调用方决定容忍度。
 		$sysroot目录 = ($远程登录目录.TrimEnd('/', '\')) + '/vscode-sysroot'
 
 		# 就绪检查：loader 实体、patchelf、bashrc 标记块三者齐备才算已部署（按 ld-*.so 实体文件判定，与部署脚本的锚定标准一致；缺任一项则重新部署自愈）
@@ -837,88 +830,8 @@ echo PROBE_END
 			上传-文件到远程 -本地路径 $素材文件.FullName -连接目标 $连接目标 -端口 $端口 -远程路径 ($暂存目录 + '/' + $素材文件.Name)
 		}
 
-		# 部署脚本在远端解包（rpm2cpio|cpio 保留 symlink；CentOS/RHEL 系必有此二工具），避免 Windows 侧处理 Linux symlink 的坑。
-		# 关键：EL8 RPM 解包后 glibc 核心库在 lib64/（loader 也在其中），libstdc++/libgcc 在 usr/lib64/；
-		# 而 loader 只搜索自己所在目录与 rpath，故将全部库归并到 loader 所在目录，环境变量写探测到的真实路径
-		$部署脚本文本 = @'
-#!/bin/sh
-set -eu
-SYSROOT='__目录__'
-STAGE="$SYSROOT/.stage"
-
-echo "[sysroot] 开始组装: $SYSROOT"
-mkdir -p "$SYSROOT/glibc" "$SYSROOT/bin"
-cd "$STAGE"
-
-for RPM in glibc-*.rpm libstdc++-*.rpm libgcc-*.rpm; do
-	echo "[sysroot] 解包 $RPM"
-	rpm2cpio "$RPM" | (cd "$SYSROOT/glibc" && cpio -idmu --quiet)
-done
-
-echo '[sysroot] 解包 patchelf'
-TARFILE=$(ls patchelf-*.tar.gz | head -1)
-tar -xzf "$TARFILE" -C "$SYSROOT/bin"
-chmod +x "$SYSROOT/bin/bin/patchelf"
-
-echo '[sysroot] 归并库目录（loader 与全部库必须在同一目录）'
-# 锚定 glibc 原生目录：必须选 ld-2.28.so 实体文件所在目录（RPM 解包后为 lib64/）。
-# 绝不能用复制到其它目录的 loader：实测副本目录作解释器会让 loader 初始化 segfault。
-LOADER_REAL=$(find "$SYSROOT/glibc" -name 'ld-*.so' -type f 2>/dev/null | head -1)
-if [ -z "$LOADER_REAL" ]; then
-	echo '[sysroot] 错误: 未找到动态链接器实体文件 ld-*.so' >&2
-	exit 1
-fi
-LIBDIR=$(dirname "$LOADER_REAL")
-# 把其它目录的库全部复制进原生目录（libstdc++/libgcc 在 usr/lib64/）；-a 保留符号链接形态
-for OTHER in $(find "$SYSROOT/glibc" -name '*.so*' 2>/dev/null); do
-	OD=$(dirname "$OTHER")
-	if [ "$OD" != "$LIBDIR" ]; then
-		cp -a "$OTHER" "$LIBDIR/" 2>/dev/null || true
-	fi
-done
-# 自愈：清除任何非原生目录的 loader 副本/软链（防旧版本部署残留误导后续探测）
-for STALE in $(find "$SYSROOT/glibc" -name 'ld-linux-x86-64.so.2' 2>/dev/null); do
-	SD=$(dirname "$STALE")
-	if [ "$SD" != "$LIBDIR" ]; then
-		rm -f "$STALE" 2>/dev/null || true
-	fi
-done
-LOADER="$LIBDIR/ld-linux-x86-64.so.2"
-
-echo '[sysroot] 验证组件'
-"$SYSROOT/bin/bin/patchelf" --version
-GLIBC_VER=$("$LOADER" --version 2>/dev/null | head -1)
-echo "[sysroot] loader: $LOADER"
-echo "[sysroot] sysroot glibc: $GLIBC_VER"
-case "$GLIBC_VER" in
-	*2.28*) ;;
-	*) echo '[sysroot] 警告: sysroot glibc 版本异常' ;;
-esac
-# 归并目录下必须能看到 libstdc++ 3.4.25（node 原生模块依赖）
-if strings "$LIBDIR/libstdc++.so.6" 2>/dev/null | grep -q GLIBCXX_3.4.25; then
-	echo '[sysroot] libstdc++ GLIBCXX_3.4.25 就绪'
-else
-	echo '[sysroot] 警告: libstdc++ 未含 GLIBCXX_3.4.25'
-fi
-
-echo '[sysroot] 注入 ~/.bashrc 环境变量块（顶部，幂等重建）'
-RC="$HOME/.bashrc"
-touch "$RC"
-TMPRC="$RC.vscsysroot.$$"
-{
-	printf '%s\n' '# >>> vscode-sysroot (安装-VSCode远程服务 模块自动注入) >>>'
-	printf 'export VSCODE_SERVER_CUSTOM_GLIBC_LINKER="%s"\n' "$LOADER"
-	printf 'export VSCODE_SERVER_CUSTOM_GLIBC_PATH="%s"\n' "$LIBDIR"
-	printf 'export VSCODE_SERVER_PATCHELF_PATH="%s/bin/bin/patchelf"\n' "$SYSROOT"
-	printf '%s\n' '# <<< vscode-sysroot <<<'
-	sed '/# >>> vscode-sysroot/,/# <<< vscode-sysroot/d' "$RC"
-} > "$TMPRC"
-mv "$TMPRC" "$RC"
-
-rm -rf "$STAGE"
-echo '[sysroot] 部署完成。'
-'@
-		$部署脚本文本 = ($部署脚本文本 -replace "`r`n", "`n").Replace('__目录__', $sysroot目录)
+		# 部署脚本为独立模板文件（private\sysroot部署脚本.sh，模块加载时读入），在远端解包组装 sysroot；库布局归并、loader 选址与环境变量注入的实现细节见该文件内注释
+		$部署脚本文本 = ($script:脚本_sysroot部署 -replace "`r`n", "`n").Replace('__目录__', $sysroot目录)
 
 		$本地部署脚本路径 = Join-Path $env:TEMP ('sysroot-deploy-{0}.sh' -f ([guid]::NewGuid().ToString('N')))
 		$远程部署脚本文件名 = 'vscode-sysroot-deploy-temp.sh'
@@ -964,10 +877,7 @@ echo '[sysroot] 部署完成。'
 			throw '未找到 ssh 命令，无法探测远程系统类型。'
 		}
 
-		# Windows 远程主机的默认 shell（cmd）没有 uname 命令，只有 Linux 会原样输出内核名与硬件架构。
-		# 一次取回 uname -s 与 uname -m：Linux 侧同时拿到系统类型与原始架构（竞速所需）；
-		# Windows 主机执行 uname 必失败，其 stderr 在 PS 5.1 下会被提升为终止性错误，
-		# 此处静默捕获并视为 Windows（Windows 架构另有探测路径），这是预期的判别路径
+		# Windows 远程主机的默认 shell（cmd）没有 uname 命令，只有 Linux 会原样输出内核名与硬件架构。一次取回 uname -s 与 uname -m：Linux 侧同时拿到系统类型与原始架构（竞速所需）；Windows 主机执行 uname 必失败，其 stderr 在 PS 5.1 下会被提升为终止性错误，此处静默捕获并视为 Windows（Windows 架构另有探测路径），这是预期的判别路径
 		# -n 将 stdin 重定向为 NUL：老版 sshd（如 Win7 自带）在远程命令结束后仍会等待 stdin 关闭才断开会话，不加 -n 会永久挂起
 		try {
 			$输出 = & $ssh命令.Source (@('-n', '-p', $端口) + $script:SSH密码选项 + @($连接目标, 'uname -s; uname -m'))
@@ -1125,8 +1035,7 @@ echo '[sysroot] 部署完成。'
 			}
 
 			try {
-				# 远程默认 shell 可能是 PowerShell 也可能是 cmd，cmd 专属语法（del、2>nul）在 PowerShell 下会报错，
-				# 统一用 powershell 包装，两种 shell 下都能正确执行且静默失败
+				# 远程默认 shell 可能是 PowerShell 也可能是 cmd，cmd 专属语法（del、2>nul）在 PowerShell 下会报错，统一用 powershell 包装，两种 shell 下都能正确执行且静默失败
 				执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('powershell -NoProfile -Command "Remove-Item $env:USERPROFILE\{0} -Force -ErrorAction SilentlyContinue"' -f $远程临时脚本文件名)
 			} catch {
 				# 远程清理失败不影响主流程，临时文件会被系统定期清理
@@ -1204,8 +1113,7 @@ echo '[sysroot] 部署完成。'
 	}
 
 	if ($环境.系统类型 -eq 'Linux') {
-		# 旧 glibc 兼容（官方 sysroot 妥协方案）：VS Code 1.99+ 的 server 要求 glibc >= 2.28，
-		# 老系统（如 CentOS 7 glibc 2.17）需在家目录部署 sysroot 并注入 VSCODE_SERVER_CUSTOM_GLIBC_* 环境变量
+		# 旧 glibc 兼容（官方 sysroot 妥协方案）：VS Code 1.99+ 的 server 要求 glibc >= 2.28，老系统（如 CentOS 7 glibc 2.17）需在家目录部署 sysroot 并注入 VSCODE_SERVER_CUSTOM_GLIBC_* 环境变量
 		$兼容性sysroot目录 = ''
 		$glibc版本 = 探测-远程glibc版本 -连接目标 $连接目标 -端口 $SSH端口
 		if ($null -ne $glibc版本) {

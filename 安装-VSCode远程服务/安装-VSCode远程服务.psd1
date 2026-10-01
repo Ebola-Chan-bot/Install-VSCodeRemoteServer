@@ -40,12 +40,8 @@
 			LicenseUri   = 'https://opensource.org/licenses/MIT'
 			ProjectUri   = 'https://github.com/Ebola-Chan-bot/Install-VSCodeRemoteServer'
 			ReleaseNotes = @'
-环境试探合并为单次 SSH 调用：一条跨 shell 兼容的多行探测命令一次取回系统类型、登录目录与 PowerShell 版本，并与免密探测合并（免密主机全程仅一次试探连接）；报告不完整时退回逐项试探保证正确性；Windows OpenSSH 不支持 ControlMaster 连接复用，故采用合并命令而非复用连接。
-断点续传时进度报告周期不再重置为 1 秒：报告周期变量移到重试循环外初始化，跨续传段继承上一段的周期值。
-修复老版 sshd（Win7 自带）挂起：探测类 ssh 调用全部加 -n（stdin 重定向 NUL）。此前在 Win7 主机上远程 powershell 命令输出后 sshd 仍等待 stdin 关闭，ssh 客户端永久挂起，导致逐项试探卡死；已在四台真实主机（Linux x2 / Win10+ / Win7 PS2）验证。
-竞速架构：Linux 与 Windows 通用版远程主机的 Server 包改为"远程自下载（后台）与本地下载+上传（后台作业）并行，先完成者获胜"。本地模块在登录目录下的 race-<提交号> 暂存目录与远程脚本交换压缩包与带架构后缀的完成标记；胜方产生后写取消标记并终止败方下载。登录目录或远程架构无法确定时自动回退远程单独下载；Win7（PS2）版保持原本的本地供给方式不竞速。环境探测与逐项试探均新增远程架构取回（uname -m / %PROCESSOR_ARCHITECTURE%）。已在 bme_login（Linux x64，预览版）实测：本地侧 16 秒完成 221MB 下载+上传并获胜，安装完整性校验通过。
-旧 glibc Linux 主机自动部署官方 sysroot 妥协方案：探测到远程 glibc < 2.28（如 CentOS 7 的 2.17）时，自动从清华/阿里 CentOS 8 镜像下载 glibc/libstdc++/libgcc RPM 与 patchelf 0.18（本地 TEMP 缓存复用），上传后在远程家目录 rpm2cpio 解包组装 vscode-sysroot（约 30MB，库归并到 loader 原生目录），并向 ~/.bashrc 顶部幂等注入 VSCODE_SERVER_CUSTOM_GLIBC_LINKER/GLIBC_PATH/PATCHELF_PATH 三个环境变量（带标记块）；Remote-SSH 连接时即按官方机制自动 patch server，不再报 glibc 先决条件错误（exitCode 207）。安装脚本本身绝不自行 patchelf——实测 patchelf 直接改写新版 node（v24）会静默损坏二进制且残留错误 interpreter 会误导官方 CLI 跳过修复；改为只以 loader 显式加载方式验证 sysroot 可用性（非破坏）。部署后自动验证非交互 SSH 会话能读到环境变量。已在 bme_login（glibc 2.17，内核 3.10，CentOS 7.6）实测：sysroot 部署、node 经 loader 启动验证（v24.21.0）、环境变量注入全部通过。
-修复单连接环境探测在 Linux 主机上退化的问题：探测命令中含圆括号的 ARCH_PS 行依赖双引号包裹，而 PS 5.1 向原生命令传参时不转义内部双引号，远端 bash 收到裸 ( 即语法错误并中止整段脚本，导致所有 Linux 主机的探测报告不完整、每次连接多花 4 次往返退回逐项试探。现探测命令行内彻底禁用双引号与圆括号，架构改为裸值输出（uname -m / $env:PROCESSOR_ARCHITECTURE），解析端按值形态识别；已在 Linux/Windows/Win7 三台主机实测（Linux 与 Win10 恢复单连接完整报告，Win7 老 sshd 只执行首行的限制不变，仍由逐项试探兜底）。
+竞速架构：Linux 与 Windows 通用版远程主机的 Server 包改为"远程自下载（后台）与本地下载+上传（后台作业）并行，先完成者获胜"。
+旧 glibc Linux 主机自动部署官方 sysroot 妥协方案
 '@
 		}
 	}
