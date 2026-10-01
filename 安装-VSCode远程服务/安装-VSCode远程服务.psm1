@@ -420,7 +420,8 @@ echo PROBE_END
 			[string]$连接目标,
 			[int]$端口,
 			[string]$命令文本,
-			[switch]$TTY
+			[switch]$TTY,
+			[scriptblock]$每行回调
 		)
 
 		$ssh命令 = Get-Command ssh -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -433,7 +434,23 @@ echo PROBE_END
 		$ssh参数 += $连接目标
 		$ssh参数 += $命令文本
 
-		& $ssh命令.Source $ssh参数
+		if ($每行回调) {
+			# 流式转发并逐行回调（用于竞速判胜等事件监听）：Write-Host 保持原有的控制台实时输出
+			# PS 5.1 下原生命令 stderr 一旦被重定向即变终止性错误，捕获期间临时切 Continue 并在 finally 恢复
+			$原始EAP = $ErrorActionPreference
+			try {
+				$ErrorActionPreference = 'Continue'
+				& $ssh命令.Source $ssh参数 2>&1 | ForEach-Object {
+					$文本 = [string]$_
+					Write-Host $文本
+					& $每行回调 $文本
+				}
+			} finally {
+				$ErrorActionPreference = $原始EAP
+			}
+		} else {
+			& $ssh命令.Source $ssh参数
+		}
 		if ($LASTEXITCODE -ne 0) {
 			throw ('SSH 执行失败，退出码: {0}' -f $LASTEXITCODE)
 		}
@@ -611,89 +628,81 @@ echo PROBE_END
 			[string]$系统类型
 		)
 
-		# 后台作业：本地下载压缩包 → 上传到远程暂存目录（.uploading 后缀）→ 原子改名并写完成标记。
-		# 每一步前检查 LOCAL_CANCEL（远程已竞速获胜），避免无谓上传与占带宽。作业内不抛错，失败只记录消息。
-		$密码选项 = @($script:SSH密码选项)
-		$暂存目录 = $竞速上下文.暂存目录
-		$下载地址 = $竞速上下文.下载地址
-		$包文件名 = $竞速上下文.包文件名
-		$远程包名 = $竞速上下文.远程包名
-		$完成标记名 = $竞速上下文.完成标记名
-		$分隔符 = $竞速上下文.分隔符
+		# 供给以独立子 powershell 进程运行（不再是 Start-Job 的同进程 runspace）：Start-Job 无法中断阻塞的网络调用，
+		# 而子进程可在任意步骤被 taskkill /T /F 连同其派生的 ssh/scp 一起终止，实现真正的零轮询即时取消。
+		# 参数经 Clixml 文件传入子进程（避开命令行转义与 PS 5.1 原生 stderr 陷阱）；stdout/stderr 重定向到日志文件，
+		# 收尾时回收打印。返回 {进程;日志路径;错误路径;参数文件路径}。
+		$参数文件 = Join-Path $env:TEMP ('race-supply-param-{0}.xml' -f ([guid]::NewGuid().ToString('N')))
+		$日志文件 = Join-Path $env:TEMP ('race-supply-log-{0}.txt' -f ([guid]::NewGuid().ToString('N')))
+		$错误文件 = Join-Path $env:TEMP ('race-supply-err-{0}.txt' -f ([guid]::NewGuid().ToString('N')))
 
-		return (Start-Job -ArgumentList $连接目标, $端口, $密码选项, $暂存目录, $下载地址, $包文件名, $远程包名, $完成标记名, $系统类型, $分隔符 -ScriptBlock {
-			param($连接目标, $端口, [string[]]$密码选项, $暂存目录, $下载地址, $包文件名, $远程包名, $完成标记名, $系统类型, $分隔符)
-			try {
-				$ErrorActionPreference = 'Stop'
-				[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+		@{
+			连接目标 = $连接目标
+			端口 = $端口
+			密码选项 = @($script:SSH密码选项)
+			暂存目录 = $竞速上下文.暂存目录
+			下载地址 = $竞速上下文.下载地址
+			远程包名 = $竞速上下文.远程包名
+			完成标记名 = $竞速上下文.完成标记名
+			系统类型 = $系统类型
+			分隔符 = $竞速上下文.分隔符
+		} | Export-Clixml -LiteralPath $参数文件
 
-				function 调用-远程命令([string]$命令文本) {
-					# 只返回退出码整数：若返回 ($输出,$退出码) 元组，命令无 stdout 时 PowerShell 会展平数组导致下标错位（实测造成改名成功却误报失败、取消检查永不生效）
-					$ssh命令 = Get-Command ssh -ErrorAction SilentlyContinue | Select-Object -First 1
-					$旧EAP = $ErrorActionPreference
-					try {
-						# 原生命令 stderr 在 PS 5.1 + EAP=Stop 下会变终止性错误，探测/控制命令期间临时降级
-						$ErrorActionPreference = 'Continue'
-						$null = & $ssh命令.Source (@('-n', '-p', $端口) + $密码选项 + @($连接目标, $命令文本)) 2>&1
-					} finally {
-						$ErrorActionPreference = $旧EAP
-					}
-					return $LASTEXITCODE
-				}
+		$供给脚本 = Join-Path $script:模块根目录 'private\本地竞速供给脚本.ps1'
+		$powershell命令 = Get-Command powershell -ErrorAction SilentlyContinue | Select-Object -First 1
+		$powershellExe = if ($powershell命令) { $powershell命令.Source } else { 'powershell.exe' }
 
-				function 取-取消标记命令 {
-					if ($系统类型 -eq 'Linux') {
-						return ('test -f {0}/LOCAL_CANCEL' -f $暂存目录)
-					}
-					return ('powershell -NoProfile -Command "exit ($(if (Test-Path -LiteralPath ''{0}\LOCAL_CANCEL'') {{0}} else {{1}}))"' -f $暂存目录)
-				}
+		$进程 = Start-Process -FilePath $powershellExe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $供给脚本), ('"{0}"' -f $参数文件)) -RedirectStandardOutput $日志文件 -RedirectStandardError $错误文件 -WindowStyle Hidden -PassThru
 
-				if ((调用-远程命令 (取-取消标记命令)) -eq 0) { Write-Output '远程侧已获胜，本地供给取消（下载前）。'; return }
+		return [pscustomobject]@{
+			进程 = $进程
+			日志路径 = $日志文件
+			错误路径 = $错误文件
+			参数文件路径 = $参数文件
+		}
+	}
 
-				# 预建远程暂存目录：本地供给可能先于远程脚本跑到上传步骤，目录不存在会导致 scp 失败
-				$建目录命令 = if ($系统类型 -eq 'Linux') {
-					('mkdir -p {0}' -f $暂存目录)
-				} else {
-					('powershell -NoProfile -Command "New-Item -ItemType Directory -Force -Path ''{0}'' | Out-Null"' -f $暂存目录)
-				}
-				$null = 调用-远程命令 $建目录命令
+	function 停止-供给进程树 {
+		param(
+			$供给
+		)
 
-				# 本地下载（带无限重试；TEMP 内固定文件名，可复用作断点续传的基础）
-				$本地包路径 = Join-Path $env:TEMP ('race-供给-{0}' -f $包文件名)
-				$重试次数 = 0
-				while ($true) {
-					$重试次数++
-					try {
-						Write-Output ('本地开始下载: {0}' -f $下载地址)
-						Invoke-WebRequest -Uri $下载地址 -OutFile $本地包路径 -UseBasicParsing
-						if ((Get-Item $本地包路径).Length -gt 0) { break }
-					} catch {
-						Write-Output ('本地下载第 {0} 次失败: {1}' -f $重试次数, $_.Exception.Message)
-					}
-					Start-Sleep -Seconds ([math]::Min($重试次数, 10))
-				}
-				Write-Output ('本地下载完成: {0} 字节' -f (Get-Item $本地包路径).Length)
+		# 击杀供给进程树：taskkill /T 连同其派生的 ssh/scp 子进程一起终止；
+		# PS 5.1 的 .NET Process.Kill() 只杀单进程不含子进程，更无法中断子进程内阻塞的下载/上传，故用 taskkill。
+		if ($null -eq $供给 -or $null -eq $供给.进程) { return }
+		$proc = $供给.进程
+		try { $proc.Refresh() } catch { }
+		if ($proc.HasExited) { return }
+		$原始EAP = $ErrorActionPreference
+		try {
+			$ErrorActionPreference = 'Continue'
+			$null = & taskkill.exe /PID $proc.Id /T /F 2>&1
+		} finally {
+			$ErrorActionPreference = $原始EAP
+		}
+	}
 
-				if ((调用-远程命令 (取-取消标记命令)) -eq 0) { Write-Output '远程侧已获胜，本地供给取消（上传前）。'; return }
+	function 等待-供给进程并回收日志 {
+		param(
+			$供给
+		)
 
-				$scp命令 = Get-Command scp -ErrorAction SilentlyContinue | Select-Object -First 1
-				Write-Output '开始上传本地压缩包到暂存目录...'
-				$上传目标 = ('{0}:{1}{2}{3}.uploading' -f $连接目标, $暂存目录, $分隔符, $远程包名)
-				& $scp命令.Source (@('-P', $端口) + $密码选项 + @($本地包路径, $上传目标))
-				if ($LASTEXITCODE -ne 0) { Write-Output ('上传失败，退出码 {0}，本地供给退出（远程将继续自下载）。' -f $LASTEXITCODE); return }
-
-				# 原子改名 + 写完成标记（带取消检查，避免远程已获胜后仍写标记）
-				if ($系统类型 -eq 'Linux') {
-					$改名命令 = ('if [ ! -f {0}/LOCAL_CANCEL ]; then mv {0}/{1}.uploading {0}/{1} && touch {0}/{2}; fi' -f $暂存目录, $远程包名, $完成标记名)
-				} else {
-					$改名命令 = ('powershell -NoProfile -Command "if (-not (Test-Path -LiteralPath ''{0}\LOCAL_CANCEL'')) {{ Move-Item -LiteralPath ''{0}\{1}.uploading'' -Destination ''{0}\{1}'' -Force; New-Item -ItemType File -Force ''{0}\{2}'' | Out-Null }}"' -f $暂存目录, $远程包名, $完成标记名)
-				}
-				$改名退出码 = 调用-远程命令 $改名命令
-				if ($改名退出码 -eq 0) { Write-Output '本地供给完成：包已就位并写入完成标记。' } else { Write-Output ('改名/标记命令失败（退出码 {0}），远程将继续自下载。' -f $改名退出码) }
-			} catch {
-				Write-Output ('本地供给任务异常终止: {0}' -f $_.Exception.Message)
+		# 收尾：兜底击杀残留供给进程树、等待退出、按 [本地供给] 前缀打印其日志，再删除临时文件（均失败无害）
+		if ($null -eq $供给) { return }
+		停止-供给进程树 -供给 $供给
+		if ($null -ne $供给.进程) {
+			try { $null = $供给.进程.WaitForExit(10000) } catch { }
+		}
+		foreach ($日志 in @($供给.日志路径, $供给.错误路径)) {
+			if (-not [string]::IsNullOrWhiteSpace($日志) -and (Test-Path -LiteralPath $日志)) {
+				Get-Content -LiteralPath $日志 | ForEach-Object { Write-Host ('[本地供给] {0}' -f $_) }
 			}
-		})
+		}
+		foreach ($临时文件 in @($供给.日志路径, $供给.错误路径, $供给.参数文件路径)) {
+			if (-not [string]::IsNullOrWhiteSpace($临时文件)) {
+				Remove-Item -LiteralPath $临时文件 -Force -ErrorAction SilentlyContinue
+			}
+		}
 	}
 
 	function 清理-竞速暂存目录 {
@@ -1012,7 +1021,8 @@ echo PROBE_END
 			[string]$脚本文本,
 			[string]$本地附加压缩包路径,
 			[string]$远程附加压缩包文件名,
-			[string]$远程登录目录
+			[string]$远程登录目录,
+			[scriptblock]$每行回调
 		)
 
 		$本地临时脚本路径 = Join-Path $env:TEMP ('临时安装-VSCode远程服务-{0}.ps1' -f ([guid]::NewGuid().ToString('N')))
@@ -1027,7 +1037,7 @@ echo PROBE_END
 			if (-not [string]::IsNullOrWhiteSpace($本地附加压缩包路径) -and -not [string]::IsNullOrWhiteSpace($远程附加压缩包文件名)) {
 				上传-文件到远程 -本地路径 $本地附加压缩包路径 -连接目标 $连接目标 -端口 $端口 -远程路径 ($远程路径前缀 + $远程附加压缩包文件名)
 			}
-			执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('powershell -NoProfile -ExecutionPolicy Bypass -File "%USERPROFILE%\{0}"' -f $远程临时脚本文件名) -TTY
+			执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('powershell -NoProfile -ExecutionPolicy Bypass -File "%USERPROFILE%\{0}"' -f $远程临时脚本文件名) -TTY -每行回调 $每行回调
 		} finally {
 			# 清理临时文件（无害操作，失败不影响主流程）
 			if (Test-Path $本地临时脚本路径) {
@@ -1048,7 +1058,8 @@ echo PROBE_END
 			[string]$连接目标,
 			[int]$端口,
 			[string]$脚本文本,
-			[string]$远程登录目录
+			[string]$远程登录目录,
+			[scriptblock]$每行回调
 		)
 
 		$本地临时脚本路径 = Join-Path $env:TEMP ('临时安装-VSCode远程服务-{0}.sh' -f ([guid]::NewGuid().ToString('N')))
@@ -1062,7 +1073,7 @@ echo PROBE_END
 			$脚本文本 = $脚本文本 -replace "`r`n", "`n"
 			[System.IO.File]::WriteAllText($本地临时脚本路径, $脚本文本, [System.Text.UTF8Encoding]::new($false))
 			上传-文件到远程 -本地路径 $本地临时脚本路径 -连接目标 $连接目标 -端口 $端口 -远程路径 $远程临时脚本路径
-			执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('sh ~/{0}' -f $远程临时脚本文件名) -TTY
+			执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('sh ~/{0}' -f $远程临时脚本文件名) -TTY -每行回调 $每行回调
 		} finally {
 			# 清理临时文件（无害操作，失败不影响主流程）
 			if (Test-Path $本地临时脚本路径) {
@@ -1128,14 +1139,17 @@ echo PROBE_END
 			}
 		}
 
-		# Linux 远程主机走 sh 安装流程；能确定暂存目录与远程架构时启用竞速（本地后台下载+上传 与 远程自下载 并行，先完成者胜）
+		# Linux 远程主机走 sh 安装流程；能确定暂存目录与远程架构时启用竞速（本地子进程下载+上传 与 远程自下载 并行，先完成者胜）
 		$竞速上下文 = 初始化-竞速上下文 -环境 $环境 -发布通道 $本地信息.发布通道 -提交号 $本地信息.提交号
-		$本地供给作业 = $null
+		$本地供给 = $null
+		$每行回调 = $null
 		if ($null -ne $竞速上下文) {
-			Write-Host ('已启用竞速模式：本地下载+上传 与 远程自下载并行，暂存目录 {0}' -f $竞速上下文.暂存目录)
+			Write-Host ('已启用竞速模式：本地子进程下载+上传 与 远程自下载并行，暂存目录 {0}' -f $竞速上下文.暂存目录)
 			# 预清理暂存目录，防陈旧标记/残包造成误判
 			清理-竞速暂存目录 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型
-			$本地供给作业 = 启动-本地竞速供给 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型
+			$本地供给 = 启动-本地竞速供给 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型
+			# 事件驱动即时取消：监听远程 stdout，一旦输出"竞速获胜"即竞速结束，立刻击杀本地供给进程树（零轮询）
+			$每行回调 = { param($行) if ($行 -match '竞速获胜') { 停止-供给进程树 -供给 $本地供给 } }.GetNewClosure()
 		} else {
 			Write-Host '未启用竞速模式（登录目录或远程架构无法确定），由远程单独下载。'
 		}
@@ -1147,14 +1161,10 @@ echo PROBE_END
 		$远程安装脚本 = $远程安装脚本.Replace('__兼容性目录__', $兼容性sysroot目录)
 
 		try {
-			执行-Linux远程安装脚本 -连接目标 $连接目标 -端口 $SSH端口 -脚本文本 $远程安装脚本 -远程登录目录 $环境.登录目录
+			执行-Linux远程安装脚本 -连接目标 $连接目标 -端口 $SSH端口 -脚本文本 $远程安装脚本 -远程登录目录 $环境.登录目录 -每行回调 $每行回调
 		} finally {
-			# 收尾：停本地供给作业并汇报其日志，再双保险清理暂存目录（失败无害）
-			if ($null -ne $本地供给作业) {
-				Stop-Job -Job $本地供给作业 -ErrorAction SilentlyContinue
-				Receive-Job -Job $本地供给作业 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ('[本地供给] {0}' -f $_) }
-				Remove-Job -Job $本地供给作业 -Force -ErrorAction SilentlyContinue
-			}
+			# 收尾：击杀本地供给进程树并回收其日志，再双保险清理暂存目录（失败无害）
+			等待-供给进程并回收日志 -供给 $本地供给
 			if ($null -ne $竞速上下文) {
 				清理-竞速暂存目录 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型
 			}
@@ -1163,10 +1173,12 @@ echo PROBE_END
 		return
 	}
 
+
 	# Windows 远程主机：一律自动探测脚本版本（按远程 PowerShell 版本选择）
 	$远程安装脚本 = 选择-远程脚本 -PS主版本 $环境.PS主版本
 	$竞速上下文 = $null
-	$本地供给作业 = $null
+	$本地供给 = $null
+	$每行回调 = $null
 	if ($远程安装脚本 -eq $script:远程脚本_Win7) {
 		# Win7（PS2）版无法在远程后台作业里可靠自下载，保持原有本地下载+上传供给方式，不竞速
 		$本地附加压缩包路径 = 下载-本地服务器压缩包 -发布通道 $本地信息.发布通道 -提交号 $本地信息.提交号 -架构 'win32-x64'
@@ -1175,9 +1187,10 @@ echo PROBE_END
 		# 通用版：能确定暂存目录与远程架构时启用竞速
 		$竞速上下文 = 初始化-竞速上下文 -环境 $环境 -发布通道 $本地信息.发布通道 -提交号 $本地信息.提交号
 		if ($null -ne $竞速上下文) {
-			Write-Host ('已启用竞速模式：本地下载+上传 与 远程自下载并行，暂存目录 {0}' -f $竞速上下文.暂存目录)
+			Write-Host ('已启用竞速模式：本地子进程下载+上传 与 远程自下载并行，暂存目录 {0}' -f $竞速上下文.暂存目录)
 			清理-竞速暂存目录 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型
-			$本地供给作业 = 启动-本地竞速供给 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型
+			$本地供给 = 启动-本地竞速供给 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型
+			$每行回调 = { param($行) if ($行 -match '竞速获胜') { 停止-供给进程树 -供给 $本地供给 } }.GetNewClosure()
 		} else {
 			Write-Host '未启用竞速模式（登录目录或远程架构无法确定），由远程单独下载。'
 		}
@@ -1189,19 +1202,16 @@ echo PROBE_END
 	$远程安装脚本 = $远程安装脚本.Replace('__暂存目录__', $(if ($null -ne $竞速上下文) { $竞速上下文.暂存目录 } else { '' }))
 
 	try {
-		执行-远程安装脚本 -连接目标 $连接目标 -端口 $SSH端口 -脚本文本 $远程安装脚本 -本地附加压缩包路径 $本地附加压缩包路径 -远程附加压缩包文件名 $远程附加压缩包文件名 -远程登录目录 $环境.登录目录
+		执行-远程安装脚本 -连接目标 $连接目标 -端口 $SSH端口 -脚本文本 $远程安装脚本 -本地附加压缩包路径 $本地附加压缩包路径 -远程附加压缩包文件名 $远程附加压缩包文件名 -远程登录目录 $环境.登录目录 -每行回调 $每行回调
 	} finally {
-		if ($null -ne $本地供给作业) {
-			Stop-Job -Job $本地供给作业 -ErrorAction SilentlyContinue
-			Receive-Job -Job $本地供给作业 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ('[本地供给] {0}' -f $_) }
-			Remove-Job -Job $本地供给作业 -Force -ErrorAction SilentlyContinue
-		}
+		等待-供给进程并回收日志 -供给 $本地供给
 		if ($null -ne $竞速上下文) {
 			清理-竞速暂存目录 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型
 		}
 	}
 	清除-SSH密码复用
 }
+
 
 # 导出公共函数
 Export-ModuleMember -Function '安装-VSCode远程服务'

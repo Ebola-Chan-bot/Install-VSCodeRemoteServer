@@ -325,13 +325,14 @@ if (-not [string]::IsNullOrWhiteSpace($暂存目录)) {
 	Remove-Item -LiteralPath $远程包路径, $远程完成标记, (Join-Path $暂存目录 'LOCAL_CANCEL') -Force -ErrorAction SilentlyContinue
 
 	Write-Host '竞速模式：远程自下载与本地下载+上传并行，先完成者用于安装。'
-	# 把断点续传下载函数以文本形式带入后台作业（Start-Job 是独立进程，无法直接调用本脚本函数），保证竞速模式下远程侧仍是断点续传
+	# 把断点续传下载函数以文本形式带入后台作业（Start-Job 是独立进程，无法直接调用本脚本函数），保证竞速模式下远程侧仍是断点续传。
+	# 注意：Definition 属性不含花括号（函数体以 param(...) 开头），注入时必须自行包上 { }，否则是非法函数声明
 	$下载函数文本 = (Get-Command '通过HTTP断点续传下载').Definition
 	$下载作业 = Start-Job -ArgumentList $下载函数文本, $下载地址, $远程包路径, $远程完成标记 -ScriptBlock {
 		param($下载函数文本, $下载地址, $远程包路径, $远程完成标记)
 		$ErrorActionPreference = 'Continue'
 		[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-		Invoke-Expression ('function 通过HTTP断点续传下载 ' + $下载函数文本)
+		Invoke-Expression ('function 通过HTTP断点续传下载 { ' + $下载函数文本 + ' }')
 		try {
 			通过HTTP断点续传下载 -下载地址 $下载地址 -目标路径 $远程包路径
 			if ((Test-Path $远程包路径) -and ((Get-Item $远程包路径).Length -gt 0)) {
