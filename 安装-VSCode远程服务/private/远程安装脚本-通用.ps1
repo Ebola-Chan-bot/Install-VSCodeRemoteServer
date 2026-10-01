@@ -278,6 +278,8 @@ function 展开-服务器压缩包 {
 
 $提交号 = '__提交号__'
 $发布通道 = '__发布通道__'
+# 竞速暂存目录：本地模块与远程脚本约定在同一目录交换压缩包与标记文件；空串表示未启用竞速，回退远程单独下载
+$暂存目录 = '__暂存目录__'
 $系统架构 = 取-系统架构标识
 $最终安装目录 = 取-安装目录 -通道 $发布通道 -版本提交号 $提交号
 # 固定文件名（不含随机后缀），使同一安装目录下的下载路径确定，便于识别与断点续传定位
@@ -310,15 +312,86 @@ if (Test-Path $最终安装目录) {
 
 New-Item -ItemType Directory -Force $最终安装目录 | Out-Null
 
-Write-Host '开始通过 HTTP 断点续传下载压缩包。'
-通过HTTP断点续传下载 -下载地址 $下载地址 -目标路径 $下载压缩包路径
+$获胜包路径 = $下载压缩包路径
+if (-not [string]::IsNullOrWhiteSpace($暂存目录)) {
+	# ===== 竞速模式：远程自下载（后台作业）与本地下载+上传（由本地模块负责）并行，先完成者获胜 =====
+	New-Item -ItemType Directory -Force $暂存目录 | Out-Null
+	$远程包路径 = Join-Path $暂存目录 'REMOTE.zip'
+	$远程完成标记 = Join-Path $暂存目录 'REMOTE_DONE'
+	# 本地完成标记带远程实际架构后缀：本地供给侧若架构判断错误则永远对不上，避免错误架构的包获胜
+	$本地完成标记 = Join-Path $暂存目录 ('LOCAL_DONE.{0}' -f $系统架构)
+	$本地包路径 = Join-Path $暂存目录 'LOCAL.zip'
+	# 清理本端上一轮残留；LOCAL_DONE/LOCAL.zip 由本地供给任务管理，不在此处删（可能已先于本脚本完成）
+	Remove-Item -LiteralPath $远程包路径, $远程完成标记, (Join-Path $暂存目录 'LOCAL_CANCEL') -Force -ErrorAction SilentlyContinue
 
-if (-not (Test-Path $下载压缩包路径)) {
-	throw ('下载完成后未找到压缩包: {0}' -f $下载压缩包路径)
+	Write-Host '竞速模式：远程自下载与本地下载+上传并行，先完成者用于安装。'
+	# 把断点续传下载函数以文本形式带入后台作业（Start-Job 是独立进程，无法直接调用本脚本函数），保证竞速模式下远程侧仍是断点续传
+	$下载函数文本 = (Get-Command '通过HTTP断点续传下载').Definition
+	$下载作业 = Start-Job -ArgumentList $下载函数文本, $下载地址, $远程包路径, $远程完成标记 -ScriptBlock {
+		param($下载函数文本, $下载地址, $远程包路径, $远程完成标记)
+		$ErrorActionPreference = 'Continue'
+		[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+		Invoke-Expression ('function 通过HTTP断点续传下载 ' + $下载函数文本)
+		try {
+			通过HTTP断点续传下载 -下载地址 $下载地址 -目标路径 $远程包路径
+			if ((Test-Path $远程包路径) -and ((Get-Item $远程包路径).Length -gt 0)) {
+				New-Item -ItemType File -Force $远程完成标记 | Out-Null
+				Write-Output '远程自下载完成。'
+			} else {
+				Write-Output '远程自下载结束后未发现完整压缩包，等待本地供给。'
+			}
+		} catch {
+			Write-Output ('远程自下载异常终止: {0}' -f $_.Exception.Message)
+		}
+	}
+
+	$等待秒数 = 0
+	$获胜方 = $null
+	while ($true) {
+		if (Test-Path -LiteralPath $远程完成标记) { $获胜方 = '远程自下载'; break }
+		if (Test-Path -LiteralPath $本地完成标记) { $获胜方 = '本地供给'; break }
+		# 流式转发后台作业的输出（下载进度/重试消息）
+		Receive-Job -Job $下载作业 | ForEach-Object { Write-Host ('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $_) }
+		Start-Sleep -Seconds 1
+		$等待秒数++
+		if (($等待秒数 % 30) -eq 0) {
+			$远程字节 = 0
+			if (Test-Path $远程包路径) { $远程字节 = (Get-Item $远程包路径).Length }
+			$本地字节 = 0
+			if (Test-Path $本地包路径) { $本地字节 = (Get-Item $本地包路径).Length }
+			elseif (Test-Path ($本地包路径 + '.uploading')) { $本地字节 = (Get-Item ($本地包路径 + '.uploading')).Length }
+			Write-Host ('[{0}] 竞速等待 {1}s：远程侧已下 {2} 字节，本地侧已到 {3} 字节。' -f (Get-Date -Format 'HH:mm:ss'), $等待秒数, $远程字节, $本地字节)
+		}
+	}
+
+	# 胜负已定：写取消标记让本地供给任务停止后续动作，并终止远程后台下载
+	New-Item -ItemType File -Force (Join-Path $暂存目录 'LOCAL_CANCEL') | Out-Null
+	Stop-Job -Job $下载作业 -ErrorAction SilentlyContinue
+	Receive-Job -Job $下载作业 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $_) }
+	Remove-Job -Job $下载作业 -Force -ErrorAction SilentlyContinue
+
+	if ($获胜方 -eq '本地供给') { $获胜包路径 = $本地包路径 } else { $获胜包路径 = $远程包路径 }
+	Write-Host ('竞速获胜：{0} 的压缩包，开始解压。' -f $获胜方)
+
+	if (-not (Test-Path -LiteralPath $获胜包路径)) {
+		throw ('竞速获胜的包不存在: {0}' -f $获胜包路径)
+	}
+} else {
+	Write-Host '开始通过 HTTP 断点续传下载压缩包。'
+	通过HTTP断点续传下载 -下载地址 $下载地址 -目标路径 $下载压缩包路径
+
+	if (-not (Test-Path $下载压缩包路径)) {
+		throw ('下载完成后未找到压缩包: {0}' -f $下载压缩包路径)
+	}
 }
 
 Write-Host '下载完成，开始解压。'
-展开-服务器压缩包 -压缩包路径 $下载压缩包路径 -目标目录 $最终安装目录
+展开-服务器压缩包 -压缩包路径 $获胜包路径 -目标目录 $最终安装目录
+
+# 竞速暂存目录用完即清（本地模块收尾时也会再清一次，双保险）
+if (-not [string]::IsNullOrWhiteSpace($暂存目录)) {
+	Remove-Item -LiteralPath $暂存目录 -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 Write-Host '安装完成，当前目录内容如下。'
 Get-ChildItem -Force $最终安装目录 | Select-Object Name, Length, Mode | Format-Table -AutoSize
