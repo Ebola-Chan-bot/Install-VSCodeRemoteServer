@@ -20,6 +20,7 @@ try {
 	$完成标记名 = [string]$参数.完成标记名
 	$系统类型 = [string]$参数.系统类型
 	$分隔符 = [string]$参数.分隔符
+	$提交号 = [string]$参数.提交号
 
 	function 调用-远程命令([string]$命令文本) {
 		# 只返回退出码整数：若返回 ($输出,$退出码) 元组，命令无 stdout 时 PowerShell 会展平数组导致下标错位
@@ -46,8 +47,9 @@ try {
 	}
 	$null = 调用-远程命令 $建目录命令
 
-	# 分块 HTTP 断点续传下载（失败无限重试且等待秒数递增）。进程会在远程获胜时被整体击杀，故下载循环无需任何取消检查；半成品保留在本地 TEMP 固定文件名，供下次运行续传。
-	$本地包路径 = Join-Path $env:TEMP ('race-supply-{0}' -f $远程包名)
+	# 分块 HTTP 断点续传下载（失败无限重试且等待秒数递增）。进程会在远程获胜时被整体击杀，故下载循环无需任何取消检查；
+	# 半成品保留在本地 TEMP 供下次运行续传，文件名带提交号：防旧版本残包被 416 误判为完整或被错误续传。
+	$本地包路径 = Join-Path $env:TEMP ('race-supply-{0}-{1}' -f $提交号, $远程包名)
 	$重试次数 = 0
 	while ($true) {
 		$重试次数++
@@ -80,6 +82,18 @@ try {
 			Write-Output ('本地下载完成：共 {0} 字节。' -f $已下载)
 			break
 		} catch {
+			# 416 = 请求区间无效：断点续传起点已不小于服务器完整大小，说明本地文件早已下载完整（如实测 231MB 包上次运行被击杀后残留），视为成功退出重试循环。
+			# PS 5.1 中 GetResponse 抛出的 $_.Exception 常是 MethodInvocationException 包装（实测取不到状态码），真正的 WebException 在 InnerException 里，须遍历异常链
+			$HTTP状态码 = 0
+			$异常 = $_.Exception
+			while ($null -ne $异常 -and $HTTP状态码 -eq 0) {
+				try { $HTTP状态码 = [int]$异常.Response.StatusCode } catch { }
+				$异常 = $异常.InnerException
+			}
+			if ($HTTP状态码 -eq 416 -and $已存在字节数 -gt 0) {
+				Write-Output ('服务器返回 416：本地文件 {0} 字节已完整，无需续传。' -f $已存在字节数)
+				break
+			}
 			$等待秒数 = [Math]::Min(30, $重试次数 * 2)
 			Write-Output ('下载中断（{0}），{1} 秒后重试（第 {2} 次，已续传 {3} 字节）...' -f $_.Exception.Message, $等待秒数, $重试次数, $已存在字节数)
 			Start-Sleep -Seconds $等待秒数

@@ -239,6 +239,18 @@ function 通过HTTP断点续传下载 {
 			Write-Host ('[{0}] 下载完成。' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
 			return
 		} catch {
+			# 416 = 请求区间无效：断点续传起点已不小于服务器完整大小，说明本地文件早已下载完整，视为成功。
+			# PS 5.1 中 GetResponse 抛出的 $_.Exception 常是 MethodInvocationException 包装（实测取不到状态码），真正的 WebException 在 InnerException 里，须遍历异常链
+			$HTTP状态码 = 0
+			$异常 = $_.Exception
+			while ($null -ne $异常 -and $HTTP状态码 -eq 0) {
+				try { $HTTP状态码 = [int]$异常.Response.StatusCode } catch { }
+				$异常 = $异常.InnerException
+			}
+			if ($HTTP状态码 -eq 416 -and $已存在字节数 -gt 0) {
+				Write-Host ('[{0}] 服务器返回 416：文件 {1} 字节已完整，无需续传。' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $已存在字节数)
+				return
+			}
 			Write-Host ('[{0}] 第 {1} 次下载中断: {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $重试次数, $_.Exception.Message)
 		}
 

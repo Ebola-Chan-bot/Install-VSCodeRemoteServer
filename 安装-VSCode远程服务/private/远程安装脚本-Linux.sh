@@ -80,12 +80,19 @@ log() {
 	echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
 
+# ===== 下载原语（sh 逐行解释执行，函数必须定义在所有调用点之前：install_cli 在下方即会调用）=====
+download_file() {
+	url="$1"
+	output="$2"
+	if [ "$DOWNLOADER" = 'curl' ]; then
+		curl -fL --connect-timeout 30 -o "$output" "$url"
+	else
+		wget -q -O "$output" "$url"
+	fi
+}
+
 # ===== 旧 glibc 兼容性验证（官方 VSCODE_SERVER_CUSTOM_GLIBC_* 妥协方案）=====
-# 注意：本脚本绝不自行 patchelf 修改 server 二进制——那是 Remote-SSH CLI 连接时的官方职责
-# （CLI 读 VSCODE_SERVER_CUSTOM_GLIBC_LINKER/PATH/PATCHELF_PATH 三个环境变量自行 patch）。
-# 实测自行 patch 新版 node（v24，4MB 对齐段）会被 patchelf 静默写坏——exit 0 但二进制损坏，
-# 且残留的错误 interpreter 会让官方 CLI 误判“已 patch”而跳过修复。
-# 这里只用 loader 显式加载的方式验证 sysroot 库能否支撑 server 的 node 运行（不修改任何文件）。
+# 注意：本脚本绝不自行 patchelf 修改 server 二进制——那是 Remote-SSH CLI 连接时的官方职责（CLI 读 VSCODE_SERVER_CUSTOM_GLIBC_LINKER/PATH/PATCHELF_PATH 三个环境变量自行 patch）。实测自行 patch 新版 node（v24，4MB 对齐段）会被 patchelf 静默写坏——exit 0 但二进制损坏，且残留的错误 interpreter 会让官方 CLI 误判“已 patch”而跳过修复。这里只用 loader 显式加载的方式验证 sysroot 库能否支撑 server 的 node 运行（不修改任何文件）。
 verify_sysroot() {
 	[ -n "$SYSROOT" ] || return 0
 	LOADER_REAL=$(find "$SYSROOT/glibc" -name 'ld-*.so' -type f 2>/dev/null | head -1)
@@ -159,17 +166,7 @@ fi
 rm -rf "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 
-# ===== 下载原语与远程自下载循环（无限重试 + 双备用地址，成功后写 REMOTE_DONE 标记） =====
-download_file() {
-	url="$1"
-	output="$2"
-	if [ "$DOWNLOADER" = 'curl' ]; then
-		curl -fL --connect-timeout 30 -o "$output" "$url"
-	else
-		wget -q -O "$output" "$url"
-	fi
-}
-
+# ===== 远程自下载循环（无限重试 + 双备用地址，成功后写 REMOTE_DONE 标记） =====
 run_remote_download() {
 	ATTEMPT=0
 	WAIT_SECONDS=0
