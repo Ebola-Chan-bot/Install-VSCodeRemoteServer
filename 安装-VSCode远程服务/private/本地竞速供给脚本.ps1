@@ -23,27 +23,34 @@ try {
 	$提交号 = [string]$参数.提交号
 
 	function 调用-远程命令([string]$命令文本) {
-		# 只返回退出码整数：若返回 ($输出,$退出码) 元组，命令无 stdout 时 PowerShell 会展平数组导致下标错位
+		# 返回 {退出码, 输出} 对象（不用元组：命令无 stdout 时 PowerShell 会展平数组导致下标错位），失败时把远端报错一并带回展示
 		$ssh命令 = Get-Command ssh -ErrorAction SilentlyContinue | Select-Object -First 1
-		$null = & $ssh命令.Source (@('-n', '-p', $端口) + $密码选项 + @($连接目标, $命令文本)) 2>&1
-		return $LASTEXITCODE
+		$输出 = @(& $ssh命令.Source (@('-n', '-p', $端口) + $密码选项 + @($连接目标, $命令文本)) 2>&1)
+		$输出文本 = ($输出 | ForEach-Object { [string]$_ }) -join ' | '
+		return [pscustomobject]@{ 退出码 = $LASTEXITCODE; 输出 = $输出文本 }
+	}
+
+	function 转换-远程PowerShell命令([string]$脚本文本) {
+		# Windows 远程命令统一走 powershell -EncodedCommand：命令行只剩 base64，不含双引号/圆括号/管道等会被 PS5.1 传参剥掉或被远端 cmd 解析的字符（同 取-环境探测命令 的硬约束）
+		$编码 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($脚本文本))
+		return ('powershell -NoProfile -EncodedCommand {0}' -f $编码)
 	}
 
 	function 取-取消标记命令 {
 		if ($系统类型 -eq 'Linux') {
 			return ('test -f {0}/LOCAL_CANCEL' -f $暂存目录)
 		}
-		return ('powershell -NoProfile -Command "exit ($(if (Test-Path -LiteralPath ''{0}\LOCAL_CANCEL'') {{0}} else {{1}}))"' -f $暂存目录)
+		return (转换-远程PowerShell命令 ('if (Test-Path -LiteralPath ''{0}\LOCAL_CANCEL'') {{ exit 0 }} else {{ exit 1 }}' -f $暂存目录))
 	}
 
 	# 下载前的低成本取消检查（远程已获胜则不必下载）
-	if ((调用-远程命令 (取-取消标记命令)) -eq 0) { Write-Output '远程侧已获胜，本地供给取消（下载前）。'; return }
+	if ((调用-远程命令 (取-取消标记命令)).退出码 -eq 0) { Write-Output '远程侧已获胜，本地供给取消（下载前）。'; return }
 
 	# 预建远程暂存目录：本地供给可能先于远程脚本跑到上传步骤，目录不存在会导致 scp 失败
 	$建目录命令 = if ($系统类型 -eq 'Linux') {
 		('mkdir -p {0}' -f $暂存目录)
 	} else {
-		('powershell -NoProfile -Command "New-Item -ItemType Directory -Force -Path ''{0}'' | Out-Null"' -f $暂存目录)
+		(转换-远程PowerShell命令 ('New-Item -ItemType Directory -Force -Path ''{0}'' | Out-Null' -f $暂存目录))
 	}
 	$null = 调用-远程命令 $建目录命令
 
@@ -105,7 +112,7 @@ try {
 	}
 
 	# 上传前的取消复检：防止远程恰在下载完成到上传之间获胜，仍做一次低成本检查
-	if ((调用-远程命令 (取-取消标记命令)) -eq 0) { Write-Output '远程侧已获胜，本地供给取消（上传前）。'; return }
+	if ((调用-远程命令 (取-取消标记命令)).退出码 -eq 0) { Write-Output '远程侧已获胜，本地供给取消（上传前）。'; return }
 
 	$scp命令 = Get-Command scp -ErrorAction SilentlyContinue | Select-Object -First 1
 	Write-Output '开始上传本地压缩包到暂存目录...'
@@ -113,14 +120,22 @@ try {
 	$null = & $scp命令.Source (@('-P', $端口) + $密码选项 + @($本地包路径, $上传目标)) 2>&1
 	if ($LASTEXITCODE -ne 0) { Write-Output ('上传失败，退出码 {0}，本地供给退出（远程将继续自下载）。' -f $LASTEXITCODE); return }
 
-	# 原子改名 + 写完成标记（带远端取消检查，避免远程已获胜后仍写标记）
+	# 原子改名 + 写完成标记（带远端取消检查，避免远程已获胜后仍写标记）。退出码约定：0=包已就位，2=远程已获胜跳过改名，其他=失败
+	# Linux 版包 sh -c 是防登录 shell 不是 sh（tcsh/fish 会把 if...then...fi 判成语法错误）；Windows 版经 转换-远程PowerShell命令 走 EncodedCommand，避开双引号被剥与 cmd 把 | 当管道解析
 	if ($系统类型 -eq 'Linux') {
-		$改名命令 = ('if [ ! -f {0}/LOCAL_CANCEL ]; then mv {0}/{1}.uploading {0}/{1} && touch {0}/{2}; fi' -f $暂存目录, $远程包名, $完成标记名)
+		$改名命令 = ("sh -c 'if [ -f {0}/LOCAL_CANCEL ]; then exit 2; fi; mv {0}/{1}.uploading {0}/{1} && touch {0}/{2}'" -f $暂存目录, $远程包名, $完成标记名)
 	} else {
-		$改名命令 = ('powershell -NoProfile -Command "if (-not (Test-Path -LiteralPath ''{0}\LOCAL_CANCEL'')) {{ Move-Item -LiteralPath ''{0}\{1}.uploading'' -Destination ''{0}\{1}'' -Force; New-Item -ItemType File -Force ''{0}\{2}'' | Out-Null }}"' -f $暂存目录, $远程包名, $完成标记名)
+		$改名脚本 = ('if (Test-Path -LiteralPath ''{0}\LOCAL_CANCEL'') {{ exit 2 }}; try {{ Move-Item -LiteralPath ''{0}\{1}.uploading'' -Destination ''{0}\{1}'' -Force -ErrorAction Stop; New-Item -ItemType File -Force ''{0}\{2}'' -ErrorAction Stop | Out-Null }} catch {{ Write-Output $_.Exception.Message; exit 1 }}' -f $暂存目录, $远程包名, $完成标记名)
+		$改名命令 = 转换-远程PowerShell命令 $改名脚本
 	}
-	$改名退出码 = 调用-远程命令 $改名命令
-	if ($改名退出码 -eq 0) { Write-Output '本地供给完成：包已就位并写入完成标记。' } else { Write-Output ('改名/标记命令失败（退出码 {0}），远程将继续自下载。' -f $改名退出码) }
+	$改名结果 = 调用-远程命令 $改名命令
+	if ($改名结果.退出码 -eq 0) {
+		Write-Output '本地供给完成：包已就位并写入完成标记。'
+	} elseif ($改名结果.退出码 -eq 2) {
+		Write-Output '远程侧已获胜，本地供给取消（改名前）。'
+	} else {
+		Write-Output ('改名/标记命令失败（退出码 {0}），远端报错：{1}，远程将继续自下载。' -f $改名结果.退出码, $(if ([string]::IsNullOrWhiteSpace($改名结果.输出)) { '无' } else { $改名结果.输出 }))
+	}
 } catch {
 	Write-Output ('本地供给任务异常终止: {0}' -f $_.Exception.Message)
 }

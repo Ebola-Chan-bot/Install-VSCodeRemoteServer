@@ -4,6 +4,7 @@
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# 关闭内置进度条：Invoke-WebRequest 的进度条靠移动光标反复重绘，在 SSH 会话里会把已输出的中文行重绘错乱（每个汉字重影、行首留大段空格），本脚本的关键进度均有自打印文本，不需要进度条
 
 function 取-系统架构标识 {
 	$原始架构 = if ($env:PROCESSOR_ARCHITEW6432) {
@@ -74,6 +75,8 @@ function 安装-远程CLI {
 	)
 
 	# 仅补装缺失的 CLI（Remote-SSH 引导仅做文件存在性检查，存在即视为已安装）；CLI 压缩包约 30MB，直接整包下载，无需断点续传，失败按递增间隔无限重试
+	# VS Code 连接时的官方引导会与本脚本并行下载并启动同名 CLI：运行中的 exe 被系统锁定、无法覆盖，只复制不复查会永远报"文件被占用"并无限重试，故每轮重试前与失败后都复查落地文件，只要它已出现即视为安装完成（文件名含提交号，同名即同版本，无需覆盖）
+	# 落位用改名而非复制：解包目录与目标同在数据目录下，改名是原子操作，中断也不会留下残缺 exe 占着正式名而被误判为已安装
 	if (Test-Path -LiteralPath $CLI信息.落地路径) {
 		Write-Host ('[{0}] CLI 已存在，跳过安装: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $CLI信息.落地路径)
 		return
@@ -86,6 +89,11 @@ function 安装-远程CLI {
 	$重试次数 = 0
 	while ($true) {
 		$重试次数++
+		# 重试前复查：并行的官方引导可能已把 CLI 装好（甚至已启动），此时安装实际已完成，直接收尾退出，不再徒劳下载 30MB 后必然复制失败
+		if (Test-Path -LiteralPath $CLI信息.落地路径) {
+			Write-Host ('[{0}] CLI 已就位（并行安装完成），跳过安装: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $CLI信息.落地路径)
+			return
+		}
 		try {
 			Write-Host ('[{0}] 开始下载远程 CLI（第 {1} 次尝试）: {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $重试次数, $CLI信息.下载地址)
 			Invoke-WebRequest -Uri $CLI信息.下载地址 -OutFile $cli压缩包路径 -UseBasicParsing
@@ -98,7 +106,7 @@ function 安装-远程CLI {
 					throw ('CLI 压缩包内未找到 {0}。' -f $CLI信息.包内可执行名)
 				}
 
-				Copy-Item -LiteralPath $包内路径 -Destination $CLI信息.落地路径 -Force
+				Move-Item -LiteralPath $包内路径 -Destination $CLI信息.落地路径 -Force
 			} finally {
 				Remove-Item $临时解压目录 -Recurse -Force -ErrorAction SilentlyContinue
 				Remove-Item $cli压缩包路径 -Force -ErrorAction SilentlyContinue
@@ -108,6 +116,11 @@ function 安装-远程CLI {
 			return
 		} catch {
 			Write-Host ('[{0}] 第 {1} 次 CLI 下载中断: {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $重试次数, $_.Exception.Message)
+			# 失败后复查：报"被另一进程占用"通常就是并行引导已把 CLI 装好并在运行，此时安装实际已完成，视为成功收尾而非无限重试
+			if (Test-Path -LiteralPath $CLI信息.落地路径) {
+				Write-Host ('[{0}] CLI 已就位（并行安装完成），视为安装完成: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $CLI信息.落地路径)
+				return
+			}
 		}
 
 		Start-Sleep -Seconds $重试次数
@@ -312,7 +325,9 @@ $服务端已就绪 = (Test-Path -LiteralPath (Join-Path $最终安装目录 'pr
 if ($服务端已就绪) {
 	# Remote-SSH 的 CLI 用 server 目录下的 product.json 与 bin 判定安装完整性，同提交号且结构完整则直接复用，避免重复下载约 190MB 的 Server 压缩包
 	Write-Host ('[{0}] 同提交号的 Server 已完整安装，跳过下载与解压: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $最终安装目录)
-	Get-ChildItem -Force $最终安装目录 | Select-Object Name, Length, Mode | Format-Table -AutoSize
+	# 表格经 Out-String 转为单字符串后由 Write-Host 输出：避免成功流与信息流在 SSH 管道合并时缺换行，导致表格与上一行粘连
+	$目录表格 = (Get-ChildItem -Force $最终安装目录 | Select-Object Name, Length, Mode | Format-Table -AutoSize | Out-String).TrimEnd()
+	Write-Host $目录表格
 	return
 }
 
@@ -407,4 +422,6 @@ if (-not [string]::IsNullOrWhiteSpace($暂存目录)) {
 }
 
 Write-Host '安装完成，当前目录内容如下。'
-Get-ChildItem -Force $最终安装目录 | Select-Object Name, Length, Mode | Format-Table -AutoSize
+# 表格经 Out-String 转为单字符串后由 Write-Host 输出：避免成功流与信息流在 SSH 管道合并时缺换行，导致表格与上一行粘连
+$目录表格 = (Get-ChildItem -Force $最终安装目录 | Select-Object Name, Length, Mode | Format-Table -AutoSize | Out-String).TrimEnd()
+Write-Host $目录表格

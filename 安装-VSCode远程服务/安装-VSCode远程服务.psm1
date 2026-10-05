@@ -7,10 +7,74 @@ $script:远程脚本_通用 = Get-Content -Path (Join-Path $script:模块根目�
 $script:远程脚本_Win7 = Get-Content -Path (Join-Path $script:模块根目录 'private\远程安装脚本-Win7.ps1') -Raw -Encoding UTF8
 $script:远程脚本_Linux = Get-Content -Path (Join-Path $script:模块根目录 'private\远程安装脚本-Linux.sh') -Raw -Encoding UTF8
 $script:脚本_sysroot部署 = Get-Content -Path (Join-Path $script:模块根目录 'private\sysroot部署脚本.sh') -Raw -Encoding UTF8
+$script:脚本_原生组件补丁 = Get-Content -Path (Join-Path $script:模块根目录 'private\原生组件补丁脚本.sh') -Raw -Encoding UTF8
+$script:脚本_服务保活部署 = Get-Content -Path (Join-Path $script:模块根目录 'private\服务保活部署脚本.sh') -Raw -Encoding UTF8
 
 # SSH 密码复用状态（由 初始化-SSH会话 设置）
 $script:SSH密码选项 = @()
 $script:密码已注入 = $false
+# 远端输出中未闭合的 OSC 标题序列跨行跟踪标志（由 剥离-终端控制序列 使用）
+$script:标题序列未闭合 = $false
+
+function 剥离-终端控制序列 {
+	param(
+		[string]$文本
+	)
+
+	# 带 -TTY 分配 PTY 后，远端 Windows 控制台（conhost/PowerShell）会向输出流插入 VT 控制序列：清屏 ESC[2J、光标归零 ESC[H、藏/显光标、设窗口标题的 OSC 序列（内部可含换行且可跨行到达）。这些序列原样透传到本地终端会被照做执行，造成提前清屏、光标乱跳、逐字重影、行首大段空白等错位乱行。逐行转发前一律剥掉，只留纯文本。
+	$结果 = New-Object System.Text.StringBuilder
+	$位置 = 0
+	while ($位置 -lt $文本.Length) {
+		$字符 = $文本[$位置]
+		if ($script:标题序列未闭合) {
+			# 仍在 OSC 标题序列内部：整段丢弃直到终止符 BEL 或 ST(ESC\)
+			if ($字符 -eq [char]7) {
+				$script:标题序列未闭合 = $false
+				$位置++
+				continue
+			}
+			if ($字符 -eq [char]27) {
+				# 可能是 ST，交给下方转义序列分支处理
+				$script:标题序列未闭合 = $false
+				continue
+			}
+			$位置++
+			continue
+		}
+		if ($字符 -ne [char]27) {
+			# 行内残留 CR 会让终端回车覆写同一行，一并丢弃
+			if ($字符 -ne [char]13) { [void]$结果.Append($字符) }
+			$位置++
+			continue
+		}
+		# ESC 开头的序列
+		if (($位置 + 1) -ge $文本.Length) {
+			$位置++
+			continue
+		}
+		$引导符 = $文本[$位置 + 1]
+		if ($引导符 -eq '[') {
+			# CSI 序列：ESC[ 参数字节(0x30-0x3F)* 中间字节(0x20-0x2F)* 终止字节(0x40-0x7E)
+			$位置 += 2
+			while ($位置 -lt $文本.Length -and [int][char]$文本[$位置] -ge 0x30 -and [int][char]$文本[$位置] -le 0x3F) { $位置++ }
+			while ($位置 -lt $文本.Length -and [int][char]$文本[$位置] -ge 0x20 -and [int][char]$文本[$位置] -le 0x2F) { $位置++ }
+			if ($位置 -lt $文本.Length) { $位置++ }
+		} elseif ($引导符 -eq ']') {
+			# OSC 序列：ESC]...BEL 或 ESC]...ST(ESC\)，可能被按行切分，闭合与否用标志跨调用跟踪
+			$位置 += 2
+			while ($位置 -lt $文本.Length) {
+				if ($文本[$位置] -eq [char]7) { $位置++; break }
+				if ($文本[$位置] -eq [char]27 -and ($位置 + 1) -lt $文本.Length -and $文本[$位置 + 1] -eq '\') { $位置 += 2; break }
+				$位置++
+			}
+			if ($位置 -ge $文本.Length) { $script:标题序列未闭合 = $true }
+		} else {
+			# 两字符转义（ESC=、ESC> 等）：丢弃 ESC 与紧跟的一个字符
+			$位置 += 2
+		}
+	}
+	return $结果.ToString()
+}
 
 function 安装-VSCode远程服务 {
 	[CmdletBinding()]
@@ -25,7 +89,14 @@ function 安装-VSCode远程服务 {
 		[int]$SSH端口 = 0,
 
 		[ValidateSet('预览版', '稳定版')]
-		[string]$本地版本
+		[string]$本地版本,
+
+		# 以下两个开关仅供本模块的公共入口 安装-VSCode服务保活 转发使用，对用户隐藏
+		[Parameter(DontShow)]
+		[switch]$仅服务保活,
+
+		[Parameter(DontShow)]
+		[switch]$移除服务保活
 	)
 
 	function 取-本地VSCode信息 {
@@ -435,13 +506,14 @@ echo PROBE_END
 		$ssh参数 += $命令文本
 
 		if ($每行回调) {
-			# 流式转发并逐行回调（用于竞速判胜等事件监听）：Write-Host 保持原有的控制台实时输出
+			# 流式转发并逐行回调（用于竞速判胜等事件监听）：Write-Host 保持原有的控制台实时输出；转发前剥离远端控制序列，避免本地终端照做执行造成乱行
 			# PS 5.1 下原生命令 stderr 一旦被重定向即变终止性错误，捕获期间临时切 Continue 并在 finally 恢复
 			$原始EAP = $ErrorActionPreference
 			try {
 				$ErrorActionPreference = 'Continue'
+				$script:标题序列未闭合 = $false
 				& $ssh命令.Source $ssh参数 2>&1 | ForEach-Object {
-					$文本 = [string]$_
+					$文本 = 剥离-终端控制序列 ([string]$_)
 					Write-Host $文本
 					& $每行回调 $文本
 				}
@@ -449,7 +521,17 @@ echo PROBE_END
 				$ErrorActionPreference = $原始EAP
 			}
 		} else {
-			& $ssh命令.Source $ssh参数
+			# 无回调时同样逐行净化后转发（不能原样透传：远端控制序列会让本地终端清屏/跳光标）
+			$原始EAP = $ErrorActionPreference
+			try {
+				$ErrorActionPreference = 'Continue'
+				$script:标题序列未闭合 = $false
+				& $ssh命令.Source $ssh参数 2>&1 | ForEach-Object {
+					Write-Host (剥离-终端控制序列 ([string]$_))
+				}
+			} finally {
+				$ErrorActionPreference = $原始EAP
+			}
 		}
 		if ($LASTEXITCODE -ne 0) {
 			throw ('SSH 执行失败，退出码: {0}' -f $LASTEXITCODE)
@@ -877,6 +959,75 @@ echo PROBE_END
 		return $sysroot目录
 	}
 
+	function 修补-远程原生组件 {
+		param(
+			[string]$连接目标,
+			[int]$端口,
+			[string]$远程登录目录
+		)
+
+		# 旧 glibc 主机上有两类原生组件需要与 server 的 node 走同一套 sysroot 环境：
+		# vsce-sign（扩展签名校验工具，.NET 单文件）与 *.node（扩展/服务端原生模块，node 的RUNPATH不被 dlopen 子对象继承，librt/libutil 等落到系统老库报 GLIBC_PRIVATE 错）。补丁脚本自带备份、patch 后实际加载验证与失败还原，幂等（已 patch 且验证通过则跳过）。
+		$补丁脚本文本 = $script:脚本_原生组件补丁 -replace "`r`n", "`n"
+		$本地临时脚本路径 = Join-Path $env:TEMP ('native-patch-{0}.sh' -f ([guid]::NewGuid().ToString('N')))
+		$远程临时脚本路径 = $远程登录目录.TrimEnd('/', '\') + '/vscode-native-patch-temp.sh'
+		try {
+			[System.IO.File]::WriteAllText($本地临时脚本路径, $补丁脚本文本, [System.Text.UTF8Encoding]::new($false))
+			上传-文件到远程 -本地路径 $本地临时脚本路径 -连接目标 $连接目标 -端口 $端口 -远程路径 $远程临时脚本路径
+
+			$补丁结果 = 执行-SSH命令并捕获 -连接目标 $连接目标 -端口 $端口 -命令文本 ('sh "{0}"' -f $远程临时脚本路径)
+			foreach ($行 in $补丁结果.输出) { Write-Host ([string]$行) }
+			if ($补丁结果.退出码 -ne 0) {
+				Write-Host ('警告: 原生组件补丁未完全成功（退出码 {0}），扩展签名校验或原生模块加载可能仍会失败。' -f $补丁结果.退出码)
+			}
+		} finally {
+			Remove-Item $本地临时脚本路径 -Force -ErrorAction SilentlyContinue
+			try { 执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('rm -f "{0}"' -f $远程临时脚本路径) } catch { }
+		}
+	}
+
+	function 部署-VSCode服务保活 {
+		param(
+			[string]$连接目标,
+			[int]$端口,
+			[string]$远程登录目录,
+			[string]$提交号,
+			[string]$发布通道,
+			[ValidateSet('部署', '移除')]
+			[string]$动作
+		)
+
+		# 把 Remote-SSH exec server 的启动入口 CLI（<数据根目录>/code[-insiders]-<提交号>）替换为包装脚本：真正启动的command-shell以「双 fork + setsid」拉起（PPID 归 1、自建会话），与 sshd-session 的祖先链彻底断开而存活；主机周期性收割超龄会话时 Server 不死，本地 VS Code 重连即可热附着（复用 pid.txt 与 connectionToken）而非冷启动。真实二进制备份必须放数据目录之外：官方引导脚本每次连接都会按文件名对数据目录做 GC（只保留最新 5 个匹配项）。
+		$根目录 = $远程登录目录.TrimEnd('/', '\')
+		$数据目录名 = if ($发布通道 -eq 'insider') { '.vscode-server-insiders' } else { '.vscode-server' }
+		$CLI基础名 = if ($发布通道 -eq 'insider') { 'code-insiders' } else { 'code' }
+
+		$脚本文本 = $script:脚本_服务保活部署
+		$脚本文本 = $脚本文本.Replace('__动作__', $动作)
+		$脚本文本 = $脚本文本.Replace('__数据目录__', ($根目录 + '/' + $数据目录名))
+		$脚本文本 = $脚本文本.Replace('__服务保活目录__', ($根目录 + '/.vscode-persistent'))
+		$脚本文本 = $脚本文本.Replace('__CLI文件名__', ($CLI基础名 + '-' + $提交号))
+		$脚本文本 = $脚本文本.Replace('__当前提交号__', $提交号)
+		$脚本文本 = $脚本文本.Replace('__发布通道__', $发布通道)
+
+		$本地临时脚本路径 = Join-Path $env:TEMP ('临时VSCode服务保活-{0}.sh' -f ([guid]::NewGuid().ToString('N')))
+		$远程临时脚本路径 = $根目录 + '/vscode-server-persist-temp.sh'
+		try {
+			# Linux sh 脚本要求 LF 行尾，且不得带 BOM，否则 shebang 与语法会出错
+			[System.IO.File]::WriteAllText($本地临时脚本路径, ($脚本文本 -replace "`r`n", "`n"), [System.Text.UTF8Encoding]::new($false))
+			上传-文件到远程 -本地路径 $本地临时脚本路径 -连接目标 $连接目标 -端口 $端口 -远程路径 $远程临时脚本路径
+
+			$结果 = 执行-SSH命令并捕获 -连接目标 $连接目标 -端口 $端口 -命令文本 ('sh "{0}"' -f $远程临时脚本路径)
+			foreach ($行 in $结果.输出) { Write-Host $行 }
+			if ($结果.退出码 -ne 0) {
+				throw ('服务保活{0}脚本失败，退出码 {1}' -f $动作, $结果.退出码)
+			}
+		} finally {
+			Remove-Item $本地临时脚本路径 -Force -ErrorAction SilentlyContinue
+			try { 执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('rm -f "{0}"' -f $远程临时脚本路径) } catch { }
+		}
+	}
+
 	function 探测-远程系统类型 {
 		param(
 			[string]$连接目标,
@@ -1125,6 +1276,27 @@ echo PROBE_END
 		Write-Host ('远程登录目录: {0}' -f $环境.登录目录)
 	}
 
+	# 服务保活入口：只部署或移除包装脚本，不安装 Server、不启用竞速下载
+	if ($仅服务保活) {
+		if ($环境.系统类型 -ne 'Linux') {
+			清除-SSH密码复用
+			throw '服务保活仅支持 Linux 远程主机（依赖 setsid 脱离会话与 POSIX sh）。'
+		}
+		if ([string]::IsNullOrWhiteSpace($环境.登录目录)) {
+			清除-SSH密码复用
+			throw '无法解析远程登录目录，服务保活需要绝对路径，请确认远程 shell 能输出 $HOME。'
+		}
+
+		$保活动作 = if ($移除服务保活) { '移除' } else { '部署' }
+		Write-Host ('执行服务保活{0}...' -f $保活动作)
+		try {
+			部署-VSCode服务保活 -连接目标 $连接目标 -端口 $SSH端口 -远程登录目录 $环境.登录目录 -提交号 $本地信息.提交号 -发布通道 $本地信息.发布通道 -动作 $保活动作
+		} finally {
+			清除-SSH密码复用
+		}
+		return
+	}
+
 	if ($环境.系统类型 -eq 'Linux') {
 		# 旧 glibc 兼容（官方 sysroot 妥协方案）：VS Code 1.99+ 的 server 要求 glibc >= 2.28，老系统（如 CentOS 7 glibc 2.17）需在家目录部署 sysroot 并注入 VSCODE_SERVER_CUSTOM_GLIBC_* 环境变量
 		$兼容性sysroot目录 = ''
@@ -1151,7 +1323,9 @@ echo PROBE_END
 			清理-竞速暂存目录 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型
 			$本地供给 = 启动-本地竞速供给 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型
 			# 事件驱动即时取消：监听远程 stdout，一旦输出"竞速获胜"即竞速结束，立刻击杀本地供给进程树（零轮询）
-			$每行回调 = { param($行) if ($行 -match '竞速获胜') { 停止-供给进程树 -供给 $本地供给 } }.GetNewClosure()
+			# GetNewClosure 把回调绑进独立动态模块，模块里看不到本函数的嵌套函数，须先把函数体取成脚本块变量随闭包带走
+			$停止供给动作 = ${function:停止-供给进程树}
+			$每行回调 = { param($行) if ($行 -match '竞速获胜') { & $停止供给动作 -供给 $本地供给 } }.GetNewClosure()
 		} else {
 			Write-Host '未启用竞速模式（登录目录或远程架构无法确定），由远程单独下载。'
 		}
@@ -1169,6 +1343,14 @@ echo PROBE_END
 			等待-供给进程并回收日志 -供给 $本地供给
 			if ($null -ne $竞速上下文) {
 				清理-竞速暂存目录 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型
+			}
+			# 旧 glibc 主机：vsce-sign 与 *.node 原生模块同样需要 sysroot 环境，收尾时统一补丁（失败仅告警不影响安装结果）
+			if (-not [string]::IsNullOrWhiteSpace($兼容性sysroot目录)) {
+				try {
+					修补-远程原生组件 -连接目标 $连接目标 -端口 $SSH端口 -远程登录目录 $环境.登录目录
+				} catch {
+					Write-Host ('警告: 原生组件补丁步骤失败: {0}' -f $_.Exception.Message)
+				}
 			}
 		}
 		清除-SSH密码复用
@@ -1192,7 +1374,9 @@ echo PROBE_END
 			Write-Host ('已启用竞速模式：本地子进程下载+上传 与 远程自下载并行，暂存目录 {0}' -f $竞速上下文.暂存目录)
 			清理-竞速暂存目录 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型
 			$本地供给 = 启动-本地竞速供给 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型
-			$每行回调 = { param($行) if ($行 -match '竞速获胜') { 停止-供给进程树 -供给 $本地供给 } }.GetNewClosure()
+			# 事件驱动即时取消：同上，函数体先取成脚本块变量再带入 GetNewClosure 闭包
+			$停止供给动作 = ${function:停止-供给进程树}
+			$每行回调 = { param($行) if ($行 -match '竞速获胜') { & $停止供给动作 -供给 $本地供给 } }.GetNewClosure()
 		} else {
 			Write-Host '未启用竞速模式（登录目录或远程架构无法确定），由远程单独下载。'
 		}
@@ -1215,5 +1399,80 @@ echo PROBE_END
 }
 
 
+function 安装-VSCode服务保活 {
+	<#
+	.SYNOPSIS
+		让远程 Linux 主机上的 VS Code Server 脱离 SSH 会话存活，主机周期性回收超龄会话后本地重连可热附着。
+
+	.DESCRIPTION
+		部分集群登录节点会用 root 权限的周期任务强制回收超龄 SSH 会话（实测有主机把存活超过 60 分钟的会话全部杀掉）。Remote-SSH 的 exec server 进程树是 sshd 会话后代，会随之被杀：本地 VS Code 每小时掉线一次，重连后远端终端与扩展状态全部丢失，日志表现为 Unknown reconnection token 加整轮冷启动。
+
+		本命令把数据根目录下的 CLI 入口（code[-insiders]-<提交号>）替换为包装脚本：真正启动的 command-shell 以「双 fork + setsid」方式拉起——子 shell 立即退出使真身 PPID 归 1、setsid 另建会话与进程组，从而与 sshd 会话的祖先链彻底断开，在会话被周期性收割后存活；同时把 --parent-process-id 看门狗参数改写为 PID 1。真实二进制另存到 <登录目录>/.vscode-persistent/real，避开官方引导脚本按文件名对数据目录做的 GC（只保留最新 5 个匹配项）。
+
+		效果：会话仍会被回收（这层由主机管理策略决定，无法在客户端改变），但 Server 不死，本地 VS Code 自动重连时热附着，编辑器、扩展宿主与远端终端及其滚动历史原地保留。掉线代价从整轮冷启动降为十几秒闪断。
+
+		注意：VS Code 更新到新提交号后需重新执行一次本命令。新提交号的 CLI 会由官方引导脚本下载为裸 ELF，当次连接不受保护，重跑后恢复保护。
+
+	.PARAMETER 远程主机
+		目标主机名或 IP（必填，位置参数 0）。传 ~/.ssh/config 中的 Host 别名时，账户与端口由 OpenSSH 自行解析。
+
+	.PARAMETER 远程账户
+		SSH 登录账户。未指定时从 ~/.ssh/config 反查匹配项。
+
+	.PARAMETER SSH端口
+		SSH 端口。未指定时取 ~/.ssh/config 中匹配到的 Port，仍无则用 22。
+
+	.PARAMETER 本地版本
+		预览版或稳定版。本机同时安装两者时必填，用于确定提交号与数据根目录名。
+
+	.PARAMETER 移除
+		还原为官方原始布局：把真实二进制移回数据目录覆盖包装脚本，并删除 .vscode-persistent 目录。
+
+	.EXAMPLE
+		安装-VSCode服务保活 bme_login_贾梦涵
+
+		对 ~/.ssh/config 中的别名部署服务保活，账户与端口由配置文件解析。
+
+	.EXAMPLE
+		安装-VSCode服务保活 10.15.49.6 -SSH端口 22112 -远程账户 v-jiamh -本地版本 预览版
+
+		裸 IP 连接时显式给出账户、端口与本机版本。
+
+	.EXAMPLE
+		安装-VSCode服务保活 bme_login_贾梦涵 -移除
+
+		移除保活包装，还原官方原始布局。
+	#>
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory = $true, Position = 0)]
+		[Alias('目标服务器', '计算机名', 'IP', '主机')]
+		[string]$远程主机,
+
+		[string]$远程账户,
+
+		# 0 表示未指定：将优先采用 ~/.ssh/config 中匹配到的 Port，仍无则用 22
+		[int]$SSH端口 = 0,
+
+		[ValidateSet('预览版', '稳定版')]
+		[string]$本地版本,
+
+		[switch]$移除
+	)
+
+	# 复用主入口已实现的连接协商（ssh config 反查、密码一次性收集复用、环境与登录目录探测），仅把动作切成服务保活的部署或移除
+	$转发参数 = @{
+		远程主机     = $远程主机
+		SSH端口      = $SSH端口
+		仅服务保活   = $true
+		移除服务保活 = $移除.IsPresent
+	}
+	if (-not [string]::IsNullOrWhiteSpace($远程账户)) { $转发参数['远程账户'] = $远程账户 }
+	if (-not [string]::IsNullOrWhiteSpace($本地版本)) { $转发参数['本地版本'] = $本地版本 }
+
+	安装-VSCode远程服务 @转发参数
+}
+
+
 # 导出公共函数
-Export-ModuleMember -Function '安装-VSCode远程服务'
+Export-ModuleMember -Function '安装-VSCode远程服务', '安装-VSCode服务保活'

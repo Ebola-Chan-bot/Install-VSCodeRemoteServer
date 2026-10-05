@@ -126,6 +126,11 @@ install_cli() {
 	CLI_ATTEMPT=0
 	while true; do
 		CLI_ATTEMPT=$((CLI_ATTEMPT + 1))
+		# 每轮重试前复查：官方引导可能已并行把 CLI 装好，此时安装实际已完成，直接收尾退出，不再无谓下载重试
+		if [ -f "$CLI_ON_DISK" ]; then
+			log "CLI 已就位（并行安装完成），跳过安装: $CLI_ON_DISK"
+			return 0
+		fi
 		if log "开始下载远程 CLI（第 $CLI_ATTEMPT 次尝试）: $CLI_URL" && download_file "$CLI_URL" "$CLI_TAR" && [ -s "$CLI_TAR" ]; then
 			CLI_TMP="$DATA_DIR/cli-unpack-$$"
 			rm -rf "$CLI_TMP"
