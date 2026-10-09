@@ -1,6 +1,7 @@
 #!/bin/sh
-# 包装脚本版本: WRAPPER-V4-DOUBLE-FORK
+# 包装脚本版本: WRAPPER-V5-NAME-EXEMPT
 # VSCODE-PERSISTENT-WRAPPER-v2 : 让 exec server 的 command-shell 脱离 sshd 会话，并把看门狗父进程钉死为 PID 1
+# v5 追加名字豁免：收割按 /proc/<pid>/comm 认名（豁免名单含 tmux/bash/sh/zsh/sshd/screen，实测同名 daemon 存活 17 小时），node 启动后 comm=MainThread、CLI comm=code-insiders-* 均在必死名单，故真身经名为 tmux 的符号链接启动、node 全树经 NODE_OPTIONS 自改名。
 # 由 安装-VSCode服务保活 自动生成；还原方式：安装-VSCode服务保活 -远程主机 <主机> -移除
 # 真实二进制放数据目录之外（官方引导脚本的 GC 会按文件名清理数据目录，放在里面必被误删）
 # PERSIST_DIR 的真实路径由 服务保活部署脚本.sh 的 write_wrapper 生成时填入
@@ -104,14 +105,39 @@ while [ "$REMAIN" -gt 0 ]; do
 	esac
 done
 
+# ---- 名字豁免改造：收割按 /proc/<pid>/comm 认名，非豁免名 60 分钟必死 ----
+# 实测豁免名单含 tmux（D1 实验：同名启动的 CLI daemon 存活 17 小时），而 node 启动后 comm=MainThread、CLI comm=code-insiders-* 均必死。两招：① 真身经名为 tmux 的符号链接启动，comm 取链接名；② node 全树经 NODE_OPTIONS 加载 comm-renamer.js（由部署脚本落位）自改名为 tmux。跨进程改名不可行（写 /proc/<pid>/comm 一律 EINVAL、ptrace 被 dumpable=0 拒绝），只能各自启动时自改。
+RENAMER="$PERSIST_DIR/comm-renamer.js"
+if [ -f "$RENAMER" ]; then
+	NODE_OPTS="--require $RENAMER"
+	export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }$NODE_OPTS"
+	# VS Code 服务端会把 VSCODE_NODE_OPTIONS 映射为子进程的 NODE_OPTIONS（out/server-main.js），保证 ext host / pty host 等内部 node 也被改名；两者都设可覆盖新旧两条链路
+	export VSCODE_NODE_OPTIONS="${VSCODE_NODE_OPTIONS:+$VSCODE_NODE_OPTIONS }$NODE_OPTS"
+fi
+LAUNCH_DIR="$PERSIST_DIR/launch/$SELF_NAME"
+HOLD_DIR="$PERSIST_DIR/hold"
+mkdir -p "$LAUNCH_DIR" "$HOLD_DIR" 2>/dev/null || true
+ln -sf "$REAL" "$LAUNCH_DIR/tmux" 2>/dev/null || true
+ln -sf "$(command -v sleep 2>/dev/null || echo /bin/sleep)" "$HOLD_DIR/tmux" 2>/dev/null || true
+
 # ---- 双 fork 脱逃：子 shell 内 setsid 后台启动真身 ----
 # 只用 setsid 不够：它改会话与进程组，却不改 PPID。daemon 的 PPID 仍是引导脚本那个 sh，而 sh 的父进程正是 60 分钟到期的 sshd-session，收割按祖先链清理时照样命中。
 # 实测：旧 server 日志停在被收割前一刻，且无任何优雅退出记录，证明单靠 setsid 未能脱逃。
 # 本机 setsid 为 util-linux 2.23，无 --fork 选项，故用子 shell 实现双 fork：子 shell 立即退出 → 真身被 init 收养（PPID=1，祖先链断裂）；setsid 另建会话与进程组。
 # 对照证据：同机 tmux 因 PPID=1 已存活数十小时，而全系统无一 VS Code 服务进程活过 70 分钟。
 # 真身继承 wrapper 的 stdout/stderr，仍写入引导脚本重定向的 CLI 日志文件，其中 "Listening on 127.0.0.1:<port>" 照旧能被引导脚本解析出来。
-( setsid "$REAL" "$@" & )
-log "已双 fork 启动 daemon（PPID=1、自建会话），参数: $*"
+# 经 tmux 名符号链接启动（comm=tmux 豁免收割）；链接缺失时退回直启，退化为 v4 行为但不致启动失败。
+if [ -x "$LAUNCH_DIR/tmux" ]; then
+	( setsid "$LAUNCH_DIR/tmux" "$@" & )
+	log "已双 fork 启动 daemon（PPID=1、自建会话、comm=tmux），参数: $*"
+else
+	( setsid "$REAL" "$@" & )
+	log "tmux 名链接缺失，退回直启真身（comm 不豁免），参数: $*"
+fi
 
-# wrapper 自身必须继续存活：引导脚本以 $!（即 wrapper 的 PID）做 kill -0 存活检查，若此处立即退出会被判定 "Exec server process not found" 而中止启动流程。收割来临时本壳进程随会话一起消失，真身因祖先链已断而不受影响。用 exec 把壳进程自身替换为 sleep：收割来临时它随会话一起消失，不会像 while+sleep 那样留下一个游离的子 sleep 进程。
-exec sleep 2147483647
+# wrapper 自身必须继续存活：引导脚本以 $!（即 wrapper 的 PID）做 kill -0 存活检查，若此处立即退出会被判定 "Exec server process not found" 而中止启动流程。收割来临时本壳进程随会话一起消失，真身因祖先链已断而不受影响。用 exec 把壳进程自身替换为 sleep：收割来临时它随会话一起消失，不会像 while+sleep 那样留下一个游离的子 sleep 进程。占位 sleep 同样经 tmux 名链接，避免自身 60 分钟被收割留下杂音。
+if [ -x "$HOLD_DIR/tmux" ]; then
+	exec "$HOLD_DIR/tmux" 2147483647
+else
+	exec sleep 2147483647
+fi

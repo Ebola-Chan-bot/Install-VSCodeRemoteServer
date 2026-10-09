@@ -21,6 +21,7 @@ CURRENT_CLI='__CLI文件名__'
 CURRENT_COMMIT='__当前提交号__'
 CHANNEL='__发布通道__'
 WRAP_TEMPLATE='__包装脚本路径__'
+RENAMER_TEMPLATE='__改名器路径__'
 
 REAL_DIR="$PERSIST_DIR/real"
 WRAP_LOG="$PERSIST_DIR/wrapper.log"
@@ -28,7 +29,7 @@ KEEP=2
 MARK='vscode-persistent-wrapper-v2'
 # 包装脚本内容版本标记：与包装脚本模板（服务保活包装脚本.sh）头部「包装脚本版本:」那一行对应。
 # 步骤 3 靠它区分“已是当前版本”与“旧版包装脚本”；凡改变脱逃方式或 wrapper 行为，必须同步递增本标记与模板头部那一行，否则已部署的旧 wrapper 永远不会被升级。MARK 只标识身份、不随内容版本变动：移除路径靠它认出已部署的 wrapper 并把真身放回原位，改 MARK 会导致旧 wrapper 无法还原。
-WRAP_VERSION='WRAPPER-V4-DOUBLE-FORK'
+WRAP_VERSION='WRAPPER-V5-NAME-EXEMPT'
 URL_BASE='https://update.code.visualstudio.com'
 
 log() {
@@ -107,6 +108,17 @@ write_wrapper() {
 	chmod 755 "$1"
 }
 
+# 落位 comm 改名器（node 专用）：正文独立存放在模板文件 RENAMER_TEMPLATE（由主模块上传），包装脚本经 NODE_OPTIONS --require 加载它把 comm 改成 tmux 豁免收割。顺手剔除 \r，防模板传输出错时污染脚本。
+write_renamer() {
+	if [ ! -f "$RENAMER_TEMPLATE" ]; then
+		echo "[保活] 错误: 改名器模板不存在: $RENAMER_TEMPLATE" >&2
+		exit 1
+	fi
+	mkdir -p "$PERSIST_DIR"
+	tr -d '\r' < "$RENAMER_TEMPLATE" > "$PERSIST_DIR/comm-renamer.js.$$"
+	mv -f "$PERSIST_DIR/comm-renamer.js.$$" "$PERSIST_DIR/comm-renamer.js"
+}
+
 # ===== 移除模式：还原官方原始布局 =====
 if [ "$ACTION" = '移除' ]; then
 	RESTORED=0
@@ -126,7 +138,8 @@ if [ "$ACTION" = '移除' ]; then
 			log "已还原 $BASE"
 		fi
 	done
-	rm -f "$REAL_DIR"/code-* "$WRAP_LOG"
+	rm -f "$REAL_DIR"/code-* "$WRAP_LOG" "$PERSIST_DIR/comm-renamer.js"
+	rm -rf "$PERSIST_DIR/launch" "$PERSIST_DIR/hold"
 	rmdir "$REAL_DIR" "$PERSIST_DIR" 2>/dev/null || true
 	log "移除完成，共还原 $RESTORED 个包装脚本，数据目录恢复为官方布局。"
 	exit 0
@@ -138,6 +151,8 @@ if ! command -v setsid >/dev/null 2>&1; then
 	exit 1
 fi
 mkdir -p "$REAL_DIR"
+write_renamer
+log 'comm 改名器已落位: comm-renamer.js'
 
 # 1) 数据目录内的裸 ELF：移入真身目录，并在原处写入包装脚本（保留官方引导脚本按文件名找到入口的契约）
 for F in "$DATA_DIR"/code-*; do

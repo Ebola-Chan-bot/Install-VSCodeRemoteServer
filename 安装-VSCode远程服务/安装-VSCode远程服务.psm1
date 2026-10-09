@@ -10,6 +10,7 @@ $script:脚本_sysroot部署 = Get-Content -Path (Join-Path $script:模块根目
 $script:脚本_原生组件补丁 = Get-Content -Path (Join-Path $script:模块根目录 'private\原生组件补丁脚本.sh') -Raw -Encoding UTF8
 $script:脚本_服务保活部署 = Get-Content -Path (Join-Path $script:模块根目录 'private\服务保活部署脚本.sh') -Raw -Encoding UTF8
 $script:脚本_服务保活包装 = Get-Content -Path (Join-Path $script:模块根目录 'private\服务保活包装脚本.sh') -Raw -Encoding UTF8
+$script:脚本_服务保活改名器 = Get-Content -Path (Join-Path $script:模块根目录 'private\服务保活改名器.js') -Raw -Encoding UTF8
 
 # SSH 密码复用状态（由 初始化-SSH会话 设置）
 $script:SSH密码选项 = @()
@@ -1011,18 +1012,23 @@ echo PROBE_END
 		$脚本文本 = $脚本文本.Replace('__当前提交号__', $提交号)
 		$脚本文本 = $脚本文本.Replace('__发布通道__', $发布通道)
 
-		# 包装脚本模板是独立文件，与部署脚本一同上传到远程，部署脚本按占位符给出的路径读取它生成包装脚本
+		# 包装脚本模板与 comm 改名器是独立文件，与部署脚本一同上传到远程，部署脚本按占位符给出的路径读取它们落位
 		$本地临时脚本路径 = Join-Path $env:TEMP ('临时VSCode服务保活-{0}.sh' -f ([guid]::NewGuid().ToString('N')))
 		$本地包装模板路径 = Join-Path $env:TEMP ('临时VSCode服务保活包装-{0}.sh' -f ([guid]::NewGuid().ToString('N')))
+		$本地改名器模板路径 = Join-Path $env:TEMP ('临时VSCode服务保活改名器-{0}.js' -f ([guid]::NewGuid().ToString('N')))
 		$远程临时脚本路径 = $根目录 + '/vscode-server-persist-temp.sh'
 		$远程包装模板路径 = $根目录 + '/vscode-server-persist-wrapper-temp.sh'
+		$远程改名器模板路径 = $根目录 + '/vscode-server-persist-renamer-temp.js'
 		$脚本文本 = $脚本文本.Replace('__包装脚本路径__', $远程包装模板路径)
+		$脚本文本 = $脚本文本.Replace('__改名器路径__', $远程改名器模板路径)
 		try {
 			# Linux sh 脚本要求 LF 行尾，且不得带 BOM，否则 shebang 与语法会出错
 			[System.IO.File]::WriteAllText($本地临时脚本路径, ($脚本文本 -replace "`r`n", "`n"), [System.Text.UTF8Encoding]::new($false))
 			[System.IO.File]::WriteAllText($本地包装模板路径, ($script:脚本_服务保活包装 -replace "`r`n", "`n"), [System.Text.UTF8Encoding]::new($false))
+			[System.IO.File]::WriteAllText($本地改名器模板路径, ($script:脚本_服务保活改名器 -replace "`r`n", "`n"), [System.Text.UTF8Encoding]::new($false))
 			上传-文件到远程 -本地路径 $本地临时脚本路径 -连接目标 $连接目标 -端口 $端口 -远程路径 $远程临时脚本路径
 			上传-文件到远程 -本地路径 $本地包装模板路径 -连接目标 $连接目标 -端口 $端口 -远程路径 $远程包装模板路径
+			上传-文件到远程 -本地路径 $本地改名器模板路径 -连接目标 $连接目标 -端口 $端口 -远程路径 $远程改名器模板路径
 
 			$结果 = 执行-SSH命令并捕获 -连接目标 $连接目标 -端口 $端口 -命令文本 ('sh "{0}"' -f $远程临时脚本路径)
 			foreach ($行 in $结果.输出) { Write-Host $行 }
@@ -1032,7 +1038,8 @@ echo PROBE_END
 		} finally {
 			Remove-Item $本地临时脚本路径 -Force -ErrorAction SilentlyContinue
 			Remove-Item $本地包装模板路径 -Force -ErrorAction SilentlyContinue
-			try { 执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('rm -f "{0}" "{1}"' -f $远程临时脚本路径, $远程包装模板路径) } catch { }
+			Remove-Item $本地改名器模板路径 -Force -ErrorAction SilentlyContinue
+			try { 执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('rm -f "{0}" "{1}" "{2}"' -f $远程临时脚本路径, $远程包装模板路径, $远程改名器模板路径) } catch { }
 		}
 	}
 
