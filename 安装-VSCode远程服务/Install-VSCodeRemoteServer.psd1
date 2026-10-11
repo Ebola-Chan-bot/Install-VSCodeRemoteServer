@@ -1,5 +1,5 @@
 ﻿@{
-	RootModule           = '安装-VSCode远程服务.psm1'
+	RootModule           = 'Install-VSCodeRemoteServer.psm1'
 	ModuleVersion        = '2.0.1'
 	GUID                 = '2e2606a2-1d8b-418e-9d6d-a714a7704bdc'
 	Author               = '埃博拉酱-机器人'

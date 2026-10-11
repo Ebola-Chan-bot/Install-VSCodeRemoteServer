@@ -108,15 +108,16 @@ write_wrapper() {
 	chmod 755 "$1"
 }
 
-# 落位 comm 改名器（node 专用）：正文独立存放在模板文件 RENAMER_TEMPLATE（由主模块上传），包装脚本经 NODE_OPTIONS --require 加载它把 comm 改成 tmux 豁免收割。顺手剔除 \r，防模板传输出错时污染脚本。
+# 落位 comm 改名器（node 专用）：模板由调用方按需上传到 RENAMER_TEMPLATE，缺失则跳过——包装脚本只在 comm-renamer.js 存在时才注入 NODE_OPTIONS，缺模板不算错误。顺手剔除 \r，防模板传输出错时污染脚本。
 write_renamer() {
 	if [ ! -f "$RENAMER_TEMPLATE" ]; then
-		echo "[保活] 错误: 改名器模板不存在: $RENAMER_TEMPLATE" >&2
-		exit 1
+		log '改名器模板未提供，跳过 comm-renamer.js 落位'
+		return 0
 	fi
 	mkdir -p "$PERSIST_DIR"
 	tr -d '\r' < "$RENAMER_TEMPLATE" > "$PERSIST_DIR/comm-renamer.js.$$"
 	mv -f "$PERSIST_DIR/comm-renamer.js.$$" "$PERSIST_DIR/comm-renamer.js"
+	log 'comm 改名器已落位: comm-renamer.js'
 }
 
 # ===== 移除模式：还原官方原始布局 =====
@@ -152,7 +153,6 @@ if ! command -v setsid >/dev/null 2>&1; then
 fi
 mkdir -p "$REAL_DIR"
 write_renamer
-log 'comm 改名器已落位: comm-renamer.js'
 
 # 1) 数据目录内的裸 ELF：移入真身目录，并在原处写入包装脚本（保留官方引导脚本按文件名找到入口的契约）
 for F in "$DATA_DIR"/code-*; do

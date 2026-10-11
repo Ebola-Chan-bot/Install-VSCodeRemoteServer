@@ -1,0 +1,51 @@
+{
+	"name": "RemoteSSH-server-installer",
+	"displayName": "RemoteSSH服务器安装",
+	"description": "接管Remote-SSH的远程服务器安装步骤，提供更稳健的断线重连、本地远程双线竞速下载和旧版本环境支持",
+	"version": "1.0.0",
+	"publisher": "Ebola-Chan-bot",
+	"license": "MIT",
+	"icon": "icon.png",
+	"keywords": [
+		"Remote-SSH",
+		"VS Code Server",
+		"远程服务器",
+		"安装接管"
+	],
+	"bugs": {
+		"url": "https://github.com/Ebola-Chan-bot/Install-VSCodeRemoteServer/issues"
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/Ebola-Chan-bot/Install-VSCodeRemoteServer"
+	},
+	"engines": {
+		"vscode": "^1.80.0"
+	},
+	"categories": [
+		"Other"
+	],
+	"extensionKind": [
+		"ui"
+	],
+	"activationEvents": [
+		"onStartupFinished"
+	],
+	"main": "./extension.js",
+	"scripts": {
+		"vscode:prepublish": "node ./打包准备.js"
+	},
+	"contributes": {
+		"configuration": {
+			"title": "安装VSCode远程服务",
+			"properties": {
+				"安装VSCode远程服务.接管远程服务器安装": {
+					"type": "boolean",
+					"default": false,
+					"scope": "application",
+					"description": "开启后，Remote-SSH 每次连接前由 Install-VSCodeRemoteServer 模块安装远程服务器（替换 Remote-SSH 自带的安装步骤）；关闭后还原为 Remote-SSH 自带安装。"
+				}
+			}
+		}
+	}
+}

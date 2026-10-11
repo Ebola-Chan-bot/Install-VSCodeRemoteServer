@@ -3,14 +3,13 @@
 
 # 加载私有远程脚本模板
 $script:模块根目录 = Split-Path -Parent $MyInvocation.MyCommand.Path
-$script:远程脚本_通用 = Get-Content -Path (Join-Path $script:模块根目录 'private\远程安装脚本-通用.ps1') -Raw -Encoding UTF8
-$script:远程脚本_Win7 = Get-Content -Path (Join-Path $script:模块根目录 'private\远程安装脚本-Win7.ps1') -Raw -Encoding UTF8
-$script:远程脚本_Linux = Get-Content -Path (Join-Path $script:模块根目录 'private\远程安装脚本-Linux.sh') -Raw -Encoding UTF8
-$script:脚本_sysroot部署 = Get-Content -Path (Join-Path $script:模块根目录 'private\sysroot部署脚本.sh') -Raw -Encoding UTF8
-$script:脚本_原生组件补丁 = Get-Content -Path (Join-Path $script:模块根目录 'private\原生组件补丁脚本.sh') -Raw -Encoding UTF8
-$script:脚本_服务保活部署 = Get-Content -Path (Join-Path $script:模块根目录 'private\服务保活部署脚本.sh') -Raw -Encoding UTF8
-$script:脚本_服务保活包装 = Get-Content -Path (Join-Path $script:模块根目录 'private\服务保活包装脚本.sh') -Raw -Encoding UTF8
-$script:脚本_服务保活改名器 = Get-Content -Path (Join-Path $script:模块根目录 'private\服务保活改名器.js') -Raw -Encoding UTF8
+$script:远程脚本_通用 = Get-Content -Path (Join-Path $script:模块根目录 'private\remote-install-common.ps1') -Raw -Encoding UTF8
+$script:远程脚本_Win7 = Get-Content -Path (Join-Path $script:模块根目录 'private\remote-install-win7.ps1') -Raw -Encoding UTF8
+$script:远程脚本_Linux = Get-Content -Path (Join-Path $script:模块根目录 'private\remote-install-linux.sh') -Raw -Encoding UTF8
+$script:脚本_sysroot部署 = Get-Content -Path (Join-Path $script:模块根目录 'private\sysroot-deploy.sh') -Raw -Encoding UTF8
+$script:脚本_原生组件补丁 = Get-Content -Path (Join-Path $script:模块根目录 'private\native-patch.sh') -Raw -Encoding UTF8
+$script:脚本_服务保活部署 = Get-Content -Path (Join-Path $script:模块根目录 'private\keepalive-deploy.sh') -Raw -Encoding UTF8
+$script:脚本_服务保活包装 = Get-Content -Path (Join-Path $script:模块根目录 'private\keepalive-wrapper.sh') -Raw -Encoding UTF8
 
 # SSH 密码复用状态（由 初始化-SSH会话 设置）
 $script:SSH密码选项 = @()
@@ -461,7 +460,7 @@ echo PROBE_END
 		# SSH_ASKPASS 协议要求一个可执行程序：ssh 需要密码时执行它并把 stdout 第一行当作密码。
 		# 密码本体只保存在当前进程的环境变量中（不写盘），模块自带的 bat 负责把该环境变量打印出来。
 		$env:VSCODE_SSH密码 = $明文密码
-		$env:SSH_ASKPASS = Join-Path $script:模块根目录 'private\SSH密码回显.bat'
+		$env:SSH_ASKPASS = Join-Path $script:模块根目录 'private\ssh-askpass.bat'
 		$env:SSH_ASKPASS_REQUIRE = 'force'
 		# 注意：不要加 BatchMode=yes——它会禁用 askpass 机制，导致密码无法注入
 		$script:SSH密码选项 = @()
@@ -734,7 +733,7 @@ echo PROBE_END
 			提交号 = $竞速上下文.提交号
 		} | Export-Clixml -LiteralPath $参数文件
 
-		$供给脚本 = Join-Path $script:模块根目录 'private\本地竞速供给脚本.ps1'
+		$供给脚本 = Join-Path $script:模块根目录 'private\local-supply.ps1'
 		$powershell命令 = Get-Command powershell -ErrorAction SilentlyContinue | Select-Object -First 1
 		$powershellExe = if ($powershell命令) { $powershell命令.Source } else { 'powershell.exe' }
 
@@ -925,7 +924,7 @@ echo PROBE_END
 			上传-文件到远程 -本地路径 $素材文件.FullName -连接目标 $连接目标 -端口 $端口 -远程路径 ($暂存目录 + '/' + $素材文件.Name)
 		}
 
-		# 部署脚本为独立模板文件（private\sysroot部署脚本.sh，模块加载时读入），在远端解包组装 sysroot；库布局归并、loader 选址与环境变量注入的实现细节见该文件内注释
+		# 部署脚本为独立模板文件（private\sysroot-deploy.sh，模块加载时读入），在远端解包组装 sysroot；库布局归并、loader 选址与环境变量注入的实现细节见该文件内注释
 		$部署脚本文本 = ($script:脚本_sysroot部署 -replace "`r`n", "`n").Replace('__目录__', $sysroot目录)
 
 		$本地部署脚本路径 = Join-Path $env:TEMP ('sysroot-deploy-{0}.sh' -f ([guid]::NewGuid().ToString('N')))
@@ -1012,23 +1011,18 @@ echo PROBE_END
 		$脚本文本 = $脚本文本.Replace('__当前提交号__', $提交号)
 		$脚本文本 = $脚本文本.Replace('__发布通道__', $发布通道)
 
-		# 包装脚本模板与 comm 改名器是独立文件，与部署脚本一同上传到远程，部署脚本按占位符给出的路径读取它们落位
+		# 包装脚本模板是独立文件，与部署脚本一同上传到远程，部署脚本按占位符给出的路径读取它生成包装脚本
 		$本地临时脚本路径 = Join-Path $env:TEMP ('临时VSCode服务保活-{0}.sh' -f ([guid]::NewGuid().ToString('N')))
 		$本地包装模板路径 = Join-Path $env:TEMP ('临时VSCode服务保活包装-{0}.sh' -f ([guid]::NewGuid().ToString('N')))
-		$本地改名器模板路径 = Join-Path $env:TEMP ('临时VSCode服务保活改名器-{0}.js' -f ([guid]::NewGuid().ToString('N')))
 		$远程临时脚本路径 = $根目录 + '/vscode-server-persist-temp.sh'
 		$远程包装模板路径 = $根目录 + '/vscode-server-persist-wrapper-temp.sh'
-		$远程改名器模板路径 = $根目录 + '/vscode-server-persist-renamer-temp.js'
 		$脚本文本 = $脚本文本.Replace('__包装脚本路径__', $远程包装模板路径)
-		$脚本文本 = $脚本文本.Replace('__改名器路径__', $远程改名器模板路径)
 		try {
 			# Linux sh 脚本要求 LF 行尾，且不得带 BOM，否则 shebang 与语法会出错
 			[System.IO.File]::WriteAllText($本地临时脚本路径, ($脚本文本 -replace "`r`n", "`n"), [System.Text.UTF8Encoding]::new($false))
 			[System.IO.File]::WriteAllText($本地包装模板路径, ($script:脚本_服务保活包装 -replace "`r`n", "`n"), [System.Text.UTF8Encoding]::new($false))
-			[System.IO.File]::WriteAllText($本地改名器模板路径, ($script:脚本_服务保活改名器 -replace "`r`n", "`n"), [System.Text.UTF8Encoding]::new($false))
 			上传-文件到远程 -本地路径 $本地临时脚本路径 -连接目标 $连接目标 -端口 $端口 -远程路径 $远程临时脚本路径
 			上传-文件到远程 -本地路径 $本地包装模板路径 -连接目标 $连接目标 -端口 $端口 -远程路径 $远程包装模板路径
-			上传-文件到远程 -本地路径 $本地改名器模板路径 -连接目标 $连接目标 -端口 $端口 -远程路径 $远程改名器模板路径
 
 			$结果 = 执行-SSH命令并捕获 -连接目标 $连接目标 -端口 $端口 -命令文本 ('sh "{0}"' -f $远程临时脚本路径)
 			foreach ($行 in $结果.输出) { Write-Host $行 }
@@ -1038,8 +1032,7 @@ echo PROBE_END
 		} finally {
 			Remove-Item $本地临时脚本路径 -Force -ErrorAction SilentlyContinue
 			Remove-Item $本地包装模板路径 -Force -ErrorAction SilentlyContinue
-			Remove-Item $本地改名器模板路径 -Force -ErrorAction SilentlyContinue
-			try { 执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('rm -f "{0}" "{1}" "{2}"' -f $远程临时脚本路径, $远程包装模板路径, $远程改名器模板路径) } catch { }
+			try { 执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('rm -f "{0}" "{1}"' -f $远程临时脚本路径, $远程包装模板路径) } catch { }
 		}
 	}
 
