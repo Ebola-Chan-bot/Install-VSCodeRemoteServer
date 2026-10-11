@@ -226,19 +226,13 @@ function 判断是否本扩展的钩子(值, 保存目录) {
 	return false;
 }
 
-// 模块与扩展同仓库共存：优先取扩展目录的同级「安装-VSCode远程服务」目录（工作区源文件），
-// 其次取扩展内打包的副本 module/（打出来的 VSIX 装到扩展目录后前者不存在）
+// 模块源码直接放在扩展的 module/ 目录内，打包与安装同此一份，扩展按相对路径取用
 function 查找模块路径(扩展目录) {
-	const 候选 = [
-		path.join(扩展目录, '..', '安装-VSCode远程服务', 'Install-VSCodeRemoteServer.psd1'),
-		path.join(扩展目录, 'module', 'Install-VSCodeRemoteServer.psd1')
-	];
-	for (const 候选路径 of 候选) {
-		if (fs.existsSync(候选路径)) {
-			return 候选路径;
-		}
+	const 模块路径 = path.join(扩展目录, 'module', 'Install-VSCodeRemoteServer.psd1');
+	if (fs.existsSync(模块路径)) {
+		return 模块路径;
 	}
-	throw new Error('未找到 Install-VSCodeRemoteServer 模块，期望位置：' + 候选[0]);
+	throw new Error('未找到 Install-VSCodeRemoteServer 模块，期望位置：' + 模块路径);
 }
 
 // 递归展开 ~/.ssh/config 的 Host 与 Include，收集可直接用于连接的主机别名（跳过含通配符的模式名）

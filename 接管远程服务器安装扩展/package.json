@@ -32,9 +32,6 @@
 		"onStartupFinished"
 	],
 	"main": "./extension.js",
-	"scripts": {
-		"vscode:prepublish": "node ./打包准备.js"
-	},
 	"contributes": {
 		"configuration": {
 			"title": "安装VSCode远程服务",

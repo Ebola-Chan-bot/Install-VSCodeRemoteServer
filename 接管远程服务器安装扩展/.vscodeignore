@@ -1,4 +1,2 @@
 .vscodeignore
-.gitignore
-打包准备.js
 **/*.log
