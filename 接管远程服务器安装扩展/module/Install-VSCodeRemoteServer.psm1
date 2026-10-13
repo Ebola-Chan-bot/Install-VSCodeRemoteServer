@@ -663,6 +663,26 @@ echo PROBE_END
 		}
 	}
 
+	function 取-CLI下载地址 {
+		param(
+			[string]$发布通道,
+			[string]$提交号,
+			[string]$架构标识
+		)
+
+		# CLI 下载 artifact 与官方引导规则一致：armhf 用 cli-linux-armhf，Linux 其余用 cli-alpine-<短架构>，Windows 用 cli-win32-<短架构>
+		$artifact名 = switch ($架构标识) {
+			'linux-x64' { 'cli-alpine-x64' }
+			'linux-arm64' { 'cli-alpine-arm64' }
+			'linux-armhf' { 'cli-linux-armhf' }
+			'win32-x64' { 'cli-win32-x64' }
+			'win32-arm64' { 'cli-win32-arm64' }
+			default { '' }
+		}
+		if ($artifact名 -eq '') { return '' }
+		return ('https://update.code.visualstudio.com/commit:{0}/{1}/{2}' -f $提交号, $artifact名, $发布通道)
+	}
+
 	function 初始化-竞速上下文 {
 		param(
 			[pscustomobject]$环境,
@@ -670,7 +690,8 @@ echo PROBE_END
 			[string]$提交号
 		)
 
-		# 汇总竞速所需信息：暂存目录（登录目录下 .vscode-server[-insiders]/race-<提交号>）、包 artifact 名与下载地址。
+		# 汇总竞速所需信息：暂存目录（登录目录下 .vscode-server[-insiders]/race-<提交号>）与逐产物的包名/标记名/下载地址。
+		# 竞速按产物独立进行（CLI 与服务端各竞速一次）：哪边能下载就由哪边供给，单边断网时另一边照样补上，互不拖累。
 		# 登录目录或架构无法确定时返回 $null，主流程将替换占位符为空串（远程脚本回退单独下载）
 		if ([string]::IsNullOrWhiteSpace($环境.登录目录)) { return $null }
 		$架构标识 = 取-远程架构标识 -原始架构 $环境.原始架构 -系统类型 $环境.系统类型
@@ -686,21 +707,21 @@ echo PROBE_END
 		}
 
 		$暂存目录 = ($环境.登录目录.TrimEnd('/', '\') + $分隔符 + $数据目录名 + $分隔符 + ('race-{0}' -f $提交号))
-		$包文件名 = ('vscode-server-{0}{1}' -f $架构标识, $包扩展名)
-		$下载地址 = ('https://vscode.download.prss.microsoft.com/dbazure/download/{0}/{1}/{2}' -f $发布通道, $提交号, $包文件名)
-		# 远程侧约定的包名与完成标记名（与远程脚本内的命名保持一致；标记带架构后缀防串包）
-		$远程包名 = ('LOCAL{0}' -f $包扩展名)
-		$完成标记名 = ('LOCAL_DONE.{0}' -f $架构标识)
+		$服务端下载地址 = ('https://vscode.download.prss.microsoft.com/dbazure/download/{0}/{1}/vscode-server-{2}{3}' -f $发布通道, $提交号, $架构标识, $包扩展名)
+		$CLI下载地址 = 取-CLI下载地址 -发布通道 $发布通道 -提交号 $提交号 -架构标识 $架构标识
+
+		# 远程侧约定的包名与标记名（与远程脚本内的命名保持一致；完成标记带架构后缀防串包，取消标记按产物区分让本地供给逐产物止损）
+		$产物列表 = @(
+			[pscustomobject]@{ 产物名 = 'CLI'; 下载地址 = $CLI下载地址; 远程包名 = ('LOCAL_CLI{0}' -f $包扩展名); 完成标记名 = ('LOCAL_CLI_DONE.{0}' -f $架构标识); 取消标记名 = 'LOCAL_CLI_CANCEL' }
+			[pscustomobject]@{ 产物名 = '服务端'; 下载地址 = $服务端下载地址; 远程包名 = ('LOCAL{0}' -f $包扩展名); 完成标记名 = ('LOCAL_DONE.{0}' -f $架构标识); 取消标记名 = 'LOCAL_CANCEL' }
+		)
 
 		return [pscustomobject]@{
 			暂存目录 = $暂存目录
 			包扩展名 = $包扩展名
-			包文件名 = $包文件名
-			下载地址 = $下载地址
 			提交号 = $提交号
-			远程包名 = $远程包名
-			完成标记名 = $完成标记名
 			分隔符 = $分隔符
+			产物列表 = $产物列表
 		}
 	}
 
@@ -714,37 +735,45 @@ echo PROBE_END
 
 		# 供给以独立子 powershell 进程运行（不再是 Start-Job 的同进程 runspace）：Start-Job 无法中断阻塞的网络调用，
 		# 而子进程可在任意步骤被 taskkill /T /F 连同其派生的 ssh/scp 一起终止，实现真正的零轮询即时取消。
+		# 每个待供给产物（CLI、服务端）各起一个子进程并行下载/上传，互不阻塞，单个产物下载失败不拖累另一个。
 		# 参数经 Clixml 文件传入子进程（避开命令行转义与 PS 5.1 原生 stderr 陷阱）；stdout/stderr 重定向到日志文件，
-		# 收尾时回收打印。返回 {进程;日志路径;错误路径;参数文件路径}。
-		$参数文件 = Join-Path $env:TEMP ('race-supply-param-{0}.xml' -f ([guid]::NewGuid().ToString('N')))
-		$日志文件 = Join-Path $env:TEMP ('race-supply-log-{0}.txt' -f ([guid]::NewGuid().ToString('N')))
-		$错误文件 = Join-Path $env:TEMP ('race-supply-err-{0}.txt' -f ([guid]::NewGuid().ToString('N')))
+		# 收尾时回收打印。返回供给对象数组：{产物名;进程;日志路径;错误路径;参数文件路径}。
+		$供给列表 = @()
+		foreach ($产物 in $竞速上下文.产物列表) {
+			$参数文件 = Join-Path $env:TEMP ('race-supply-param-{0}.xml' -f ([guid]::NewGuid().ToString('N')))
+			$日志文件 = Join-Path $env:TEMP ('race-supply-log-{0}.txt' -f ([guid]::NewGuid().ToString('N')))
+			$错误文件 = Join-Path $env:TEMP ('race-supply-err-{0}.txt' -f ([guid]::NewGuid().ToString('N')))
 
-		@{
-			连接目标 = $连接目标
-			端口 = $端口
-			密码选项 = @($script:SSH密码选项)
-			暂存目录 = $竞速上下文.暂存目录
-			下载地址 = $竞速上下文.下载地址
-			远程包名 = $竞速上下文.远程包名
-			完成标记名 = $竞速上下文.完成标记名
-			系统类型 = $系统类型
-			分隔符 = $竞速上下文.分隔符
-			提交号 = $竞速上下文.提交号
-		} | Export-Clixml -LiteralPath $参数文件
+			@{
+				产物名 = $产物.产物名
+				连接目标 = $连接目标
+				端口 = $端口
+				密码选项 = @($script:SSH密码选项)
+				暂存目录 = $竞速上下文.暂存目录
+				下载地址 = $产物.下载地址
+				远程包名 = $产物.远程包名
+				完成标记名 = $产物.完成标记名
+				取消标记名 = $产物.取消标记名
+				系统类型 = $系统类型
+				分隔符 = $竞速上下文.分隔符
+				提交号 = $竞速上下文.提交号
+			} | Export-Clixml -LiteralPath $参数文件
 
-		$供给脚本 = Join-Path $script:模块根目录 'private\local-supply.ps1'
-		$powershell命令 = Get-Command powershell -ErrorAction SilentlyContinue | Select-Object -First 1
-		$powershellExe = if ($powershell命令) { $powershell命令.Source } else { 'powershell.exe' }
+			$供给脚本 = Join-Path $script:模块根目录 'private\local-supply.ps1'
+			$powershell命令 = Get-Command powershell -ErrorAction SilentlyContinue | Select-Object -First 1
+			$powershellExe = if ($powershell命令) { $powershell命令.Source } else { 'powershell.exe' }
 
-		$进程 = Start-Process -FilePath $powershellExe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $供给脚本), ('"{0}"' -f $参数文件)) -RedirectStandardOutput $日志文件 -RedirectStandardError $错误文件 -WindowStyle Hidden -PassThru
+			$进程 = Start-Process -FilePath $powershellExe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $供给脚本), ('"{0}"' -f $参数文件)) -RedirectStandardOutput $日志文件 -RedirectStandardError $错误文件 -WindowStyle Hidden -PassThru
 
-		return [pscustomobject]@{
-			进程 = $进程
-			日志路径 = $日志文件
-			错误路径 = $错误文件
-			参数文件路径 = $参数文件
+			$供给列表 += [pscustomobject]@{
+				产物名 = $产物.产物名
+				进程 = $进程
+				日志路径 = $日志文件
+				错误路径 = $错误文件
+				参数文件路径 = $参数文件
+			}
 		}
+		return $供给列表
 	}
 
 	function 停止-供给进程树 {
@@ -752,18 +781,20 @@ echo PROBE_END
 			$供给
 		)
 
-		# 击杀供给进程树：taskkill /T 连同其派生的 ssh/scp 子进程一起终止；
+		# 击杀供给进程树（$供给 可为单个供给对象或数组，逐个处理）：taskkill /T 连同其派生的 ssh/scp 子进程一起终止；
 		# PS 5.1 的 .NET Process.Kill() 只杀单进程不含子进程，更无法中断子进程内阻塞的下载/上传，故用 taskkill。
-		if ($null -eq $供给 -or $null -eq $供给.进程) { return }
-		$proc = $供给.进程
-		try { $proc.Refresh() } catch { }
-		if ($proc.HasExited) { return }
-		$原始EAP = $ErrorActionPreference
-		try {
-			$ErrorActionPreference = 'Continue'
-			$null = & taskkill.exe /PID $proc.Id /T /F 2>&1
-		} finally {
-			$ErrorActionPreference = $原始EAP
+		foreach ($单个供给 in @($供给)) {
+			if ($null -eq $单个供给 -or $null -eq $单个供给.进程) { continue }
+			$proc = $单个供给.进程
+			try { $proc.Refresh() } catch { }
+			if ($proc.HasExited) { continue }
+			$原始EAP = $ErrorActionPreference
+			try {
+				$ErrorActionPreference = 'Continue'
+				$null = & taskkill.exe /PID $proc.Id /T /F 2>&1
+			} finally {
+				$ErrorActionPreference = $原始EAP
+			}
 		}
 	}
 
@@ -772,20 +803,22 @@ echo PROBE_END
 			$供给
 		)
 
-		# 收尾：兜底击杀残留供给进程树、等待退出、按 [本地供给] 前缀打印其日志，再删除临时文件（均失败无害）
-		if ($null -eq $供给) { return }
-		停止-供给进程树 -供给 $供给
-		if ($null -ne $供给.进程) {
-			try { $null = $供给.进程.WaitForExit(10000) } catch { }
-		}
-		foreach ($日志 in @($供给.日志路径, $供给.错误路径)) {
-			if (-not [string]::IsNullOrWhiteSpace($日志) -and (Test-Path -LiteralPath $日志)) {
-				Get-Content -LiteralPath $日志 | ForEach-Object { Write-Host ('[本地供给] {0}' -f $_) }
+		# 收尾：兜底击杀残留供给进程树、等待退出、按 [本地供给-产物名] 前缀打印其日志，再删除临时文件（均失败无害）
+		foreach ($单个供给 in @($供给)) {
+			if ($null -eq $单个供给) { continue }
+			停止-供给进程树 -供给 $单个供给
+			if ($null -ne $单个供给.进程) {
+				try { $null = $单个供给.进程.WaitForExit(10000) } catch { }
 			}
-		}
-		foreach ($临时文件 in @($供给.日志路径, $供给.错误路径, $供给.参数文件路径)) {
-			if (-not [string]::IsNullOrWhiteSpace($临时文件)) {
-				Remove-Item -LiteralPath $临时文件 -Force -ErrorAction SilentlyContinue
+			foreach ($日志 in @($单个供给.日志路径, $单个供给.错误路径)) {
+				if (-not [string]::IsNullOrWhiteSpace($日志) -and (Test-Path -LiteralPath $日志)) {
+					Get-Content -LiteralPath $日志 | ForEach-Object { Write-Host ('[本地供给-{0}] {1}' -f $单个供给.产物名, $_) }
+				}
+			}
+			foreach ($临时文件 in @($单个供给.日志路径, $单个供给.错误路径, $单个供给.参数文件路径)) {
+				if (-not [string]::IsNullOrWhiteSpace($临时文件)) {
+					Remove-Item -LiteralPath $临时文件 -Force -ErrorAction SilentlyContinue
+				}
 			}
 		}
 	}
@@ -848,6 +881,24 @@ echo PROBE_END
 		foreach ($行 in $结果.输出) {
 			$文本 = ([string]$行).Trim()
 			if ($文本 -match '(\d+\.\d+)\s*$') {
+				try { return [version]$Matches[1] } catch { return $null }
+			}
+		}
+		return $null
+	}
+
+	function 探测-远程内核版本 {
+		param(
+			[string]$连接目标,
+			[int]$端口
+		)
+
+		# 解析 uname -r 的主次版本号（如 2.6.32-504.el6.x86_64 → 2.6）；探测失败返回 $null
+		$结果 = 执行-SSH命令并捕获 -连接目标 $连接目标 -端口 $端口 -命令文本 'uname -r'
+		if ($结果.退出码 -ne 0) { return $null }
+		foreach ($行 in $结果.输出) {
+			$文本 = ([string]$行).Trim()
+			if ($文本 -match '^(\d+\.\d+)') {
 				try { return [version]$Matches[1] } catch { return $null }
 			}
 		}
@@ -1316,6 +1367,15 @@ echo PROBE_END
 			if ([string]::IsNullOrWhiteSpace($环境.登录目录)) {
 				Write-Host '警告: 远程 glibc 过旧且登录目录未知，无法自动部署 sysroot；Remote-SSH 连接将因先决条件失败。'
 			} else {
+				# sysroot 妥协方案的硬性前提：glibc 2.28 的 loader 要求内核 ≥ 3.2，旧内核（如 CentOS 6 的 2.6.32）上 loader 启动即报 FATAL: kernel too old 拒绝加载任何程序，补丁与安装均无意义，先探明内核再决定是否继续
+				$内核版本 = 探测-远程内核版本 -连接目标 $连接目标 -端口 $SSH端口
+				if ($null -ne $内核版本) {
+					Write-Host ('远程内核版本: {0}' -f $内核版本)
+				}
+				if (($null -ne $内核版本) -and ($内核版本 -lt [version]'3.2')) {
+					清除-SSH密码复用
+					throw ('远程内核 {0} 过旧：glibc 2.28 运行时要求内核不低于 3.2，旧内核上 loader 启动即报 FATAL: kernel too old 拒绝运行，sysroot 妥协方案无解（实测 /bin/ls 都无法加载）。请升级主机内核/系统，或对该主机改用支持旧内核的旧版 VS Code。' -f $内核版本)
+				}
 				Write-Host ('远程 glibc {0} < 2.28，不满足 VS Code Server 先决条件，自动部署官方 sysroot 妥协方案...' -f $glibc版本)
 				$兼容性sysroot目录 = 部署-远程兼容性环境 -连接目标 $连接目标 -端口 $SSH端口 -远程登录目录 $环境.登录目录
 			}

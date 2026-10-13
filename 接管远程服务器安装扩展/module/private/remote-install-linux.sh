@@ -101,10 +101,11 @@ verify_sysroot() {
 		return 0
 	fi
 	LIBDIR=$(dirname "$LOADER_REAL")
-	if "$LOADER_REAL" --library-path "$LIBDIR" "$INSTALL_DIR/node" --version >/dev/null 2>&1; then
+	VERIFY_OUT=$("$LOADER_REAL" --library-path "$LIBDIR" "$INSTALL_DIR/node" --version 2>&1) && VERIFY_RC=0 || VERIFY_RC=$?
+	if [ "$VERIFY_RC" -eq 0 ]; then
 		log "sysroot 验证通过：node 可经 sysroot loader 正常启动，Remote-SSH 连接时将自动 patch server。"
 	else
-		log '警告: sysroot loader 验证 node 失败，Remote-SSH 连接可能报 glibc 先决条件错误。'
+		log "警告: sysroot loader 验证 node 失败（$(echo "$VERIFY_OUT" | tr '\n' ' ')）。Remote-SSH 连接可能报 glibc 先决条件错误；若含 kernel too old 则是远程内核低于 glibc 2.28 要求的 3.2，sysroot 妥协方案无解。"
 	fi
 }
 
@@ -115,7 +116,142 @@ echo "自动检测到的安装目录: $INSTALL_DIR"
 echo "下载工具: $DOWNLOADER"
 echo "CLI 下载地址: $CLI_URL"
 
-# ===== 安装远程 CLI（Remote-SSH 引导的启动入口，server 由它拉起，二者缺一不可；仅缺失时补装，压缩包约 30MB 直接整包下载，失败按递增间隔无限重试） =====
+# ===== 下载与竞速原语（sh 逐行解释执行，函数必须定义在所有调用点之前）=====
+
+# 远程自下载 server 压缩包（无限重试 + 双备用地址）：$1=包路径 $2=完成标记；竞速模式下后台拉起，决出后被整体终止，故无需取消检查
+run_remote_download() {
+	PKG_OUT="$1"
+	DONE_MARK="$2"
+	CLI_ATTEMPT=0
+	WAIT_SECONDS=0
+	# 无限重试：第 1 次失败后等 1 秒，第 2 次失败后等 2 秒，依此类推，每多重试一次多等 1 秒
+	while true; do
+		CLI_ATTEMPT=$((CLI_ATTEMPT + 1))
+		if [ "$CLI_ATTEMPT" -gt 1 ]; then
+			WAIT_SECONDS=$((CLI_ATTEMPT - 1))
+			log "上次下载失败，等待 $WAIT_SECONDS 秒后开始第 $CLI_ATTEMPT 次重试..."
+			sleep "$WAIT_SECONDS"
+		fi
+		for URL in "$URL_PRIMARY" "$URL_FALLBACK"; do
+			log "开始下载: $URL"
+			if download_file "$URL" "$PKG_OUT" && [ -s "$PKG_OUT" ]; then
+				touch "$DONE_MARK"
+				return 0
+			fi
+		done
+		log '本次下载失败，清理残留文件。'
+		rm -f "$PKG_OUT"
+	done
+}
+
+# 远程自下载 CLI 压缩包（竞速模式下后台拉起）：$1=包路径 $2=完成标记；同样无限重试，决出后被整体终止
+run_remote_cli_download() {
+	PKG_OUT="$1"
+	DONE_MARK="$2"
+	CLI_ATTEMPT=0
+	while true; do
+		CLI_ATTEMPT=$((CLI_ATTEMPT + 1))
+		if [ "$CLI_ATTEMPT" -gt 1 ]; then
+			WAIT_SECONDS=$((CLI_ATTEMPT - 1))
+			log "CLI 上次下载失败，等待 $WAIT_SECONDS 秒后开始第 $CLI_ATTEMPT 次重试..."
+			sleep "$WAIT_SECONDS"
+		fi
+		log "开始下载远程 CLI: $CLI_URL"
+		if download_file "$CLI_URL" "$PKG_OUT" && [ -s "$PKG_OUT" ]; then
+			touch "$DONE_MARK"
+			return 0
+		fi
+		log '本次 CLI 下载失败，清理残留文件。'
+		rm -f "$PKG_OUT"
+	done
+}
+
+# 竞速单个产物：后台远程自下载 与 本地下载+上传（由本地模块负责）并行，先完成者获胜。$1=产物名 $2=远程包路径 $3=远程完成标记 $4=本地包路径 $5=本地完成标记 $6=本地取消标记 $7=远程后台下载函数名（空串=远程不下载）
+# 返回后 RACE_WINNER_SIDE（remote/local）与 RACE_WINNER_PKG（获胜包路径）有效
+race_artifact() {
+	RACE_WINNER_SIDE=''
+	RACE_WINNER_PKG=''
+	# 清理本端上一轮残留；本地包与本地标记由本地供给任务管理，不在此处删（可能已先于本脚本完成）
+	rm -f "$2" "$3" "$6"
+	log "$1 竞速：远程自下载与本地下载+上传并行，先完成者用于安装。"
+	DL_PID=''
+	if [ -n "$7" ]; then
+		"$7" "$2" "$3" &
+		DL_PID=$!
+	else
+		log "$1：远程缺少 curl/wget，本端不参与下载，只等待本地供给。"
+	fi
+
+	ELAPSED=0
+	while true; do
+		if [ -f "$3" ]; then
+			RACE_WINNER_SIDE='remote'
+			break
+		fi
+		if [ -f "$5" ]; then
+			RACE_WINNER_SIDE='local'
+			break
+		fi
+		sleep 1
+		ELAPSED=$((ELAPSED + 1))
+		if [ $((ELAPSED % 30)) -eq 0 ]; then
+			RSIZE=0
+			if [ -f "$2" ]; then
+				RSIZE=$(wc -c < "$2" 2>/dev/null | tr -d ' ')
+			fi
+			LSIZE=0
+			# 本地供给包：上传完成前为 <包名>.uploading（scp 写入），完成后更名
+			if [ -f "$4" ]; then
+				LSIZE=$(wc -c < "$4" 2>/dev/null | tr -d ' ')
+			elif [ -f "$4.uploading" ]; then
+				LSIZE=$(wc -c < "$4.uploading" 2>/dev/null | tr -d ' ')
+			fi
+			log "$1 竞速等待 ${ELAPSED}s：远程侧已下 ${RSIZE} 字节，本地侧已到 ${LSIZE} 字节。"
+		fi
+	done
+
+	# 胜负已分：写该产物的取消标记让本地供给任务停止该产物的后续动作，并终止远程后台下载
+	touch "$6"
+	if [ -n "$DL_PID" ]; then
+		if command -v pkill >/dev/null 2>&1; then
+			pkill -P "$DL_PID" 2>/dev/null || true
+		fi
+		kill "$DL_PID" 2>/dev/null || true
+		wait "$DL_PID" 2>/dev/null || true
+	fi
+
+	if [ "$RACE_WINNER_SIDE" = 'local' ]; then
+		RACE_WINNER_PKG="$4"
+		log "竞速决出（$1）：本地供给的压缩包。"
+	else
+		RACE_WINNER_PKG="$2"
+		log "竞速决出（$1）：远程自下载的压缩包。"
+	fi
+}
+
+# 解包 CLI 压缩包并按引导契约落到正式名（包内为单个 code[-insiders] 可执行文件）；$1=压缩包路径
+unpack_cli_package() {
+	# 并行官方引导可能已把 CLI 装好（甚至已启动），此时安装实际已完成，直接收尾
+	if [ -f "$CLI_ON_DISK" ]; then
+		log "CLI 已就位（并行安装完成），跳过安装: $CLI_ON_DISK"
+		return 0
+	fi
+	CLI_TMP="$DATA_DIR/cli-unpack-$$"
+	rm -rf "$CLI_TMP"
+	mkdir -p "$CLI_TMP"
+	if tar -xzf "$1" -C "$CLI_TMP" && [ -f "$CLI_TMP/$CLI_BASE_NAME" ]; then
+		mv "$CLI_TMP/$CLI_BASE_NAME" "$CLI_ON_DISK"
+		chmod +x "$CLI_ON_DISK"
+		rm -rf "$CLI_TMP" "$1"
+		log "远程 CLI 安装完成: $CLI_ON_DISK"
+		return 0
+	fi
+	log 'CLI 压缩包内容异常，已清理。'
+	rm -rf "$CLI_TMP" "$1"
+	return 1
+}
+
+# ===== 非竞速模式的 CLI 补装（前台无限重试；竞速模式的 CLI 由竞速供给，不走这里）：仅缺失时补装，压缩包约 30MB 直接整包下载 =====
 install_cli() {
 	if [ -f "$CLI_ON_DISK" ]; then
 		log "CLI 已存在，跳过安装: $CLI_ON_DISK"
@@ -132,18 +268,7 @@ install_cli() {
 			return 0
 		fi
 		if log "开始下载远程 CLI（第 $CLI_ATTEMPT 次尝试）: $CLI_URL" && download_file "$CLI_URL" "$CLI_TAR" && [ -s "$CLI_TAR" ]; then
-			CLI_TMP="$DATA_DIR/cli-unpack-$$"
-			rm -rf "$CLI_TMP"
-			mkdir -p "$CLI_TMP"
-			if tar -xzf "$CLI_TAR" -C "$CLI_TMP" && [ -f "$CLI_TMP/$CLI_BASE_NAME" ]; then
-				mv "$CLI_TMP/$CLI_BASE_NAME" "$CLI_ON_DISK"
-				chmod +x "$CLI_ON_DISK"
-				rm -rf "$CLI_TMP" "$CLI_TAR"
-				log "远程 CLI 安装完成: $CLI_ON_DISK"
-				return 0
-			fi
-			log "CLI 压缩包内容异常，清理后重试。"
-			rm -rf "$CLI_TMP" "$CLI_TAR"
+			unpack_cli_package "$CLI_TAR" && return 0
 		else
 			rm -f "$CLI_TAR"
 		fi
@@ -156,8 +281,51 @@ if command -v pkill >/dev/null 2>&1; then
 	pkill -f "$COMMIT" 2>/dev/null || true
 fi
 
-# ===== CLI 下载器已在上方确定，此处先补 CLI 再处理 server =====
-install_cli
+# ===== 判定待装产物：已就位的产物不参与竞速，避免无谓的下载与上传 =====
+NEED_CLI=1
+if [ -f "$CLI_ON_DISK" ]; then
+	NEED_CLI=0
+fi
+NEED_SERVER=1
+if [ -f "$INSTALL_DIR/product.json" ] && [ -d "$INSTALL_DIR/bin" ]; then
+	NEED_SERVER=0
+fi
+
+CLI_WINNER_PKG=''
+SERVER_WINNER_PKG=''
+if [ -n "$STAGING" ]; then
+	# ===== 竞速模式：每个缺失产物各竞速一次（本地下载+上传 vs 远程自下载，先完成者获胜），CLI 与服务端独立判胜、互不拖累 =====
+	# 单边断网时由另一边补上：远端连不上下载服务器就等本地供给，本地下载失败就等远程自下载
+	mkdir -p "$STAGING"
+	RACE_CLI_DL_FN=''
+	RACE_SERVER_DL_FN=''
+	if [ -n "$DOWNLOADER" ]; then
+		RACE_CLI_DL_FN='run_remote_cli_download'
+		RACE_SERVER_DL_FN='run_remote_download'
+	fi
+	if [ "$NEED_CLI" = '1' ]; then
+		race_artifact 'CLI' "$STAGING/REMOTE_CLI.tar.gz" "$STAGING/REMOTE_CLI_DONE" "$STAGING/LOCAL_CLI.tar.gz" "$STAGING/LOCAL_CLI_DONE.$ARCH" "$STAGING/LOCAL_CLI_CANCEL" "$RACE_CLI_DL_FN"
+		CLI_WINNER_PKG="$RACE_WINNER_PKG"
+	fi
+	if [ "$NEED_SERVER" = '1' ]; then
+		race_artifact '服务端' "$STAGING/REMOTE.tar.gz" "$STAGING/REMOTE_DONE" "$STAGING/LOCAL.tar.gz" "$STAGING/LOCAL_DONE.$ARCH" "$STAGING/LOCAL_CANCEL" "$RACE_SERVER_DL_FN"
+		SERVER_WINNER_PKG="$RACE_WINNER_PKG"
+	fi
+	# 全部产物竞速决出：该行触发主流程立即击杀本地供给进程树（零轮询即时取消）
+	echo '竞速获胜：全部产物已就位，开始安装。'
+fi
+
+# ===== 安装 CLI（Remote-SSH 引导的启动入口，server 由它拉起，二者缺一不可）=====
+if [ "$NEED_CLI" = '0' ]; then
+	log "CLI 已存在，跳过安装: $CLI_ON_DISK"
+elif [ -n "$STAGING" ]; then
+	if ! unpack_cli_package "$CLI_WINNER_PKG"; then
+		echo "错误: 竞速决出的 CLI 压缩包无法解包: $CLI_WINNER_PKG" >&2
+		exit 1
+	fi
+else
+	install_cli
+fi
 
 # 同提交号且结构完整（product.json 与 bin 并存）的 server 直接复用，避免重复下载
 if [ -f "$INSTALL_DIR/product.json" ] && [ -d "$INSTALL_DIR/bin" ]; then
@@ -171,101 +339,18 @@ fi
 rm -rf "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 
-# ===== 远程自下载循环（无限重试 + 双备用地址，成功后写 REMOTE_DONE 标记） =====
-run_remote_download() {
-	ATTEMPT=0
-	WAIT_SECONDS=0
-	# 无限重试：第 1 次失败后等 1 秒，第 2 次失败后等 2 秒，依此类推，每多重试一次多等 1 秒
-	while true; do
-		ATTEMPT=$((ATTEMPT + 1))
-		if [ "$ATTEMPT" -gt 1 ]; then
-			WAIT_SECONDS=$((ATTEMPT - 1))
-			log "上次下载失败，等待 $WAIT_SECONDS 秒后开始第 $ATTEMPT 次重试..."
-			sleep "$WAIT_SECONDS"
-		fi
-		for URL in "$URL_PRIMARY" "$URL_FALLBACK"; do
-			log "开始下载: $URL"
-			if download_file "$URL" "$REMOTE_PKG" && [ -s "$REMOTE_PKG" ]; then
-				touch "$REMOTE_DONE"
-				return 0
-			fi
-		done
-		log '本次下载失败，清理残留文件。'
-		rm -f "$REMOTE_PKG"
-	done
-}
-
 if [ -n "$STAGING" ]; then
-	# ===== 竞速模式：远程自下载（后台）与本地下载+上传（由本地模块负责）并行，先完成者获胜 =====
-	mkdir -p "$STAGING"
-	REMOTE_PKG="$STAGING/REMOTE.tar.gz"
-	REMOTE_DONE="$STAGING/REMOTE_DONE"
-	# 本地完成标记带远程实际架构后缀：本地供给侧若架构判断错误则永远对不上，避免错误架构的包获胜
-	LOCAL_DONE="$STAGING/LOCAL_DONE.$ARCH"
-	LOCAL_PKG="$STAGING/LOCAL.tar.gz"
-	# 清理本端上一轮残留；LOCAL_DONE/LOCAL_PKG 由本地供给任务管理，不在此处删（可能已先于本脚本完成）
-	rm -f "$REMOTE_PKG" "$REMOTE_DONE" "$STAGING/LOCAL_CANCEL"
-
-	log '竞速模式：远程自下载与本地下载+上传并行，先完成者用于安装。'
-	DL_PID=''
-	if [ -n "$DOWNLOADER" ]; then
-		run_remote_download &
-		DL_PID=$!
-	else
-		log '远程缺少 curl/wget，本端不参与下载，只等待本地供给。'
+	# 竞速决出的服务端压缩包（若服务端已就位则未竞速，上面的复用判定已提前收尾）
+	if [ -z "$SERVER_WINNER_PKG" ] || [ ! -f "$SERVER_WINNER_PKG" ]; then
+		echo "错误: 竞速未产出服务端压缩包: $SERVER_WINNER_PKG" >&2
+		exit 1
 	fi
-
-	ELAPSED=0
-	WINNER=''
-	while true; do
-		if [ -f "$REMOTE_DONE" ]; then
-			WINNER='remote'
-			break
-		fi
-		if [ -f "$LOCAL_DONE" ]; then
-			WINNER='local'
-			break
-		fi
-		sleep 1
-		ELAPSED=$((ELAPSED + 1))
-		if [ $((ELAPSED % 30)) -eq 0 ]; then
-			RSIZE=0
-			if [ -f "$REMOTE_PKG" ]; then
-				RSIZE=$(wc -c < "$REMOTE_PKG" 2>/dev/null | tr -d ' ')
-			fi
-			LSIZE=0
-			# 本地供给包：上传完成前为 LOCAL.tar.gz.uploading（scp 写入），完成后更名为 LOCAL.tar.gz
-			if [ -f "$LOCAL_PKG" ]; then
-				LSIZE=$(wc -c < "$LOCAL_PKG" 2>/dev/null | tr -d ' ')
-			elif [ -f "$LOCAL_PKG.uploading" ]; then
-				LSIZE=$(wc -c < "$LOCAL_PKG.uploading" 2>/dev/null | tr -d ' ')
-			fi
-			log "竞速等待 ${ELAPSED}s：远程侧已下 ${RSIZE} 字节，本地侧已到 ${LSIZE} 字节。"
-		fi
-	done
-
-	# 胜负已分：写取消标记让本地供给任务停止后续动作，并终止远程后台下载
-	touch "$STAGING/LOCAL_CANCEL"
-	if [ -n "$DL_PID" ]; then
-		if command -v pkill >/dev/null 2>&1; then
-			pkill -P "$DL_PID" 2>/dev/null || true
-		fi
-		kill "$DL_PID" 2>/dev/null || true
-		wait "$DL_PID" 2>/dev/null || true
-	fi
-
-	if [ "$WINNER" = 'local' ]; then
-		PACKAGE_PATH="$STAGING/LOCAL.tar.gz"
-		log '竞速获胜：本地供给的压缩包，开始解压。'
-	else
-		PACKAGE_PATH="$REMOTE_PKG"
-		log '竞速获胜：远程自下载的压缩包，开始解压。'
-	fi
+	PACKAGE_PATH="$SERVER_WINNER_PKG"
 else
 	# ===== 未启用竞速：保持原有前台单独下载 =====
 	REMOTE_PKG="$INSTALL_DIR/vscode-server-download-$$.tar.gz"
 	REMOTE_DONE="$INSTALL_DIR/vscode-server-download-$$.done"
-	run_remote_download
+	run_remote_download "$REMOTE_PKG" "$REMOTE_DONE"
 	PACKAGE_PATH="$REMOTE_PKG"
 	rm -f "$REMOTE_DONE"
 	echo '下载完成，开始解压。'

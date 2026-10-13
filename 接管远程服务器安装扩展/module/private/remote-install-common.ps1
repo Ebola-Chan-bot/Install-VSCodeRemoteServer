@@ -98,19 +98,7 @@ function 安装-远程CLI {
 			Write-Host ('[{0}] 开始下载远程 CLI（第 {1} 次尝试）: {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $重试次数, $CLI信息.下载地址)
 			Invoke-WebRequest -Uri $CLI信息.下载地址 -OutFile $cli压缩包路径 -UseBasicParsing
 
-			$临时解压目录 = Join-Path $数据目录 ('cli-unpack-{0}' -f ([System.IO.Path]::GetRandomFileName()))
-			try {
-				Expand-Archive -Path $cli压缩包路径 -DestinationPath $临时解压目录 -Force
-				$包内路径 = Join-Path $临时解压目录 $CLI信息.包内可执行名
-				if (-not (Test-Path -LiteralPath $包内路径)) {
-					throw ('CLI 压缩包内未找到 {0}。' -f $CLI信息.包内可执行名)
-				}
-
-				Move-Item -LiteralPath $包内路径 -Destination $CLI信息.落地路径 -Force
-			} finally {
-				Remove-Item $临时解压目录 -Recurse -Force -ErrorAction SilentlyContinue
-				Remove-Item $cli压缩包路径 -Force -ErrorAction SilentlyContinue
-			}
+			展开-CLI压缩包 -压缩包路径 $cli压缩包路径 -CLI信息 $CLI信息
 
 			Write-Host ('[{0}] 远程 CLI 安装完成: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $CLI信息.落地路径)
 			return
@@ -125,6 +113,125 @@ function 安装-远程CLI {
 
 		Start-Sleep -Seconds $重试次数
 	}
+}
+
+function 展开-CLI压缩包 {
+	param(
+		[string]$压缩包路径,
+		[pscustomobject]$CLI信息
+	)
+
+	# 解包 CLI 压缩包并按引导契约落地改名（包内可执行名不带提交号）；解包目录与目标同在数据目录下，改名落位是原子操作，中断也不会留下残缺 exe 占着正式名而被误判为已安装
+	$数据目录 = Split-Path -Parent $CLI信息.落地路径
+	New-Item -ItemType Directory -Force $数据目录 | Out-Null
+	$临时解压目录 = Join-Path $数据目录 ('cli-unpack-{0}' -f ([System.IO.Path]::GetRandomFileName()))
+	try {
+		Expand-Archive -Path $压缩包路径 -DestinationPath $临时解压目录 -Force
+		$包内路径 = Join-Path $临时解压目录 $CLI信息.包内可执行名
+		if (-not (Test-Path -LiteralPath $包内路径)) {
+			throw ('CLI 压缩包内未找到 {0}。' -f $CLI信息.包内可执行名)
+		}
+
+		Move-Item -LiteralPath $包内路径 -Destination $CLI信息.落地路径 -Force
+	} finally {
+		Remove-Item $临时解压目录 -Recurse -Force -ErrorAction SilentlyContinue
+		Remove-Item $压缩包路径 -Force -ErrorAction SilentlyContinue
+	}
+}
+
+function 安装-CLI压缩包 {
+	param(
+		[string]$压缩包路径,
+		[pscustomobject]$CLI信息
+	)
+
+	# 竞速供给包的一次性落位：VS Code 官方引导可能已并行把 CLI 装好（甚至已启动、目标被系统锁定），先复查再落位；失败再复查，已出现即视为完成（文件名含提交号，同名即同版本）
+	if (Test-Path -LiteralPath $CLI信息.落地路径) {
+		Write-Host ('[{0}] CLI 已就位（并行安装完成），跳过安装: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $CLI信息.落地路径)
+		return
+	}
+	try {
+		展开-CLI压缩包 -压缩包路径 $压缩包路径 -CLI信息 $CLI信息
+		Write-Host ('[{0}] 远程 CLI 安装完成: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $CLI信息.落地路径)
+	} catch {
+		if (Test-Path -LiteralPath $CLI信息.落地路径) {
+			Write-Host ('[{0}] CLI 已就位（并行安装完成），跳过安装: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $CLI信息.落地路径)
+			return
+		}
+		throw
+	}
+}
+
+function 竞速-单个产物 {
+	param(
+		[string]$产物名,
+		[string]$下载地址,
+		[string]$远程包路径,
+		[string]$远程完成标记,
+		[string]$本地包路径,
+		[string]$本地完成标记,
+		[string]$本地取消标记,
+		[string]$下载函数文本
+	)
+
+	# 单个产物的竞速：远程自下载（后台作业）与本地下载+上传（由本地模块负责）并行，先完成者获胜，返回 {获胜方;获胜包路径}。
+	# 逐产物独立竞速：哪边能下载就由哪边供给，单边断网时另一边照样补上，互不拖累。
+	# 清理本端上一轮残留；本地包/本地标记由本地供给任务管理，不在此处删（可能已先于本脚本完成）
+	Remove-Item -LiteralPath $远程包路径, $远程完成标记, $本地取消标记 -Force -ErrorAction SilentlyContinue
+
+	Write-Host ('[{0}] {1} 竞速：远程自下载与本地下载+上传并行，先完成者用于安装。' -f (Get-Date -Format 'HH:mm:ss'), $产物名)
+	# 把断点续传下载函数以文本形式带入后台作业（Start-Job 是独立进程，无法直接调用本脚本函数），保证竞速模式下远程侧仍是断点续传。
+	# 注意：Definition 属性不含花括号（函数体以 param(...) 开头），注入时必须自行包上 { }，否则是非法函数声明
+	$下载作业 = Start-Job -ArgumentList $下载函数文本, $下载地址, $远程包路径, $远程完成标记 -ScriptBlock {
+		param($下载函数文本, $下载地址, $远程包路径, $远程完成标记)
+		$ErrorActionPreference = 'Continue'
+		[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+		Invoke-Expression ('function 通过HTTP断点续传下载 { ' + $下载函数文本 + ' }')
+		try {
+			通过HTTP断点续传下载 -下载地址 $下载地址 -目标路径 $远程包路径
+			if ((Test-Path $远程包路径) -and ((Get-Item $远程包路径).Length -gt 0)) {
+				New-Item -ItemType File -Force $远程完成标记 | Out-Null
+				Write-Output '远程自下载完成。'
+			} else {
+				Write-Output '远程自下载结束后未发现完整压缩包，等待本地供给。'
+			}
+		} catch {
+			Write-Output ('远程自下载异常终止: {0}' -f $_.Exception.Message)
+		}
+	}
+
+	$等待秒数 = 0
+	$获胜方 = $null
+	while ($true) {
+		if (Test-Path -LiteralPath $远程完成标记) { $获胜方 = '远程自下载'; break }
+		if (Test-Path -LiteralPath $本地完成标记) { $获胜方 = '本地供给'; break }
+		# 流式转发后台作业的输出（下载进度/重试消息）
+		Receive-Job -Job $下载作业 | ForEach-Object { Write-Host ('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $_) }
+		Start-Sleep -Seconds 1
+		$等待秒数++
+		if (($等待秒数 % 30) -eq 0) {
+			$远程字节 = 0
+			if (Test-Path -LiteralPath $远程包路径) { $远程字节 = (Get-Item -LiteralPath $远程包路径).Length }
+			$本地字节 = 0
+			if (Test-Path -LiteralPath $本地包路径) { $本地字节 = (Get-Item -LiteralPath $本地包路径).Length }
+			elseif (Test-Path -LiteralPath ($本地包路径 + '.uploading')) { $本地字节 = (Get-Item -LiteralPath ($本地包路径 + '.uploading')).Length }
+			Write-Host ('[{0}] {1} 竞速等待 {2}s：远程侧已下 {3} 字节，本地侧已到 {4} 字节。' -f (Get-Date -Format 'HH:mm:ss'), $产物名, $等待秒数, $远程字节, $本地字节)
+		}
+	}
+
+	# 胜负已定：写该产物的取消标记让本地供给任务停止该产物的后续动作，并终止远程后台下载
+	New-Item -ItemType File -Force $本地取消标记 | Out-Null
+	Stop-Job -Job $下载作业 -ErrorAction SilentlyContinue
+	Receive-Job -Job $下载作业 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $_) }
+	Remove-Job -Job $下载作业 -Force -ErrorAction SilentlyContinue
+
+	$获胜包路径 = if ($获胜方 -eq '本地供给') { $本地包路径 } else { $远程包路径 }
+	Write-Host ('[{0}] 竞速决出：{1} 由{2}获胜。' -f (Get-Date -Format 'HH:mm:ss'), $产物名, $获胜方)
+	if (-not (Test-Path -LiteralPath $获胜包路径)) {
+		throw ('竞速决出的包不存在: {0}' -f $获胜包路径)
+	}
+
+	return [pscustomobject]@{ 获胜方 = $获胜方; 获胜包路径 = $获胜包路径 }
 }
 
 function 取-下载地址 {
@@ -318,10 +425,41 @@ Write-Host ('自动检测到的系统架构: {0}' -f $系统架构)
 Write-Host ('自动检测到的安装目录: {0}' -f $最终安装目录)
 Write-Host ('下载地址: {0}' -f $下载地址)
 
-# 远程服务端的启动入口是 CLI（code[-insiders]-<提交号>.exe），由它按需拉起 server，二者缺一不可，故先补 CLI
-安装-远程CLI -CLI信息 $CLI信息
-
+# ===== 判定待装产物：已就位的产物不参与竞速，避免无谓的下载与上传 =====
+$CLI已就位 = Test-Path -LiteralPath $CLI信息.落地路径
+# Remote-SSH 的 CLI 用 server 目录下的 product.json 与 bin 判定安装完整性
 $服务端已就绪 = (Test-Path -LiteralPath (Join-Path $最终安装目录 'product.json')) -and (Test-Path -LiteralPath (Join-Path $最终安装目录 'bin'))
+
+$启用竞速 = -not [string]::IsNullOrWhiteSpace($暂存目录)
+$CLI获胜包路径 = $null
+$获胜包路径 = $下载压缩包路径
+if ($启用竞速) {
+	# ===== 竞速模式：每个缺失产物各竞速一次（本地下载+上传 vs 远程自下载，先完成者获胜），CLI 与服务端独立判胜、互不拖累 =====
+	# 单边断网时由另一边补上：远端连不上下载服务器就等本地供给，本地下载失败就等远程自下载
+	New-Item -ItemType Directory -Force $暂存目录 | Out-Null
+	# 把断点续传下载函数以文本形式带入后台作业（Start-Job 是独立进程，无法直接调用本脚本函数），竞速双方产物都用它下载
+	$下载函数文本 = (Get-Command '通过HTTP断点续传下载').Definition
+	if (-not $CLI已就位) {
+		$CLI竞速结果 = 竞速-单个产物 -产物名 'CLI' -下载地址 $CLI信息.下载地址 -远程包路径 (Join-Path $暂存目录 'REMOTE_CLI.zip') -远程完成标记 (Join-Path $暂存目录 'REMOTE_CLI_DONE') -本地包路径 (Join-Path $暂存目录 'LOCAL_CLI.zip') -本地完成标记 (Join-Path $暂存目录 ('LOCAL_CLI_DONE.{0}' -f $系统架构)) -本地取消标记 (Join-Path $暂存目录 'LOCAL_CLI_CANCEL') -下载函数文本 $下载函数文本
+		$CLI获胜包路径 = $CLI竞速结果.获胜包路径
+	}
+	if (-not $服务端已就绪) {
+		$服务端竞速结果 = 竞速-单个产物 -产物名 '服务端' -下载地址 $下载地址 -远程包路径 (Join-Path $暂存目录 'REMOTE.zip') -远程完成标记 (Join-Path $暂存目录 'REMOTE_DONE') -本地包路径 (Join-Path $暂存目录 'LOCAL.zip') -本地完成标记 (Join-Path $暂存目录 ('LOCAL_DONE.{0}' -f $系统架构)) -本地取消标记 (Join-Path $暂存目录 'LOCAL_CANCEL') -下载函数文本 $下载函数文本
+		$获胜包路径 = $服务端竞速结果.获胜包路径
+	}
+	# 全部产物竞速决出：该行触发主流程立即击杀本地供给进程树（零轮询即时取消）
+	Write-Host '竞速获胜：全部产物已就位，开始安装。'
+}
+
+# ===== 安装 CLI（Remote-SSH 引导的启动入口，server 由它拉起，二者缺一不可，故先补 CLI）=====
+if ($CLI已就位) {
+	Write-Host ('[{0}] CLI 已存在，跳过安装: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $CLI信息.落地路径)
+} elseif ($null -ne $CLI获胜包路径) {
+	安装-CLI压缩包 -压缩包路径 $CLI获胜包路径 -CLI信息 $CLI信息
+} else {
+	安装-远程CLI -CLI信息 $CLI信息
+}
+
 if ($服务端已就绪) {
 	# Remote-SSH 的 CLI 用 server 目录下的 product.json 与 bin 判定安装完整性，同提交号且结构完整则直接复用，避免重复下载约 190MB 的 Server 压缩包
 	Write-Host ('[{0}] 同提交号的 Server 已完整安装，跳过下载与解压: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $最终安装目录)
@@ -339,70 +477,10 @@ if (Test-Path $最终安装目录) {
 
 New-Item -ItemType Directory -Force $最终安装目录 | Out-Null
 
-$获胜包路径 = $下载压缩包路径
-if (-not [string]::IsNullOrWhiteSpace($暂存目录)) {
-	# ===== 竞速模式：远程自下载（后台作业）与本地下载+上传（由本地模块负责）并行，先完成者获胜 =====
-	New-Item -ItemType Directory -Force $暂存目录 | Out-Null
-	$远程包路径 = Join-Path $暂存目录 'REMOTE.zip'
-	$远程完成标记 = Join-Path $暂存目录 'REMOTE_DONE'
-	# 本地完成标记带远程实际架构后缀：本地供给侧若架构判断错误则永远对不上，避免错误架构的包获胜
-	$本地完成标记 = Join-Path $暂存目录 ('LOCAL_DONE.{0}' -f $系统架构)
-	$本地包路径 = Join-Path $暂存目录 'LOCAL.zip'
-	# 清理本端上一轮残留；LOCAL_DONE/LOCAL.zip 由本地供给任务管理，不在此处删（可能已先于本脚本完成）
-	Remove-Item -LiteralPath $远程包路径, $远程完成标记, (Join-Path $暂存目录 'LOCAL_CANCEL') -Force -ErrorAction SilentlyContinue
-
-	Write-Host '竞速模式：远程自下载与本地下载+上传并行，先完成者用于安装。'
-	# 把断点续传下载函数以文本形式带入后台作业（Start-Job 是独立进程，无法直接调用本脚本函数），保证竞速模式下远程侧仍是断点续传。
-	# 注意：Definition 属性不含花括号（函数体以 param(...) 开头），注入时必须自行包上 { }，否则是非法函数声明
-	$下载函数文本 = (Get-Command '通过HTTP断点续传下载').Definition
-	$下载作业 = Start-Job -ArgumentList $下载函数文本, $下载地址, $远程包路径, $远程完成标记 -ScriptBlock {
-		param($下载函数文本, $下载地址, $远程包路径, $远程完成标记)
-		$ErrorActionPreference = 'Continue'
-		[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-		Invoke-Expression ('function 通过HTTP断点续传下载 { ' + $下载函数文本 + ' }')
-		try {
-			通过HTTP断点续传下载 -下载地址 $下载地址 -目标路径 $远程包路径
-			if ((Test-Path $远程包路径) -and ((Get-Item $远程包路径).Length -gt 0)) {
-				New-Item -ItemType File -Force $远程完成标记 | Out-Null
-				Write-Output '远程自下载完成。'
-			} else {
-				Write-Output '远程自下载结束后未发现完整压缩包，等待本地供给。'
-			}
-		} catch {
-			Write-Output ('远程自下载异常终止: {0}' -f $_.Exception.Message)
-		}
-	}
-
-	$等待秒数 = 0
-	$获胜方 = $null
-	while ($true) {
-		if (Test-Path -LiteralPath $远程完成标记) { $获胜方 = '远程自下载'; break }
-		if (Test-Path -LiteralPath $本地完成标记) { $获胜方 = '本地供给'; break }
-		# 流式转发后台作业的输出（下载进度/重试消息）
-		Receive-Job -Job $下载作业 | ForEach-Object { Write-Host ('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $_) }
-		Start-Sleep -Seconds 1
-		$等待秒数++
-		if (($等待秒数 % 30) -eq 0) {
-			$远程字节 = 0
-			if (Test-Path $远程包路径) { $远程字节 = (Get-Item $远程包路径).Length }
-			$本地字节 = 0
-			if (Test-Path $本地包路径) { $本地字节 = (Get-Item $本地包路径).Length }
-			elseif (Test-Path ($本地包路径 + '.uploading')) { $本地字节 = (Get-Item ($本地包路径 + '.uploading')).Length }
-			Write-Host ('[{0}] 竞速等待 {1}s：远程侧已下 {2} 字节，本地侧已到 {3} 字节。' -f (Get-Date -Format 'HH:mm:ss'), $等待秒数, $远程字节, $本地字节)
-		}
-	}
-
-	# 胜负已定：写取消标记让本地供给任务停止后续动作，并终止远程后台下载
-	New-Item -ItemType File -Force (Join-Path $暂存目录 'LOCAL_CANCEL') | Out-Null
-	Stop-Job -Job $下载作业 -ErrorAction SilentlyContinue
-	Receive-Job -Job $下载作业 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $_) }
-	Remove-Job -Job $下载作业 -Force -ErrorAction SilentlyContinue
-
-	if ($获胜方 -eq '本地供给') { $获胜包路径 = $本地包路径 } else { $获胜包路径 = $远程包路径 }
-	Write-Host ('竞速获胜：{0} 的压缩包，开始解压。' -f $获胜方)
-
+if ($启用竞速) {
+	# 竞速决出的服务端压缩包（若服务端已就位则未竞速，上方的复用判定已提前收尾）
 	if (-not (Test-Path -LiteralPath $获胜包路径)) {
-		throw ('竞速获胜的包不存在: {0}' -f $获胜包路径)
+		throw ('竞速决出的包不存在: {0}' -f $获胜包路径)
 	}
 } else {
 	Write-Host '开始通过 HTTP 断点续传下载压缩包。'

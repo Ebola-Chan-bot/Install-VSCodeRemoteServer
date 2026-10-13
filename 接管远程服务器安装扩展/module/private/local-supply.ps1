@@ -1,5 +1,5 @@
-﻿# 本地竞速供给子进程脚本
-# 由 启动-本地竞速供给 通过 Start-Process 作为独立 powershell 进程运行，与主模块进程隔离；远程侧获胜的瞬间，主流程用 taskkill /T /F 直接击杀本进程及其派生的 ssh/scp，下载或上传无论进行到哪一步都被立即终止（真正的事件驱动即时取消，零轮询）。参数经 Clixml 文件传入，避开命令行转义与 PS 5.1 原生命令 stderr 终止性错误陷阱。
+﻿# 本地竞速供给子进程脚本（每个竞速产物一个实例：CLI 与服务端各由 启动-本地竞速供给 起一个，并行下载/上传互不阻塞）
+# 由 启动-本地竞速供给 通过 Start-Process 作为独立 powershell 进程运行，与主模块进程隔离；竞速全部决出的瞬间，主流程用 taskkill /T /F 直接击杀本进程及其派生的 ssh/scp，下载或上传无论进行到哪一步都被立即终止（真正的事件驱动即时取消，零轮询）。参数经 Clixml 文件传入，避开命令行转义与 PS 5.1 原生命令 stderr 终止性错误陷阱。
 [CmdletBinding()]
 param(
 	[Parameter(Mandatory = $true, Position = 0)]
@@ -21,6 +21,8 @@ try {
 	$系统类型 = [string]$参数.系统类型
 	$分隔符 = [string]$参数.分隔符
 	$提交号 = [string]$参数.提交号
+	$产物名 = [string]$参数.产物名
+	$取消标记名 = [string]$参数.取消标记名
 
 	function 调用-远程命令([string]$命令文本) {
 		# 返回 {退出码, 输出} 对象（不用元组：命令无 stdout 时 PowerShell 会展平数组导致下标错位），失败时把远端报错一并带回展示
@@ -38,9 +40,9 @@ try {
 
 	function 取-取消标记命令 {
 		if ($系统类型 -eq 'Linux') {
-			return ('test -f {0}/LOCAL_CANCEL' -f $暂存目录)
+			return ('test -f {0}/{1}' -f $暂存目录, $取消标记名)
 		}
-		return (转换-远程PowerShell命令 ('if (Test-Path -LiteralPath ''{0}\LOCAL_CANCEL'') {{ exit 0 }} else {{ exit 1 }}' -f $暂存目录))
+		return (转换-远程PowerShell命令 ('if (Test-Path -LiteralPath ''{0}\{1}'') {{ exit 0 }} else {{ exit 1 }}' -f $暂存目录, $取消标记名))
 	}
 
 	# 下载前的低成本取消检查（远程已获胜则不必下载）
@@ -123,9 +125,9 @@ try {
 	# 原子改名 + 写完成标记（带远端取消检查，避免远程已获胜后仍写标记）。退出码约定：0=包已就位，2=远程已获胜跳过改名，其他=失败
 	# Linux 版包 sh -c 是防登录 shell 不是 sh（tcsh/fish 会把 if...then...fi 判成语法错误）；Windows 版经 转换-远程PowerShell命令 走 EncodedCommand，避开双引号被剥与 cmd 把 | 当管道解析
 	if ($系统类型 -eq 'Linux') {
-		$改名命令 = ("sh -c 'if [ -f {0}/LOCAL_CANCEL ]; then exit 2; fi; mv {0}/{1}.uploading {0}/{1} && touch {0}/{2}'" -f $暂存目录, $远程包名, $完成标记名)
+		$改名命令 = ("sh -c 'if [ -f {0}/{3} ]; then exit 2; fi; mv {0}/{1}.uploading {0}/{1} && touch {0}/{2}'" -f $暂存目录, $远程包名, $完成标记名, $取消标记名)
 	} else {
-		$改名脚本 = ('if (Test-Path -LiteralPath ''{0}\LOCAL_CANCEL'') {{ exit 2 }}; try {{ Move-Item -LiteralPath ''{0}\{1}.uploading'' -Destination ''{0}\{1}'' -Force -ErrorAction Stop; New-Item -ItemType File -Force ''{0}\{2}'' -ErrorAction Stop | Out-Null }} catch {{ Write-Output $_.Exception.Message; exit 1 }}' -f $暂存目录, $远程包名, $完成标记名)
+		$改名脚本 = ('if (Test-Path -LiteralPath ''{0}\{3}'') {{ exit 2 }}; try {{ Move-Item -LiteralPath ''{0}\{1}.uploading'' -Destination ''{0}\{1}'' -Force -ErrorAction Stop; New-Item -ItemType File -Force ''{0}\{2}'' -ErrorAction Stop | Out-Null }} catch {{ Write-Output $_.Exception.Message; exit 1 }}' -f $暂存目录, $远程包名, $完成标记名, $取消标记名)
 		$改名命令 = 转换-远程PowerShell命令 $改名脚本
 	}
 	$改名结果 = 调用-远程命令 $改名命令

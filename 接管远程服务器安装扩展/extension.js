@@ -3,7 +3,17 @@
 // 开启：Remote-SSH 每次连接前先由本模块安装远程服务器（竞速供给 + 旧 glibc 自动部署官方 sysroot + CLI 引导预装），Remote-SSH 自带的安装步骤检测到服务端已就位便直接复用——即「用本模块的方式替换原本的远程服务器安装」。
 // 关闭：撤下钩子并把 remote.SSH.preconnect 还原为接管前的取值——即「还原」。
 //
-// 机制依据（Remote-SSH 0.128 源码实测）：remote.SSH.preconnect 取字符串时对全部主机生效、取对象时按主机映射，脚本在 Windows 上必须是 .ps1，以 powershell.exe -NoProfile -ExecutionPolicy Bypass -File 调用且不带任何参数，非零退出会直接中止连接。故接管脚本必须自带主机名、全程尽力而为（出错写日志不抛出）、结尾 exit 0；又因脚本内容哈希参与一次性授权确认（内容变化会重新弹窗），生成的脚本必须逐字节稳定，不含时间戳之类易变内容。
+// 机制依据（Remote-SSH 0.128 源码实测：out/extension.js 的 preconnectScript）：remote.SSH.preconnect 取字符串时对全部主机生效、
+// 取对象时按主机映射；Windows 上必须是 .ps1，以 spawn('powershell.exe', ['-NoProfile','-ExecutionPolicy','Bypass','-File', 脚本路径],
+// { stdio: ['ignore','pipe','pipe'] }) 调用——参数硬编码、不注入环境变量、不设工作目录、标准输入为 ignore，脚本运行时对自己
+// 被哪台主机触发一无所知（主机名只被用来挑路径，不传下来），故唯一能携带主机名的途径就是每主机一个薄脚本。
+// 非零退出会中止连接；脚本内容 sha256 参与一次性授权确认（内容变化即重新弹窗）。
+//
+// 因此本扩展把职责拆成三个文件（都在 globalStorage 目录）：
+//   接管安装-<主机>.ps1  薄脚本，内容只有主机名 + 一行调用，逐字节稳定，是被授权哈希的那个文件；
+//   接管安装实现.ps1     公共实现，从扩展目录原样复制（不在这里拼字符串），Remote-SSH 不读它，改逻辑不会重新弹窗；
+//   接管安装配置.json    模块路径、发布通道、各主机原有的 preconnect 脚本——易变信息集中在此，同样不参与授权。
+// 薄脚本用 $PSScriptRoot 找同目录的实现文件，所以扩展升级换目录也不会改薄脚本内容。
 'use strict';
 
 const vscode = require('vscode');
@@ -14,7 +24,10 @@ const os = require('os');
 const 设置节 = '安装VSCode远程服务';
 const 开关键 = '接管远程服务器安装';
 const 钩子设置键 = 'remote.SSH.preconnect';
-const 生成脚本前缀 = '接管安装-';
+const 接管文件前缀 = '接管安装';
+const 生成脚本前缀 = 接管文件前缀 + '-';
+const 公共实现文件名 = '接管安装实现.ps1';
+const 配置文件名 = '接管安装配置.json';
 const 状态键_接管前设置 = '接管前的remote.SSH.preconnect';
 
 function 激活(context) {
@@ -89,9 +102,20 @@ async function 执行接管(context, 来自开关变化) {
 		return;
 	}
 
+	// 易变信息全部进配置文件与公共实现，薄脚本只留主机名，避免逻辑或路径变化重新触发授权确认
+	const 原脚本映射 = {};
+	for (const 主机 of 主机清单) {
+		原脚本映射[主机] = 取原preconnect脚本(原设置, 主机);
+	}
+	部署公共文件(context.extensionPath, 保存目录, {
+		模块路径: 模块路径,
+		本地版本: 发布通道,
+		原脚本映射: 原脚本映射
+	});
+
 	const 新钩子 = {};
 	for (const 主机 of 主机清单) {
-		新钩子[主机] = 生成接管脚本(保存目录, 主机, 模块路径, 发布通道, 取原preconnect脚本(原设置, 主机));
+		新钩子[主机] = 生成接管脚本(保存目录, 主机);
 	}
 
 	if (JSON.stringify(取钩子全局值()) !== JSON.stringify(新钩子)) {
@@ -140,7 +164,7 @@ function 收集主机清单(原设置) {
 	return 清单;
 }
 
-// 接管前映射中该主机原有的 preconnect 脚本（字符串形式视为对全部主机生效），生成的接管脚本末尾会链式执行它
+// 接管前映射中该主机原有的 preconnect 脚本（字符串形式视为对全部主机生效）；记入配置文件，由公共实现直接调用
 function 取原preconnect脚本(原设置, 主机) {
 	if (typeof 原设置 === 'string' && 原设置.trim() !== '') {
 		return 原设置;
@@ -154,50 +178,59 @@ function 取原preconnect脚本(原设置, 主机) {
 	return '';
 }
 
-function 生成接管脚本(保存目录, 主机, 模块路径, 发布通道, 原脚本) {
+function 生成接管脚本(保存目录, 主机) {
 	const 文件名 = 生成脚本前缀 + 主机.replace(/[\\/:*?"<>|]/g, '_') + '.ps1';
 	const 文件路径 = path.join(保存目录, 文件名);
-	const 目标内容 = '\ufeff' + 生成脚本内容(主机, 模块路径, 发布通道, 原脚本);
-	const 现有内容 = fs.existsSync(文件路径) ? fs.readFileSync(文件路径, 'utf8') : '';
-	if (现有内容 !== 目标内容) {
-		fs.mkdirSync(保存目录, { recursive: true });
-		// UTF-8 带 BOM：Windows PowerShell 5.1 会把无 BOM 的 UTF-8 按 ANSI 误读，中文必乱码
-		fs.writeFileSync(文件路径, 目标内容, 'utf8');
-	}
+	fs.mkdirSync(保存目录, { recursive: true });
+	写入如不同(文件路径, 加BOM(生成薄脚本内容(主机)));
 	return 文件路径;
 }
 
-function 生成脚本内容(主机, 模块路径, 发布通道, 原脚本) {
+// 薄脚本：只把主机名交给同目录的公共实现。这里刻意不含模块路径、发布通道等易变信息——
+// 它的内容 sha256 就是 Remote-SSH 的一次性授权凭据，内容越稳，升级后越不会重新弹窗。
+function 生成薄脚本内容(主机) {
 	const 转义 = 文本 => String(文本).replace(/'/g, "''");
 	return [
-		'# 接管 Remote-SSH 的远程服务器安装步骤（由「接管远程服务器安装」扩展生成，请勿手工修改）',
-		'# 主机：' + 主机 + '；发布通道：' + 发布通道 + '。全程尽力而为：出错只写日志、绝不阻断连接（preconnect 脚本非零退出会中止连接）。',
-		"$模块路径 = '" + 转义(模块路径) + "'",
-		"$主机 = '" + 转义(主机) + "'",
-		"$原脚本 = '" + 转义(原脚本) + "'",
-		'try {',
-		'	# 先探免密：模块在需要密码时会交互收集，脱离终端会挂起，故探测不通过就放弃接管、交还 Remote-SSH 自带安装',
-		'	& ssh -o BatchMode=yes -o ConnectTimeout=8 $主机 exit 0 | Out-Null',
-		'	if ($LASTEXITCODE -ne 0) {',
-		"		Write-Host ('[接管安装] {0} 未配置免密登录，跳过本次接管，保持 Remote-SSH 自带安装' -f $主机)",
-		'	} else {',
-		'		Import-Module -Name $模块路径 -Force -ErrorAction Stop',
-		"		安装-VSCode远程服务 -远程主机 $主机 -本地版本 '" + 转义(发布通道) + "' -ErrorAction Stop",
-		'	}',
-		'} catch {',
-		"	Write-Host ('[接管安装] 失败（不阻断连接）：{0}' -f $_.Exception.Message)",
-		'}',
-		"if ($原脚本 -ne '' -and (Test-Path -LiteralPath $原脚本)) {",
-		'	# 链式执行接管前的原 preconnect 脚本，保持接管前的既有行为（如服务保活预部署）',
-		'	try {',
-		'		& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $原脚本 | Out-Null',
-		'	} catch {',
-		"		Write-Host ('[接管安装] 原 preconnect 脚本失败（不阻断连接）：{0}' -f $_.Exception.Message)",
-		'	}',
-		'}',
-		'exit 0',
+		'# 接管 Remote-SSH 的远程服务器安装步骤（由「接管远程服务器安装」扩展生成，请勿手工修改）。',
+		'# 本文件只负责把主机名交给同目录的公共实现；具体逻辑与路径信息都在实现文件和配置文件里。',
+		'# 改动那两个文件不会改变本文件内容，因此不会重新触发 Remote-SSH 的授权确认。',
+		"& (Join-Path $PSScriptRoot '" + 公共实现文件名 + "') -远程主机 '" + 转义(主机) + "'",
+		'# 公共实现自己决定退出码（非 0 会让 Remote-SSH 中止本次连接）；下面一行只是兜底。',
+		'exit $LASTEXITCODE',
 		''
 	].join('\r\n');
+}
+
+// 部署公共实现与配置：公共实现是扩展目录里的独立 .ps1 文件，原样复制（不在此拼字符串），
+// 便于单独编辑、单独做 PowerShell 语法校验；配置是本次接管的易变信息。
+function 部署公共文件(扩展目录, 保存目录, 配置) {
+	const 源实现 = path.join(扩展目录, 公共实现文件名);
+	if (!fs.existsSync(源实现)) {
+		throw new Error('未找到接管安装公共实现，期望位置：' + 源实现);
+	}
+	fs.mkdirSync(保存目录, { recursive: true });
+	写入如不同(path.join(保存目录, 公共实现文件名), 加BOM(规范化文本(fs.readFileSync(源实现, 'utf8'))));
+	// 只含稳定字段（无时间戳），逐字节可复现，才能用“内容相同就不写”避免无谓改动
+	写入如不同(path.join(保存目录, 配置文件名), 加BOM(JSON.stringify(配置, null, '\t') + '\r\n'));
+}
+
+function 写入如不同(文件路径, 目标内容) {
+	const 现有内容 = fs.existsSync(文件路径) ? fs.readFileSync(文件路径, 'utf8') : '';
+	if (现有内容 === 目标内容) {
+		return false;
+	}
+	fs.writeFileSync(文件路径, 目标内容, 'utf8');
+	return true;
+}
+
+// 行尾统一 CRLF、去掉源文件可能已有的 BOM（避免复制后出现双 BOM）
+function 规范化文本(文本) {
+	return String(文本).replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').replace(/\n/g, '\r\n');
+}
+
+// UTF-8 带 BOM：Windows PowerShell 5.1 会把无 BOM 的 UTF-8 按 ANSI 误读，中文必乱码
+function 加BOM(文本) {
+	return '\ufeff' + 文本;
 }
 
 function 清理生成脚本(保存目录) {
@@ -206,7 +239,8 @@ function 清理生成脚本(保存目录) {
 		return 数量;
 	}
 	for (const 文件名 of fs.readdirSync(保存目录)) {
-		if (文件名.startsWith(生成脚本前缀) && 文件名.endsWith('.ps1')) {
+		// 薄脚本（接管安装-<主机>.ps1）、公共实现与配置同一个前缀，关闭开关时一并清掉
+		if (文件名.startsWith(接管文件前缀) && (文件名.endsWith('.ps1') || 文件名.endsWith('.json'))) {
 			fs.unlinkSync(path.join(保存目录, 文件名));
 			数量 += 1;
 		}
