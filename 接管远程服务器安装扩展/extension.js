@@ -7,7 +7,7 @@
 // { stdio: ['ignore','pipe','pipe'] }) 调用——参数硬编码、不注入环境变量、不设工作目录、标准输入为 ignore，脚本运行时对自己被哪台主机触发一无所知（主机名只被用来挑路径，不传下来），故唯一能携带主机名的途径就是每主机一个薄脚本。非零退出会中止连接；脚本内容 sha256 参与一次性授权确认（内容变化即重新弹窗）。
 //
 // 因此本扩展把职责拆成三个文件（都在 globalStorage 目录）：
-//   接管安装-<主机>.ps1  薄脚本，内容只有主机名 + 一行调用，逐字节稳定，是被授权哈希的那个文件；`接管安装实现.ps1`公共实现，从扩展目录原样复制（不在这里拼字符串），Remote-SSH 不读它，改逻辑不会重新弹窗；`接管安装配置.json`模块路径与发布通道——易变信息集中在此，同样不参与授权。薄脚本用 $PSScriptRoot 找同目录的实现文件，所以扩展升级换目录也不会改薄脚本内容。
+//   接管安装-<主机>.ps1  薄脚本，内容只有主机名 + 一行调用，逐字节稳定，是被授权哈希的那个文件；`接管安装实现.ps1`公共实现，从扩展目录原样复制（不在这里拼字符串），Remote-SSH 不读它，改逻辑不会重新弹窗；`接管安装配置.json`模块路径、发布通道与各主机启用的能力（接管安装 / 服务保活）——易变信息集中在此，同样不参与授权。薄脚本用 $PSScriptRoot 找同目录的实现文件，所以扩展升级换目录也不会改薄脚本内容。启用保活的主机同样生成薄脚本挂 preconnect，连接时幂等检修保活包装（部署/升级/自愈），VS Code 更新到新提交号后下一次连接即自动补上。
 //
 // 主机接管前已有外部 preconnect 脚本时绝不自动套壳，弹窗让用户三选一（决策持久化在 globalState，只问一次）：直接覆盖：钩子改指我方薄脚本，原脚本引用被丢弃（不可恢复，还原时也不回填）；复制调用代码：该主机的钩子完全不动，一行调用代码复制到剪贴板由用户自己粘进原脚本，调用链变成 Remote-SSH → 用户脚本 → 我方薄脚本；还原时扩展对该主机不做任何事，只提示手动删除那行（其薄脚本与公共文件必须保留：用户没删行之前还要靠它们干活，删了会让连接直接报错）。
 'use strict';
@@ -25,6 +25,7 @@ const 生成脚本前缀 = 接管文件前缀 + '-';
 const 公共实现文件名 = '接管安装实现.ps1';
 const 配置文件名 = '接管安装配置.json';
 const 接管主机键 = '接管的主机';
+const 保活主机键 = '启用保活的主机';
 const 命令_选择主机 = 设置节 + '.选择接管主机';
 const 状态键_接管方式 = '接管方式'; // 主机 → { 方式: '覆盖'|'自调', 原脚本 }；只对有过外部原脚本的主机记录
 const 状态键_接管前设置 = '接管前的remote.SSH.preconnect'; // 旧版遗留记录，只读取用于追溯原脚本，用完即清
@@ -43,12 +44,12 @@ function 串行对齐(context, 交互) {
 function 激活(context) {
 	// 开关或主机清单任一变化（设置页保存、手改 settings.json 都算）→ 立即对齐，交互模式下允许弹窗
 	context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(事件 => {
-		if (事件.affectsConfiguration(设置节 + '.' + 开关键) || 事件.affectsConfiguration(设置节 + '.' + 接管主机键)) {
+		if (事件.affectsConfiguration(设置节 + '.' + 开关键) || 事件.affectsConfiguration(设置节 + '.' + 接管主机键) || 事件.affectsConfiguration(设置节 + '.' + 保活主机键)) {
 			串行对齐(context, true);
 		}
 	}));
 
-	// 多选勾选列表：实时扫描 ssh config 供勾选，确认后写回「接管的主机」设置（写回即触发上面的对齐）
+	// 多选勾选列表：实时扫描 ssh config 供勾选（先接管、后保活），确认后写回对应设置（写回即触发上面的对齐）
 	context.subscriptions.push(vscode.commands.registerCommand(命令_选择主机, () => 选择接管主机().catch(错误 => {
 		vscode.window.showErrorMessage('接管远程服务器安装：打开主机选择失败：' + 取错误信息(错误));
 	})));
@@ -67,33 +68,46 @@ async function 对齐接管状态(context, 交互) {
 	}
 }
 
-// 「选择要接管的主机…」命令：多选 QuickPick，候选实时来自 ssh config（含已勾选但已从 config 消失的，便于取消）
+// 「选择接管与保活的主机…」命令：两个多选 QuickPick 依次勾选（接管安装 / 服务保活，相互独立可重叠），候选实时来自 ssh config（含已勾选但已从 config 消失的，便于取消）
 async function 选择接管主机() {
-	const 当前 = 取接管主机设置();
 	const 候选 = 解析SSH主机();
-	for (const 主机 of 当前) {
-		if (!候选.includes(主机)) {
-			候选.push(主机);
+	const 当前接管 = 取主机清单设置(接管主机键);
+	const 当前保活 = 取主机清单设置(保活主机键);
+	for (const 名单 of [当前接管, 当前保活]) {
+		for (const 主机 of 名单) {
+			if (!候选.includes(主机)) {
+				候选.push(主机);
+			}
 		}
 	}
 	if (候选.length === 0) {
 		vscode.window.showWarningMessage('接管远程服务器安装：未在 ~/.ssh/config 中发现任何主机，请补充 SSH 配置后再试。');
 		return;
 	}
-	const 选中 = await vscode.window.showQuickPick(候选.map(名字 => ({ label: 名字, picked: 当前.includes(名字) })), {
+	const 勾选接管 = await vscode.window.showQuickPick(候选.map(名字 => ({ label: 名字, picked: 当前接管.includes(名字) })), {
 		canPickMany: true,
 		title: '选择要接管远程服务器安装的主机',
 		placeHolder: '空格切换勾选，回车确定；未勾选的主机保持 Remote-SSH 自带安装'
 	});
-	if (选中 === undefined) {
-		return; // 取消对话框：设置不变
+	if (勾选接管 === undefined) {
+		return; // 第一步取消：全部设置不变
 	}
-	await vscode.workspace.getConfiguration(设置节).update(接管主机键, 选中.map(项 => 项.label), vscode.ConfigurationTarget.Global);
+	await vscode.workspace.getConfiguration(设置节).update(接管主机键, 勾选接管.map(项 => 项.label), vscode.ConfigurationTarget.Global);
+
+	const 勾选保活 = await vscode.window.showQuickPick(候选.map(名字 => ({ label: 名字, picked: 当前保活.includes(名字) })), {
+		canPickMany: true,
+		title: '选择要启用服务保活的主机',
+		placeHolder: '空格切换勾选，回车确定；保活让 server 脱离 SSH 会话存活、断线热附着，preconnect 时自动检修'
+	});
+	if (勾选保活 === undefined) {
+		return; // 第二步取消：接管清单已生效，保活清单保持原样
+	}
+	await vscode.workspace.getConfiguration(设置节).update(保活主机键, 勾选保活.map(项 => 项.label), vscode.ConfigurationTarget.Global);
 }
 
-// 读「接管的主机」设置：去重、去空、去首尾空白（用户可能手改 settings.json）
-function 取接管主机设置() {
-	const 值 = vscode.workspace.getConfiguration(设置节).get(接管主机键, []);
+// 读主机清单类设置（「接管的主机」「启用保活的主机」）：去重、去空、去首尾空白（用户可能手改 settings.json）
+function 取主机清单设置(键) {
+	const 值 = vscode.workspace.getConfiguration(设置节).get(键, []);
 	if (!Array.isArray(值)) {
 		return [];
 	}
@@ -135,20 +149,29 @@ async function 执行接管(context, 交互) {
 	// 旧版本（全量自动接管）留下的记录：只作为追溯外部原脚本的第二来源，消费后清除
 	const 遗留原设置 = context.globalState.get(状态键_接管前设置);
 	const 方式记录 = context.globalState.get(状态键_接管方式) || {};
-	let 选中主机 = 取接管主机设置();
+	let 接管清单 = 取主机清单设置(接管主机键);
+	let 保活清单 = 取主机清单设置(保活主机键);
 
 	// 旧版升级迁移：新设置为空、但钩子里已有我方脚本时，把这些主机视为已勾选写回设置，避免升级后接管静默失效
-	if (选中主机.length === 0 && !交互 && 当前钩子 && typeof 当前钩子 === 'object') {
+	if (接管清单.length === 0 && !交互 && 当前钩子 && typeof 当前钩子 === 'object') {
 		const 迁移清单 = Object.keys(当前钩子).filter(主机 => 是我方脚本(当前钩子[主机], 保存目录));
 		if (迁移清单.length > 0) {
-			选中主机 = 迁移清单;
+			接管清单 = 迁移清单;
 			await vscode.workspace.getConfiguration(设置节).update(接管主机键, 迁移清单, vscode.ConfigurationTarget.Global);
 			vscode.window.showInformationMessage('接管远程服务器安装：已从旧版本迁移 ' + 迁移清单.length + ' 台主机到「接管的主机」设置，可随时增删。');
 		}
 	}
 
-	if (选中主机.length === 0 && 交互) {
-		const 选择 = await vscode.window.showWarningMessage('接管远程服务器安装：开关已开启，但还没有勾选任何主机。', '选择主机…');
+	// 需要 preconnect 钩子的主机 = 启用接管 ∪ 启用保活：保活也要在每次连接时检修（幂等部署/升级/自愈包装）
+	let 需要钩子 = [...接管清单];
+	for (const 主机 of 保活清单) {
+		if (!需要钩子.includes(主机)) {
+			需要钩子.push(主机);
+		}
+	}
+
+	if (需要钩子.length === 0 && 交互) {
+		const 选择 = await vscode.window.showWarningMessage('接管远程服务器安装：开关已开启，但还没有勾选任何接管或保活的主机。', '选择主机…');
 		if (选择 === '选择主机…') {
 			await vscode.commands.executeCommand(命令_选择主机);
 		}
@@ -157,7 +180,7 @@ async function 执行接管(context, 交互) {
 
 	// 有外部原脚本且尚未决策的主机：交互时逐个弹窗询问；启动静默对齐时不打扰，只留通知并跳过这些主机
 	const 待决策 = [];
-	for (const 主机 of 选中主机) {
+	for (const 主机 of 需要钩子) {
 		if (方式记录[主机]) {
 			continue;
 		}
@@ -172,9 +195,11 @@ async function 执行接管(context, 交互) {
 			for (const 项 of 待决策) {
 				const 结果 = await 询问原脚本处理(项, 当前钩子, 保存目录);
 				if (结果 === null) {
-					// 跳过/关窗：等同不勾选此主机，从清单里同步移除
+					// 跳过/关窗：等同不勾选此主机，两个清单里都同步移除
 					有跳过 = true;
-					选中主机 = 选中主机.filter(名字 => 名字 !== 项.主机);
+					接管清单 = 接管清单.filter(名字 => 名字 !== 项.主机);
+					保活清单 = 保活清单.filter(名字 => 名字 !== 项.主机);
+					需要钩子 = 需要钩子.filter(名字 => 名字 !== 项.主机);
 				} else {
 					方式记录[项.主机] = { 方式: 结果.方式, 原脚本: 项.原脚本 };
 					if (结果.方式 === '自调') {
@@ -185,12 +210,15 @@ async function 执行接管(context, 交互) {
 			}
 		} else {
 			const 名字串 = 待决策.map(项 => 项.主机).join('、');
-			vscode.window.showWarningMessage('接管远程服务器安装：主机（' + 名字串 + '）接管前已配置 preconnect 脚本，需要选择处理方式后才能接管，本次已跳过。', '立即处理').then(选择 => {
+			vscode.window.showWarningMessage('接管远程服务器安装：主机（' + 名字串 + '）接管前已配置 preconnect 脚本，需要选择处理方式后才能接管或保活，本次已跳过。', '立即处理').then(选择 => {
 				if (选择 === '立即处理') {
 					串行对齐(context, true);
 				}
 			});
-			选中主机 = 选中主机.filter(名字 => !待决策.some(项 => 项.主机 === 名字));
+			const 待决策主机 = 待决策.map(项 => 项.主机);
+			接管清单 = 接管清单.filter(名字 => !待决策主机.includes(名字));
+			保活清单 = 保活清单.filter(名字 => !待决策主机.includes(名字));
+			需要钩子 = 需要钩子.filter(名字 => !待决策主机.includes(名字));
 		}
 	}
 
@@ -200,23 +228,31 @@ async function 执行接管(context, 交互) {
 		await context.globalState.update(状态键_接管前设置, undefined);
 	}
 	if (有跳过) {
-		await vscode.workspace.getConfiguration(设置节).update(接管主机键, 选中主机, vscode.ConfigurationTarget.Global);
+		await vscode.workspace.getConfiguration(设置节).update(接管主机键, 接管清单, vscode.ConfigurationTarget.Global);
+		await vscode.workspace.getConfiguration(设置节).update(保活主机键, 保活清单, vscode.ConfigurationTarget.Global);
 	}
 
 	// 薄脚本：覆盖主机由钩子直接调用，自调主机由用户粘贴的那行调用，两者都需要生成
 	const 我方条目 = {};
-	for (const 主机 of 选中主机) {
+	for (const 主机 of 需要钩子) {
 		我方条目[主机] = 生成接管脚本(保存目录, 主机);
 	}
 	// 易变信息全部进配置文件与公共实现，薄脚本只留主机名，避免逻辑或路径变化重新触发授权确认
-	部署公共文件(context.extensionPath, 保存目录, { 模块路径: 模块路径, 本地版本: 发布通道 });
+	部署公共文件(context.extensionPath, 保存目录, {
+		模块路径: 模块路径,
+		本地版本: 发布通道,
+		接管主机: 接管清单,
+		保活主机: 保活清单,
+		// 平台提示取自 Remote-SSH 自己的 remotePlatform 设置：Windows 主机上单会话（sh/base64）必失败，提前告知模块跳过那次徒劳尝试
+		平台提示映射: (vscode.workspace.getConfiguration('remote.SSH').get('remotePlatform') || {})
+	});
 
 	const 新钩子 = 重建钩子(当前钩子, 方式记录, 我方条目, 保存目录);
 	if (JSON.stringify(取钩子全局值()) !== JSON.stringify(新钩子)) {
 		await 写钩子全局值(新钩子);
 	}
 	// 自调主机的薄脚本可能仍被用户脚本里粘贴的那行引用（决策有记录就保留），其余不再选中的薄脚本清掉
-	const 保留主机 = new Set(选中主机);
+	const 保留主机 = new Set(需要钩子);
 	for (const 主机 of Object.keys(方式记录)) {
 		if (方式记录[主机] && 方式记录[主机].方式 === '自调') {
 			保留主机.add(主机);
@@ -224,8 +260,15 @@ async function 执行接管(context, 交互) {
 	}
 	清理多余薄脚本(保存目录, [...保留主机]);
 
-	if (交互 && 选中主机.length > 0) {
-		vscode.window.showInformationMessage('已接管 Remote-SSH 远程服务器安装：' + 选中主机.join('、') + '（共 ' + 选中主机.length + ' 个主机）；未勾选的主机保持自带安装。');
+	if (交互 && (接管清单.length > 0 || 保活清单.length > 0)) {
+		const 说明 = [];
+		if (接管清单.length > 0) {
+			说明.push('接管安装：' + 接管清单.join('、'));
+		}
+		if (保活清单.length > 0) {
+			说明.push('服务保活（preconnect 时自动检修）：' + 保活清单.join('、'));
+		}
+		vscode.window.showInformationMessage('接管远程服务器安装已配置——' + 说明.join('；') + '。未勾选的主机保持 Remote-SSH 自带安装。');
 	}
 }
 
@@ -311,7 +354,7 @@ async function 询问原脚本处理(项, 当前钩子, 保存目录) {
 			detail: '原脚本：' + 项.原脚本 + 补充警示
 				+ '\n\n直接覆盖：钩子改指本扩展脚本，原脚本不再被执行、引用丢失后不可恢复。'
 				+ '\n复制调用代码：您的脚本与钩子一概不动，一行调用代码复制到剪贴板，由您粘贴进原脚本（调用链：Remote-SSH → 您的脚本 → 接管安装）。'
-				+ '\n跳过：此主机不接管，保持原有行为。'
+				+ '\n跳过：此主机不接管安装、也不做保活检修，保持原有行为。'
 		},
 		覆盖, 自调, 跳过
 	);

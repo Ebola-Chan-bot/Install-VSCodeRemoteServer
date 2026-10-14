@@ -92,12 +92,20 @@ function 安装-VSCode远程服务 {
 		[ValidateSet('预览版', '稳定版')]
 		[string]$本地版本,
 
-		# 以下两个开关仅供本模块的公共入口 安装-VSCode服务保活 转发使用，对用户隐藏
+		# 以下开关仅供本模块的公共入口 安装-VSCode服务保活 转发与 preconnect 非交互场景使用，对用户隐藏
 		[Parameter(DontShow)]
 		[switch]$仅服务保活,
 
 		[Parameter(DontShow)]
-		[switch]$移除服务保活
+		[switch]$移除服务保活,
+
+		# 非交互环境（如 Remote-SSH preconnect）：需要密码时直接报错，不收集密码
+		[Parameter(DontShow)]
+		[switch]$非交互,
+
+		# 与接管安装同跑时把服务保活检修并入同一次远程会话（供 preconnect 场景使用），对用户隐藏
+		[Parameter(DontShow)]
+		[switch]$含服务保活
 	)
 
 	function 取-本地VSCode信息 {
@@ -293,6 +301,8 @@ powershell -NoProfile -Command Write-Output $env:USERPROFILE
 powershell -NoProfile -Command Write-Output $env:PROCESSOR_ARCHITECTURE
 uname -s
 uname -m
+uname -r
+ldd --version | head -1
 printf 'HOMEDIR_SH=%s\n' $HOME
 echo PROBE_END
 '@
@@ -307,6 +317,8 @@ echo PROBE_END
 		$登录目录 = ''
 		$PS主版本 = $null
 		$原始架构 = ''
+		$内核版本 = $null
+		$Glibc版本 = $null
 		foreach ($原始行 in $输出) {
 			$行 = ([string]$原始行).Trim()
 			if ($行 -eq 'Linux') {
@@ -339,6 +351,16 @@ echo PROBE_END
 				continue
 			}
 
+			# Linux 专用：内核发布（uname -r 裸值，如 3.10.0-1160.el7.x86_64）与 glibc（ldd --version 首行，如 ldd (GNU libc) 2.17）；随合并探测一次带回，免去为它们各开一次 SSH（慢速主机上每次往返可达数十秒）
+			if ($null -eq $内核版本 -and $行 -match '^(\d+\.\d+)\.') {
+				try { $内核版本 = [version]$Matches[1] } catch { $内核版本 = $null }
+				continue
+			}
+			if ($null -eq $Glibc版本 -and $行 -match 'libc.*?(\d+\.\d+)\s*$') {
+				try { $Glibc版本 = [version]$Matches[1] } catch { $Glibc版本 = $null }
+				continue
+			}
+
 			# Windows 默认 shell 为 PowerShell 时，探测命令中的 powershell 行直接输出裸路径（无标记前缀），按 Windows 路径形态识别
 			if ($系统类型 -eq 'Windows' -and $登录目录 -eq '' -and $行 -match '^[A-Za-z]:\\') {
 				$登录目录 = $行.TrimEnd('\', '/')
@@ -357,6 +379,8 @@ echo PROBE_END
 			登录目录 = $登录目录
 			PS主版本 = $PS主版本
 			原始架构 = $原始架构
+			内核版本 = $内核版本
+			Glibc版本 = $Glibc版本
 			完整 = $完整
 		}
 	}
@@ -365,7 +389,9 @@ echo PROBE_END
 		param(
 			[string]$连接目标,
 			[int]$端口,
-			[switch]$免密模式
+			[switch]$免密模式,
+			# 与探测同行执行的轻量远端准备（同一条连接）；语法须跨 sh/cmd/PowerShell 全兼容（约束见 取-环境探测命令 注释）
+			[string]$附加命令
 		)
 
 		# 一次 SSH 调用完成全部环境试探；认证失败（退出码 255）返回 $null 由调用方进入密码收集流程
@@ -377,7 +403,11 @@ echo PROBE_END
 		$ssh参数 = @('-n', '-p', $端口) + $script:SSH密码选项
 		if ($免密模式) { $ssh参数 += @('-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10') }
 		# 探测命令必须用 LF 行尾：本模块文件以 CRLF 保存，here-string 会带上 \r，远端 sh 会把行尾的 \r 当成命令的一部分（如 uname -s\r 报 invalid option），导致关键输出行丢失
-		$ssh参数 += @($连接目标, ((取-环境探测命令) -replace "`r`n", "`n"))
+		$探测命令文本 = (取-环境探测命令) -replace "`r`n", "`n"
+		if (-not [string]::IsNullOrWhiteSpace($附加命令)) {
+			$探测命令文本 = $探测命令文本 + "`n" + $附加命令
+		}
+		$ssh参数 += @($连接目标, $探测命令文本)
 
 		# PS 5.1 下原生命令 stderr 一旦被重定向即变终止性错误，捕获期间临时切 Continue 并在 finally 恢复；不重定向时探测命令的多平台垃圾行会污染控制台，故此处选择捕获
 		$原始EAP = $ErrorActionPreference
@@ -389,6 +419,8 @@ echo PROBE_END
 		}
 
 		if ($LASTEXITCODE -eq 255) {
+			# 留诊断给非交互模式报错时区分「要密码」与「连不上」
+			$script:环境探测诊断 = (@($输出) | ForEach-Object { [string]$_ }) -join ' '
 			return $null
 		}
 
@@ -424,6 +456,8 @@ echo PROBE_END
 			登录目录 = $登录目录
 			PS主版本 = $PS主版本
 			原始架构 = $原始架构
+			内核版本 = $报告.内核版本
+			Glibc版本 = $报告.Glibc版本
 			完整 = $true
 		}
 	}
@@ -431,17 +465,49 @@ echo PROBE_END
 	function 初始化-SSH会话 {
 		param(
 			[string]$连接目标,
-			[int]$端口
+			[int]$端口,
+			# 非交互（如 Remote-SSH preconnect，标准输入是 ignore）：需要密码时直接报错而不是收集
+			[switch]$非交互,
+			[string]$附加命令,
+			# 单会话通道：探测已随会话引导体发出，直接取结果；取不到（非 POSIX 远端/免密失败）则回退离散探测
+			$会话
 		)
 
 		$script:SSH密码选项 = @()
 		$script:密码已注入 = $false
 
-		# 免密探测与环境试探合并为同一次连接：成功即同时拿到免密结论与完整环境报告
-		$报告 = 执行-环境探测 -连接目标 $连接目标 -端口 $端口 -免密模式
+		if ($null -ne $会话 -and -not $会话.进程.HasExited) {
+			$会话探测行 = 读取-会话探测 $会话
+			if ($null -ne $会话探测行) {
+				Write-Host '检测到远程主机已配置免密登录，无需输入密码。'
+				$报告 = 解析-环境报告 -输出 $会话探测行
+				return (补全-环境报告 -报告 $报告 -连接目标 $连接目标 -端口 $端口)
+			}
+			# 会话没能完成探测：弃用会话，回退下方离散流程（它会给出准确的免密/连接报错）
+			关闭-接管会话 $会话
+			$会话 = $null
+		}
+
+		# 同一次会话内复用环境报告（如 preconnect 里安装与保活各调用一次本函数）：免去重复的整轮 SSH 往返
+		if ($null -eq $script:环境报告缓存) { $script:环境报告缓存 = @{} }
+		$缓存键 = '{0}:{1}' -f $连接目标, $端口
+		if ($非交互 -and $script:环境报告缓存.ContainsKey($缓存键)) {
+			return $script:环境报告缓存[$缓存键]
+		}
+
+		# 免密探测与环境试探合并为同一次连接：成功即同时拿到免密结论与完整环境报告（含内核与 glibc 版本）
+		$报告 = 执行-环境探测 -连接目标 $连接目标 -端口 $端口 -免密模式 -附加命令 $附加命令
 		if ($null -ne $报告) {
 			Write-Host '检测到远程主机已配置免密登录，无需输入密码。'
-			return (补全-环境报告 -报告 $报告 -连接目标 $连接目标 -端口 $端口)
+			$补全报告 = 补全-环境报告 -报告 $报告 -连接目标 $连接目标 -端口 $端口
+			if ($非交互) { $script:环境报告缓存[$缓存键] = $补全报告 }
+			return $补全报告
+		}
+
+		if ($非交互) {
+			$诊断 = '无法连接远程主机'
+			if ($script:环境探测诊断 -match 'Permission denied|denied|password|认证') { $诊断 = '未配置免密登录（密钥认证）' }
+			throw ('{0}（{1}）：本环境无法交互输入密码（Remote-SSH preconnect 的标准输入被忽略）。请为该主机配置密钥认证，或关闭接管开关改用 Remote-SSH 自带安装。' -f $诊断, $连接目标)
 		}
 
 		# 需要密码：交互收集一次，之后通过 SSH_ASKPASS 注入到后续每次 ssh/scp 调用
@@ -467,7 +533,7 @@ echo PROBE_END
 		$script:密码已注入 = $true
 
 		# 密码注入后的第一次连接同样兼作环境试探，避免为试探再单独连一次
-		$报告 = 执行-环境探测 -连接目标 $连接目标 -端口 $端口
+		$报告 = 执行-环境探测 -连接目标 $连接目标 -端口 $端口 -附加命令 $附加命令
 		if ($null -eq $报告) {
 			清除-SSH密码复用
 			throw ('SSH 认证失败：{0} 拒绝了所提供的密码。' -f $连接目标)
@@ -948,142 +1014,438 @@ echo PROBE_END
 		return $缓存目录
 	}
 
-	function 部署-远程兼容性环境 {
+	function 上传-一批文件到远程 {
+		param(
+			[string[]]$本地路径,
+			[string]$连接目标,
+			[int]$端口,
+			[string]$远程目录
+		)
+
+		# 多文件一次连接上传（scp 单次调用接受多个源）：把逐文件上传的 N 次连接开销压成 1 次（慢速主机上每次连接可达数十秒）
+		$SCP命令 = Get-Command scp -ErrorAction SilentlyContinue | Select-Object -First 1
+		if ($null -eq $SCP命令) {
+			throw '未找到 scp 命令。请确保已安装 OpenSSH 客户端。'
+		}
+		$目标 = '{0}:{1}/' -f $连接目标, $远程目录.TrimEnd('/', '\')
+
+		$原始EAP = $ErrorActionPreference
+		try {
+			$ErrorActionPreference = 'Continue'
+			& $SCP命令.Source (@('-P', $端口) + $script:SSH密码选项 + $本地路径 + @($目标)) 2>&1 | Out-Null
+		} finally {
+			$ErrorActionPreference = $原始EAP
+		}
+		if ($LASTEXITCODE -eq 0) {
+			return
+		}
+
+		# 与单文件上传同款回退：SFTP 失败时用经典 SCP 协议（-O）补传一次，远端真实报错（如磁盘配额）才能回显
+		$原始EAP = $ErrorActionPreference
+		try {
+			$ErrorActionPreference = 'Continue'
+			$诊断输出 = @(& $SCP命令.Source (@('-O', '-P', $端口) + $script:SSH密码选项 + $本地路径 + @($目标)) 2>&1)
+		} finally {
+			$ErrorActionPreference = $原始EAP
+		}
+		if ($LASTEXITCODE -eq 0) {
+			return
+		}
+		$远端错误 = ($诊断输出 | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() }) -join "`n"
+		throw ('SCP 批量上传失败，退出码: {0}。目标 {1}。{2}{3}' -f $LASTEXITCODE, $目标, "`n", $远端错误)
+	}
+
+	function 构造-保活部署文本 {
+		param(
+			[string]$远程登录目录,
+			[string]$提交号,
+			[string]$发布通道,
+			[ValidateSet('部署', '移除')][string]$动作,
+			[string]$包装模板远程路径
+		)
+
+		# 保活部署脚本的占位符填充：把 Remote-SSH exec server 的启动入口 CLI（<数据根目录>/code[-insiders]-<提交号>）替换为包装脚本
+		# （真正启动的 command-shell 以「双 fork + setsid」拉起、与 sshd 会话祖先链断开而存活；真身另存数据目录之外避开官方 GC）
+		$根目录 = $远程登录目录.TrimEnd('/', '\')
+		$数据目录名 = if ($发布通道 -eq 'insider') { '.vscode-server-insiders' } else { '.vscode-server' }
+		$CLI基础名 = if ($发布通道 -eq 'insider') { 'code-insiders' } else { 'code' }
+
+		$文本 = $script:脚本_服务保活部署
+		$文本 = $文本.Replace('__动作__', $动作)
+		$文本 = $文本.Replace('__数据目录__', ($根目录 + '/' + $数据目录名))
+		$文本 = $文本.Replace('__服务保活目录__', ($根目录 + '/.vscode-persistent'))
+		$文本 = $文本.Replace('__CLI文件名__', ($CLI基础名 + '-' + $提交号))
+		$文本 = $文本.Replace('__当前提交号__', $提交号)
+		$文本 = $文本.Replace('__发布通道__', $发布通道)
+		return $文本.Replace('__包装脚本路径__', $包装模板远程路径)
+	}
+
+	function 生成-接管编排脚本 {
+		param(
+			[bool]$需要sysroot阶段,
+			[bool]$需要安装阶段,
+			[bool]$需要保活阶段,
+			[string]$暂存目录,
+			[string]$兼容性目录
+		)
+
+		# 单会话编排脚本：把 sysroot 部署、安装、原生补丁、保活检修、收尾清理串成一个 sh 脚本，由 执行-接管编排 随同一批阶段文件上传后一次性执行（每次 SSH 连接的开销在慢速主机上不可接受）。
+		# 阶段失败语义与分散执行时一致：安装按其退出码中止、sysroot/保活失败中止（20/21）、原生补丁失败仅告警。
+		$sysroot段 = ''
+		if ($需要sysroot阶段) {
+			$sysroot段 = @'
+echo '[接管安装-编排] 阶段: sysroot 兼容性环境'
+if find '__兼容性目录__/glibc' -name 'ld-*.so' -type f 2>/dev/null | grep -q . && '__兼容性目录__/bin/bin/patchelf' --version >/dev/null 2>&1 && grep -q 'vscode-sysroot (' "$HOME/.bashrc"; then
+	echo '[sysroot部署] 远程 sysroot 已部署，跳过。'
+else
+	mkdir -p '__兼容性目录__/.stage' || { echo '[接管安装-编排] 错误: 创建 sysroot 暂存目录失败' >&2; exit 20; }
+	for F in "$HOME"/vsi-stage-bundle-*; do
+		[ -f "$F" ] || continue
+		mv -f "$F" '__兼容性目录__/.stage/'${F##*/vsi-stage-bundle-} 2>/dev/null
+	done
+	sh "$HOME/vsi-stage-sysroot.sh" || { echo '[接管安装-编排] 错误: sysroot 部署失败' >&2; exit 20; }
+fi
+case "$(echo "LINKER=$VSCODE_SERVER_CUSTOM_GLIBC_LINKER")" in
+	'LINKER=__兼容性目录__'/*) echo '[接管安装-编排] 已验证非交互会话可见 VSCODE_SERVER_CUSTOM_GLIBC_LINKER。' ;;
+	*) echo '[接管安装-编排] 警告: 非交互会话未读到 sysroot 环境变量（远程 shell 可能不是 bash），Remote-SSH 若仍报 glibc 错误请手动检查 ~/.bashrc。' ;;
+esac
+'@
+		}
+
+		$安装段 = ''
+		if ($需要安装阶段) {
+			$安装段 = @'
+echo '[接管安装-编排] 阶段: 远程安装'
+sh "$HOME/vsi-stage-install.sh"
+RC=$?
+if [ "$RC" -ne 0 ]; then
+	echo "[接管安装-编排] 错误: 安装失败（退出码 $RC）" >&2
+	exit "$RC"
+fi
+'@
+		}
+
+		$原生段 = ''
+		if ($需要sysroot阶段) {
+			$原生段 = @'
+echo '[接管安装-编排] 阶段: 原生组件补丁'
+sh "$HOME/vsi-stage-native.sh" || echo '[接管安装-编排] 提示: 原生补丁未完全成功，不阻断安装结果'
+'@
+		}
+
+		$保活段 = ''
+		if ($需要保活阶段) {
+			$保活段 = @'
+echo '[接管安装-编排] 阶段: 服务保活检修'
+sh "$HOME/vsi-stage-keepalive.sh" || { echo '[接管安装-编排] 错误: 服务保活检修失败' >&2; exit 21; }
+'@
+		}
+
+		$正文 = @'
+#!/bin/sh
+# 接管安装编排（由 Install-VSCodeRemoteServer 模块生成）：单会话依次完成各阶段。
+# 阶段脚本随同一批上传带入登录目录（vsi-stage-* 前缀），本脚本负责串接、降级与收尾清理。
+__SYSROOT段__
+__安装段__
+__原生段__
+__保活段__
+echo '[接管安装-编排] 阶段: 收尾清理'
+rm -rf '__暂存目录__' 2>/dev/null
+rm -f "$HOME"/vsi-stage-* 2>/dev/null
+echo '[接管安装-编排] 编排完成'
+exit 0
+'@
+		return $正文.Replace('__SYSROOT段__', $sysroot段).Replace('__安装段__', $安装段).Replace('__原生段__', $原生段).Replace('__保活段__', $保活段).Replace('__暂存目录__', $暂存目录).Replace('__兼容性目录__', $兼容性目录)
+	}
+
+	function 建立-接管会话 {
 		param(
 			[string]$连接目标,
 			[int]$端口,
-			[string]$远程登录目录
+			[string]$预备命令
 		)
 
-		# 官方 sysroot 妥协方案的全自动部署（VS Code 1.99+ 对旧 glibc 系统的 workaround）：
-		# 在远程家目录组装 vscode-sysroot（glibc 2.28 库 + patchelf 0.18），并向 ~/.bashrc 顶部注入 VSCODE_SERVER_CUSTOM_GLIBC_LINKER / VSCODE_SERVER_CUSTOM_GLIBC_PATH / VSCODE_SERVER_PATCHELF_PATH 三个环境变量，Remote-SSH 后续安装时即自动用 sysroot patch server 而不报 glibc 先决条件错误。已部署过则幂等跳过。返回 sysroot 目录路径；部署失败抛异常由调用方决定容忍度。
-		$sysroot目录 = ($远程登录目录.TrimEnd('/', '\')) + '/vscode-sysroot'
-
-		# 就绪检查：loader 实体、patchelf、bashrc 标记块三者齐备才算已部署（按 ld-*.so 实体文件判定，与部署脚本的锚定标准一致；缺任一项则重新部署自愈）
-		$就绪命令 = 'find "{0}/glibc" -name "ld-*.so" -type f | grep -q . && "{0}/bin/bin/patchelf" --version >/dev/null 2>&1 && grep -q "vscode-sysroot (" "$HOME/.bashrc"' -f $sysroot目录
-		$就绪结果 = 执行-SSH命令并捕获 -连接目标 $连接目标 -端口 $端口 -命令文本 $就绪命令
-		if ($就绪结果.退出码 -eq 0) {
-			Write-Host '远程 sysroot 已部署，跳过。'
-			return $sysroot目录
+		# 单会话帧协议：一条 SSH 连接内完成 探测 → 等待本地备好阶段文件 → 逐帧上传 → 就地执行 全程。
+		# 远端引导体经 base64 管道下发（echo <b64> | base64 -d | sh）：任何 POSIX 登录 shell 都能启动、彻底避开引号/括号转义问题；Windows 远端没有 sh/base64 会立即失败，由调用方回退离散流程。
+		# stdin 是帧通道，四类帧：__FILE__（<字节数>\n<裸名>\n<裸字节>，落盘 $HOME/）、__CMD__（一行命令静默执行，用于改名+写标记，
+		# 帧序即“先文件后改名”的原子序，坏包/截断包永远不会被就位）、__RUN__（一行命令，后台起编排，输出继承会话 stdout 回传，
+		# 结束时回传 __ORCH_EXIT__=N 退出码）、__EXIT__（收尾退循环）。编排运行期间帧循环不退，供给产物的上传帧可随时插入——
+		# 单会话由主线程（读输出）与上传器线程（写帧）双工占用；写入仅由一方执行，无并发写入风险。
+		$帧循环 = @'
+echo __接管会话就绪__
+while IFS= read -r FT; do
+	case "$FT" in
+		__EXIT__)
+			break
+			;;
+		__FILE__)
+			IFS= read -r FN
+			IFS= read -r FF
+			head -c "$FN" > "$HOME/$FF"
+			;;
+		__CMD__)
+			IFS= read -r CC
+			sh -c "$CC" >/dev/null 2>&1
+			;;
+		__RUN__)
+			IFS= read -r RR
+			( sh -c "$RR" < /dev/null; echo "__ORCH_EXIT__$?" ) &
+			;;
+	esac
+done
+'@
+		$引导体 = ((取-环境探测命令) -replace "`r`n", "`n")
+		if (-not [string]::IsNullOrWhiteSpace($预备命令)) {
+			$引导体 = $引导体 + "`n" + $预备命令
 		}
+		$引导体 = $引导体 + "`n" + $帧循环
+		$编码 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($引导体))
+		$启动命令 = 'echo ' + $编码 + ' | base64 -d | sh'
 
-		$缓存目录 = 下载-兼容性工具包
-		$暂存目录 = $sysroot目录 + '/.stage'
-		[void](执行-SSH命令并捕获 -连接目标 $连接目标 -端口 $端口 -命令文本 ('mkdir -p "{0}"' -f $暂存目录))
-
-		foreach ($素材文件 in (Get-ChildItem $缓存目录 -File)) {
-			上传-文件到远程 -本地路径 $素材文件.FullName -连接目标 $连接目标 -端口 $端口 -远程路径 ($暂存目录 + '/' + $素材文件.Name)
+		$ssh命令 = Get-Command ssh -ErrorAction SilentlyContinue | Select-Object -First 1
+		if ($null -eq $ssh命令) {
+			throw '未找到 ssh 命令，无法连接远程服务器。'
 		}
-
-		# 部署脚本为独立模板文件（private\sysroot-deploy.sh，模块加载时读入），在远端解包组装 sysroot；库布局归并、loader 选址与环境变量注入的实现细节见该文件内注释
-		$部署脚本文本 = ($script:脚本_sysroot部署 -replace "`r`n", "`n").Replace('__目录__', $sysroot目录)
-
-		$本地部署脚本路径 = Join-Path $env:TEMP ('sysroot-deploy-{0}.sh' -f ([guid]::NewGuid().ToString('N')))
-		$远程部署脚本文件名 = 'vscode-sysroot-deploy-temp.sh'
-		$远程部署脚本路径 = $远程登录目录.TrimEnd('/', '\') + '/' + $远程部署脚本文件名
-		try {
-			[System.IO.File]::WriteAllText($本地部署脚本路径, $部署脚本文本, [System.Text.UTF8Encoding]::new($false))
-			上传-文件到远程 -本地路径 $本地部署脚本路径 -连接目标 $连接目标 -端口 $端口 -远程路径 $远程部署脚本路径
-
-			$部署结果 = 执行-SSH命令并捕获 -连接目标 $连接目标 -端口 $端口 -命令文本 ('sh "{0}"' -f $远程部署脚本路径)
-			foreach ($行 in $部署结果.输出) { Write-Host ('[sysroot部署] {0}' -f $行) }
-			if ($部署结果.退出码 -ne 0) {
-				throw ('sysroot 部署脚本失败，退出码 {0}' -f $部署结果.退出码)
-			}
-		} finally {
-			Remove-Item $本地部署脚本路径 -Force -ErrorAction SilentlyContinue
-			try { 执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('rm -f "{0}"' -f $远程部署脚本路径) } catch { }
+		# 注意不能带 -n（stdin 归 /dev/null）：帧通道就在 stdin 上；BatchMode 必带——否则免密失败时 ssh 会从帧通道里抢读密码
+		$参数串 = '-p ' + $端口 + ' -o BatchMode=yes -o ConnectTimeout=10'
+		foreach ($项 in $script:SSH密码选项) {
+			$参数串 = $参数串 + ' "' + $项 + '"'
 		}
-
-		# 验证非交互 ssh 会话确实能吃到 .bashrc 注入的变量（bash 对 SSH_CLIENT 会话会读 ~/.bashrc）
-		# 注意命令用单引号构造，防止 $VSCODE_SERVER_* 被本地 PowerShell 展开；匹配 sysroot 目录前缀即可（lib64/usr/lib64 布局均可）
-		$验证结果 = 执行-SSH命令并捕获 -连接目标 $连接目标 -端口 $端口 -命令文本 'echo "LINKER=$VSCODE_SERVER_CUSTOM_GLIBC_LINKER"'
-		$验证命中 = $false
-		foreach ($行 in $验证结果.输出) {
-			if (([string]$行) -match ('^LINKER=' + [regex]::Escape($sysroot目录) + '[\\/]')) { $验证命中 = $true }
-		}
-		if ($验证命中) {
-			Write-Host '已验证非交互 SSH 会话可见 VSCODE_SERVER_CUSTOM_GLIBC_LINKER。'
+		$参数串 = $参数串 + ' ' + $连接目标 + ' "' + $启动命令 + '"'
+		$psi = New-Object System.Diagnostics.ProcessStartInfo
+		# .cmd/.bat 包装的 ssh（某些环境用批处理包装）不能被 CreateProcess 直接启动，包一层 cmd /c
+		if ($ssh命令.Source -match '\.(cmd|bat)$') {
+			$psi.FileName = 'cmd.exe'
+			$psi.Arguments = '/c ""' + $ssh命令.Source + '" ' + $参数串 + '"'
 		} else {
-			Write-Host '警告: 非交互 SSH 会话未读到 sysroot 环境变量（远程 shell 可能不是 bash 或 .bashrc 未被加载），Remote-SSH 若仍报 glibc 错误请手动检查 ~/.bashrc。'
+			$psi.FileName = $ssh命令.Source
+			$psi.Arguments = $参数串
 		}
+		$psi.UseShellExecute = $false
+		$psi.RedirectStandardInput = $true
+		$psi.RedirectStandardOutput = $true
+		$psi.RedirectStandardError = $true
+		$psi.CreateNoWindow = $true
+		$进程 = [System.Diagnostics.Process]::Start($psi)
+		$错误任务 = $进程.StandardError.ReadToEndAsync()
 
-		return $sysroot目录
+		return [pscustomobject]@{
+			进程 = $进程
+			标准输入 = $进程.StandardInput
+			标准输出 = $进程.StandardOutput
+			错误任务 = $错误任务
+		}
 	}
 
-	function 修补-远程原生组件 {
+	function 读取-会话探测 {
+		param($会话)
+
+		# 读到 PROBE_END 为止返回全部输出行；到 EOF 都没见标记返回 $null（非 POSIX 远端或免密失败），由调用方回退离散流程
+		$行 = New-Object System.Collections.Generic.List[string]
+		while ($true) {
+			$文本 = $会话.标准输出.ReadLine()
+			if ($null -eq $文本) { return $null }
+			$行.Add($文本)
+			if ($文本 -match 'PROBE_END') { return $行 }
+		}
+	}
+
+	function 发送-会话帧文件 {
+		param($会话, [string]$本地路径, [string]$远端名)
+		$字节 = [System.IO.File]::ReadAllBytes($本地路径)
+		$头 = [System.Text.Encoding]::UTF8.GetBytes("__FILE__`n" + $字节.Length + "`n" + [string]$远端名 + "`n")
+		$会话.标准输入.Write($头, 0, $头.Length)
+		$会话.标准输入.Write($字节, 0, $字节.Length)
+	}
+
+	function 发送-会话命令帧 {
+		param($会话, [string]$命令文本)
+		$字节 = [System.Text.Encoding]::UTF8.GetBytes("__CMD__`n" + $命令文本 + "`n")
+		$会话.标准输入.Write($字节, 0, $字节.Length)
+	}
+
+	function 发送-会话阶段 {
 		param(
-			[string]$连接目标,
-			[int]$端口,
-			[string]$远程登录目录
+			$会话,
+			$文件清单,
+			[string]$运行命令,
+			[scriptblock]$每行回调,
+			[string]$交接目录
 		)
 
-		# 旧 glibc 主机上有两类原生组件需要与 server 的 node 走同一套 sysroot 环境：
-		# vsce-sign（扩展签名校验工具，.NET 单文件）与 *.node（扩展/服务端原生模块，node 的RUNPATH不被 dlopen 子对象继承，librt/libutil 等落到系统老库报 GLIBC_PRIVATE 错）。补丁脚本自带备份、patch 后实际加载验证与失败还原，幂等（已 patch 且验证通过则跳过）。
-		$补丁脚本文本 = $script:脚本_原生组件补丁 -replace "`r`n", "`n"
-		$本地临时脚本路径 = Join-Path $env:TEMP ('native-patch-{0}.sh' -f ([guid]::NewGuid().ToString('N')))
-		$远程临时脚本路径 = $远程登录目录.TrimEnd('/', '\') + '/vscode-native-patch-temp.sh'
-		try {
-			[System.IO.File]::WriteAllText($本地临时脚本路径, $补丁脚本文本, [System.Text.UTF8Encoding]::new($false))
-			上传-文件到远程 -本地路径 $本地临时脚本路径 -连接目标 $连接目标 -端口 $端口 -远程路径 $远程临时脚本路径
+		# 阶段文件逐帧送出 + RUN 帧后台起编排；随后启动上传器线程（消费供给的 .job 交接文件）并流式读输出到 __ORCH_EXIT__。
+		# 写入次序严格互斥：阶段帧与 RUN 帧由本线程写完，上传器才启动（之后 stdin 只由它写），收尾停传后再送 __EXIT__。
+		foreach ($文件 in $文件清单) {
+			发送-会话帧文件 -会话 $会话 -本地路径 $文件.路径 -远端名 $文件.名
+		}
+		$运行帧 = [System.Text.Encoding]::UTF8.GetBytes("__RUN__`n" + $运行命令 + "`n")
+		$会话.标准输入.Write($运行帧, 0, $运行帧.Length)
+		$会话.标准输入.Flush()
 
-			$补丁结果 = 执行-SSH命令并捕获 -连接目标 $连接目标 -端口 $端口 -命令文本 ('sh "{0}"' -f $远程临时脚本路径)
-			foreach ($行 in $补丁结果.输出) { Write-Host ([string]$行) }
-			if ($补丁结果.退出码 -ne 0) {
-				Write-Host ('警告: 原生组件补丁未完全成功（退出码 {0}），扩展签名校验或原生模块加载可能仍会失败。' -f $补丁结果.退出码)
+		$上传器 = 启动-帧上传器 -会话 $会话 -扫描目录 $交接目录
+		$编排退出码 = $null
+		try {
+			while ($true) {
+				$文本行 = $会话.标准输出.ReadLine()
+				if ($null -eq $文本行) { break }
+				if ($文本行 -match '^__ORCH_EXIT__=(\d+)') {
+					$编排退出码 = [int]$Matches[1]
+					break
+				}
+				$净化 = 剥离-终端控制序列 $文本行
+				Write-Host $净化
+				if ($每行回调) { & $每行回调 $净化 }
 			}
 		} finally {
-			Remove-Item $本地临时脚本路径 -Force -ErrorAction SilentlyContinue
-			try { 执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('rm -f "{0}"' -f $远程临时脚本路径) } catch { }
+			停止-帧上传器 $上传器
+			try {
+				$退出帧 = [System.Text.Encoding]::UTF8.GetBytes("__EXIT__`n")
+				$会话.标准输入.Write($退出帧, 0, $退出帧.Length)
+				$会话.标准输入.Flush()
+			} catch { }
+		}
+		if ($null -eq $编排退出码) {
+			throw '单会话执行异常：未收到编排退出码（会话提前中断）。'
+		}
+		if ($编排退出码 -ne 0) {
+			throw ('接管编排执行失败，退出码: {0}' -f $编排退出码)
 		}
 	}
 
-	function 部署-VSCode服务保活 {
+	function 启动-帧上传器 {
+		param($会话, [string]$扫描目录)
+
+		# 上传器 = 独立 runspace 线程：消费 race-supply-*.job 交接文件（供给下载完成后写入）并按“文件帧→命令帧”序送出。
+		# 与主线程（读输出）双工占用同一会话：写 stdin 的只有本线程（阶段帧在它启动前已送完），无并发写入风险。
+		$运行空间 = [runspacefactory]::CreateRunspace()
+		$运行空间.Open()
+		$运行空间.SessionStateProxy.SetVariable('输入流', $会话.标准输入)
+		$运行空间.SessionStateProxy.SetVariable('扫描目录', $扫描目录)
+		$运行空间.SessionStateProxy.SetVariable('停止标志', $false)
+		$ps = [powershell]::Create()
+		$ps.Runspace = $运行空间
+		[void]$ps.AddScript({
+			while ($true) {
+				if ((Get-Variable -Name 停止标志 -ValueOnly)) { break }
+				Get-ChildItem -LiteralPath $扫描目录 -Filter 'race-supply-*.job' -ErrorAction SilentlyContinue | ForEach-Object {
+					try {
+						$交接 = Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+						$字节 = [System.IO.File]::ReadAllBytes([string]$交接.数据文件)
+						$头 = [System.Text.Encoding]::UTF8.GetBytes("__FILE__`n" + $字节.Length + "`n" + [string]$交接.远端名 + "`n")
+						$输入流.Write($头, 0, $头.Length)
+						$输入流.Write($字节, 0, $字节.Length)
+						$尾 = [System.Text.Encoding]::UTF8.GetBytes("__CMD__`n" + [string]$交接.完成命令 + "`n")
+						$输入流.Write($尾, 0, $尾.Length)
+						$输入流.Flush()
+						Remove-Item -LiteralPath $_.FullName -Force
+						Remove-Item -LiteralPath ([string]$交接.数据文件) -Force -ErrorAction SilentlyContinue
+					} catch { }
+				}
+				Start-Sleep -Milliseconds 500
+			}
+		})
+		$句柄 = $ps.BeginInvoke()
+		return @{ 运行空间 = $运行空间; PS = $ps; 句柄 = $句柄 }
+	}
+
+	function 停止-帧上传器 {
+		param($上传器)
+		if ($null -eq $上传器) { return }
+		try { $上传器.运行空间.SessionStateProxy.SetVariable('停止标志', $true) } catch { }
+		try { $null = $上传器.PS.EndInvoke($上传器.句柄) } catch { }
+		try { $上传器.PS.Dispose() } catch { }
+		try { $上传器.运行空间.Dispose() } catch { }
+	}
+
+	function 关闭-接管会话 {
+		param($会话)
+		# 不 Dispose 进程对象：调用方还靠 HasExited 判断会话是否可用（Dispose 后查询会抛异常）
+		try { $会话.标准输入.Close() } catch { }
+		try { if (-not $会话.进程.HasExited) { $会话.进程.Kill() } } catch { }
+	}
+
+	function 执行-接管编排 {
 		param(
 			[string]$连接目标,
 			[int]$端口,
 			[string]$远程登录目录,
 			[string]$提交号,
 			[string]$发布通道,
-			[ValidateSet('部署', '移除')]
-			[string]$动作
+			[string]$安装脚本文本,
+			[bool]$需要sysroot阶段,
+			[bool]$需要保活阶段,
+			[ValidateSet('部署', '移除')][string]$保活动作,
+			$竞速上下文,
+			[scriptblock]$每行回调,
+			# 单会话通道（非交互场景）：阶段文件从其 stdin 逐帧送入、就地执行；为 $null 或已退出时回退离散上传+执行
+			$会话
 		)
 
-		# 把 Remote-SSH exec server 的启动入口 CLI（<数据根目录>/code[-insiders]-<提交号>）替换为包装脚本：真正启动的command-shell以「双 fork + setsid」拉起（PPID 归 1、自建会话），与 sshd-session 的祖先链彻底断开而存活；主机周期性收割超龄会话时 Server 不死，本地 VS Code 重连即可热附着（复用 pid.txt 与 connectionToken）而非冷启动。真实二进制备份必须放数据目录之外：官方引导脚本每次连接都会按文件名对数据目录做 GC（只保留最新 5 个匹配项）。
+		# 一次批量上传 + 一次远程会话跑完全部阶段（sysroot → 安装 → 原生补丁 → 保活 → 清理）：慢速主机上每条 SSH 往返可达数十秒，逐阶段上传+执行的连接开销远超干活本身。未见「编排完成」标记（异常退出）时才在 finally 兜底清理远端暂存文件（失败无害）。
 		$根目录 = $远程登录目录.TrimEnd('/', '\')
-		$数据目录名 = if ($发布通道 -eq 'insider') { '.vscode-server-insiders' } else { '.vscode-server' }
-		$CLI基础名 = if ($发布通道 -eq 'insider') { 'code-insiders' } else { 'code' }
+		$暂存目录 = if ($null -ne $竞速上下文) { $竞速上下文.暂存目录 } else { '' }
+		$兼容性目录 = $根目录 + '/vscode-sysroot'
+		$本地目录 = Join-Path $env:TEMP ('接管编排-{0}' -f ([guid]::NewGuid().ToString('N')))
+		[void](New-Item -ItemType Directory -Path $本地目录 -Force)
 
-		$脚本文本 = $script:脚本_服务保活部署
-		$脚本文本 = $脚本文本.Replace('__动作__', $动作)
-		$脚本文本 = $脚本文本.Replace('__数据目录__', ($根目录 + '/' + $数据目录名))
-		$脚本文本 = $脚本文本.Replace('__服务保活目录__', ($根目录 + '/.vscode-persistent'))
-		$脚本文本 = $脚本文本.Replace('__CLI文件名__', ($CLI基础名 + '-' + $提交号))
-		$脚本文本 = $脚本文本.Replace('__当前提交号__', $提交号)
-		$脚本文本 = $脚本文本.Replace('__发布通道__', $发布通道)
+		$上传清单 = New-Object System.Collections.Generic.List[string]
+		$落盘 = {
+			param($名字, $内容)
+			$路径 = Join-Path $本地目录 $名字
+			# Linux sh 脚本要求 LF 行尾且不得带 BOM，否则 shebang 与语法会出错
+			[System.IO.File]::WriteAllText($路径, ($内容 -replace "`r`n", "`n"), [System.Text.UTF8Encoding]::new($false))
+			[void]$上传清单.Add($路径)
+		}
 
-		# 包装脚本模板是独立文件，与部署脚本一同上传到远程，部署脚本按占位符给出的路径读取它生成包装脚本
-		$本地临时脚本路径 = Join-Path $env:TEMP ('临时VSCode服务保活-{0}.sh' -f ([guid]::NewGuid().ToString('N')))
-		$本地包装模板路径 = Join-Path $env:TEMP ('临时VSCode服务保活包装-{0}.sh' -f ([guid]::NewGuid().ToString('N')))
-		$远程临时脚本路径 = $根目录 + '/vscode-server-persist-temp.sh'
-		$远程包装模板路径 = $根目录 + '/vscode-server-persist-wrapper-temp.sh'
-		$脚本文本 = $脚本文本.Replace('__包装脚本路径__', $远程包装模板路径)
+		$编排状态 = @{ 已完成 = $false }
+		$包装回调 = {
+			param($行)
+			if ($null -ne $每行回调) { & $每行回调 $行 }
+			if ($行 -match '接管安装-编排\] 编排完成') { $编排状态.已完成 = $true }
+		}.GetNewClosure()
+
 		try {
-			# Linux sh 脚本要求 LF 行尾，且不得带 BOM，否则 shebang 与语法会出错
-			[System.IO.File]::WriteAllText($本地临时脚本路径, ($脚本文本 -replace "`r`n", "`n"), [System.Text.UTF8Encoding]::new($false))
-			[System.IO.File]::WriteAllText($本地包装模板路径, ($script:脚本_服务保活包装 -replace "`r`n", "`n"), [System.Text.UTF8Encoding]::new($false))
-			上传-文件到远程 -本地路径 $本地临时脚本路径 -连接目标 $连接目标 -端口 $端口 -远程路径 $远程临时脚本路径
-			上传-文件到远程 -本地路径 $本地包装模板路径 -连接目标 $连接目标 -端口 $端口 -远程路径 $远程包装模板路径
+			& $落盘 'vsi-stage-orch.sh' (生成-接管编排脚本 -需要sysroot阶段 $需要sysroot阶段 -需要安装阶段 ($null -ne $安装脚本文本) -需要保活阶段 $需要保活阶段 -暂存目录 $暂存目录 -兼容性目录 $兼容性目录)
+			if ($null -ne $安装脚本文本) {
+				& $落盘 'vsi-stage-install.sh' $安装脚本文本
+			}
+			if ($需要sysroot阶段) {
+				& $落盘 'vsi-stage-native.sh' $script:脚本_原生组件补丁
+				& $落盘 'vsi-stage-sysroot.sh' ($script:脚本_sysroot部署.Replace('__目录__', $兼容性目录))
+				# sysroot 工具包（glibc/libstdc++/libgcc 的 rpm 与 patchelf 压缩包）带 bundle- 前缀随批上传，编排脚本按原名归位到 .stage 供部署脚本解包
+				$缓存目录 = 下载-兼容性工具包
+				foreach ($素材文件 in (Get-ChildItem $缓存目录 -File)) {
+					$路径 = Join-Path $本地目录 ('vsi-stage-bundle-' + $素材文件.Name)
+					Copy-Item -LiteralPath $素材文件.FullName -Destination $路径 -Force
+					[void]$上传清单.Add($路径)
+				}
+			}
+			if ($需要保活阶段) {
+				& $落盘 'vsi-stage-keepalive.sh' (构造-保活部署文本 -远程登录目录 $远程登录目录 -提交号 $提交号 -发布通道 $发布通道 -动作 $保活动作 -包装模板远程路径 ($根目录 + '/vsi-stage-wrapper.sh'))
+				& $落盘 'vsi-stage-wrapper.sh' $script:脚本_服务保活包装
+			}
 
-			$结果 = 执行-SSH命令并捕获 -连接目标 $连接目标 -端口 $端口 -命令文本 ('sh "{0}"' -f $远程临时脚本路径)
-			foreach ($行 in $结果.输出) { Write-Host $行 }
-			if ($结果.退出码 -ne 0) {
-				throw ('服务保活{0}脚本失败，退出码 {1}' -f $动作, $结果.退出码)
+			if ($null -ne $会话 -and -not $会话.进程.HasExited) {
+				# 单会话路径：阶段帧 + RUN 帧 + 供给交接帧 全走这一条连接，省掉独立上传/改名的每条连接开销
+				$帧清单 = @()
+				foreach ($路径 in $上传清单) {
+					$帧清单 += @{ 路径 = $路径; 名 = [System.IO.Path]::GetFileName($路径) }
+				}
+				发送-会话阶段 -会话 $会话 -文件清单 $帧清单 -运行命令 'sh vsi-stage-orch.sh' -每行回调 $包装回调 -交接目录 $env:TEMP
+			} else {
+				上传-一批文件到远程 -本地路径 $上传清单.ToArray() -连接目标 $连接目标 -端口 $端口 -远程目录 $根目录
+				执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 'sh vsi-stage-orch.sh' -TTY -每行回调 $包装回调
 			}
 		} finally {
-			Remove-Item $本地临时脚本路径 -Force -ErrorAction SilentlyContinue
-			Remove-Item $本地包装模板路径 -Force -ErrorAction SilentlyContinue
-			try { 执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('rm -f "{0}" "{1}"' -f $远程临时脚本路径, $远程包装模板路径) } catch { }
+			Remove-Item -LiteralPath $本地目录 -Recurse -Force -ErrorAction SilentlyContinue
+			if ($null -ne $会话) {
+				关闭-接管会话 $会话
+			}
+			if (-not $编排状态.已完成) {
+				# 异常退出兜底：清掉远端暂存的阶段文件与竞速暂存目录（失败无害；正常路径已由编排脚本收尾）
+				$清理命令 = if ($暂存目录 -ne '') { ('rm -f vsi-stage-*; rm -rf ''{0}'' 2>/dev/null' -f $暂存目录) } else { 'rm -f vsi-stage-*' }
+				try { 执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 $清理命令 } catch { }
+			}
 		}
 	}
 
@@ -1265,41 +1627,6 @@ echo PROBE_END
 		}
 	}
 
-	function 执行-Linux远程安装脚本 {
-		param(
-			[string]$连接目标,
-			[int]$端口,
-			[string]$脚本文本,
-			[string]$远程登录目录,
-			[scriptblock]$每行回调
-		)
-
-		$本地临时脚本路径 = Join-Path $env:TEMP ('临时安装-VSCode远程服务-{0}.sh' -f ([guid]::NewGuid().ToString('N')))
-		$远程临时脚本文件名 = 'vscode-server-install-temp.sh'
-		# 已知远程登录目录时上传目标用绝对路径，报错可直接显示完整目标路径；否则退回登录目录下的相对路径
-		$远程路径前缀 = if ([string]::IsNullOrWhiteSpace($远程登录目录)) { './' } else { $远程登录目录.TrimEnd('\', '/') + '/' }
-		$远程临时脚本路径 = $远程路径前缀 + $远程临时脚本文件名
-
-		try {
-			# Linux sh 脚本要求 LF 行尾，且不得带 BOM，否则 shebang 与语法会出错
-			$脚本文本 = $脚本文本 -replace "`r`n", "`n"
-			[System.IO.File]::WriteAllText($本地临时脚本路径, $脚本文本, [System.Text.UTF8Encoding]::new($false))
-			上传-文件到远程 -本地路径 $本地临时脚本路径 -连接目标 $连接目标 -端口 $端口 -远程路径 $远程临时脚本路径
-			执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('sh ~/{0}' -f $远程临时脚本文件名) -TTY -每行回调 $每行回调
-		} finally {
-			# 清理临时文件（无害操作，失败不影响主流程）
-			if (Test-Path $本地临时脚本路径) {
-				Remove-Item $本地临时脚本路径 -Force -ErrorAction SilentlyContinue
-			}
-
-			try {
-				执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('rm -f ~/{0}' -f $远程临时脚本文件名)
-			} catch {
-				# 远程清理失败不影响主流程，临时文件会被系统定期清理
-			}
-		}
-	}
-
 	# ===== 主流程 =====
 
 	$ErrorActionPreference = 'Stop'
@@ -1322,7 +1649,27 @@ echo PROBE_END
 	$远程附加压缩包文件名 = $null
 
 	# 认证与环境试探合并：免密主机一次连接拿到全部环境信息；需密码主机在密码注入后的第一次连接拿到
-	$环境 = 初始化-SSH会话 -连接目标 $连接目标 -端口 $SSH端口
+	# 竞速暂存的预清理+预建随环境探测同一条连接完成（残包/取消标记清掉、目录建好）：必须早于本地供给启动（防残包被误当完整包），又不值得独占一条连接。sh -c 包装让命令只在 POSIX 端生效（cmd/PowerShell 下是无害噪声），~ 即登录目录，单引号避开 PS 5.1 传参剥双引号的坑
+	$竞速数据目录名 = if ($本地信息.发布通道 -eq 'insider') { '.vscode-server-insiders' } else { '.vscode-server' }
+	$竞速预备命令 = "sh -c 'rm -rf ~/{0}/race-{1}; mkdir -p ~/{0}/race-{1}'" -f $竞速数据目录名, $本地信息.提交号
+	# 非交互（preconnect）优先走单会话：探测/上传/执行一条连接全包（实测慢速主机每条独立连接 25s 会话开销）；会话建不起来或探测取不到结果时自然回退离散流程（交互式手动调用恒走离散，保留密码收集能力）
+	$接管会话 = $null
+	if ($非交互) {
+		# 平台提示（来自 Remote-SSH 的 remotePlatform 设置）：Windows 远端没有 sh/base64，单会话引导必失败——
+		# 提前跳过那次徒劳尝试（实测白耗一轮连接时间），直接走离散流程
+		$平台提示 = ''
+		try {
+			$平台提示 = [string]$配置.平台提示映射.$远程主机
+		} catch { }
+		if ($平台提示 -notmatch '^(?i)windows') {
+			try {
+				$接管会话 = 建立-接管会话 -连接目标 $连接目标 -端口 $SSH端口 -预备命令 $竞速预备命令
+			} catch {
+				$接管会话 = $null
+			}
+		}
+	}
+	$环境 = 初始化-SSH会话 -连接目标 $连接目标 -端口 $SSH端口 -非交互:$非交互 -附加命令 $竞速预备命令 -会话 $接管会话
 
 	Write-Host ('本机自动检测到的 VS Code 命令: {0}' -f $本地信息.命令路径)
 	Write-Host ('本机自动检测到的发布通道: {0}' -f $本地信息.发布通道)
@@ -1349,7 +1696,9 @@ echo PROBE_END
 		$保活动作 = if ($移除服务保活) { '移除' } else { '部署' }
 		Write-Host ('执行服务保活{0}...' -f $保活动作)
 		try {
-			部署-VSCode服务保活 -连接目标 $连接目标 -端口 $SSH端口 -远程登录目录 $环境.登录目录 -提交号 $本地信息.提交号 -发布通道 $本地信息.发布通道 -动作 $保活动作
+			执行-接管编排 -连接目标 $连接目标 -端口 $SSH端口 -远程登录目录 $环境.登录目录 `
+				-提交号 $本地信息.提交号 -发布通道 $本地信息.发布通道 `
+				-安装脚本文本 $null -需要sysroot阶段 $false -需要保活阶段 $true -保活动作 $保活动作 -竞速上下文 $null -每行回调 $null -会话 $接管会话
 		} finally {
 			清除-SSH密码复用
 		}
@@ -1359,7 +1708,9 @@ echo PROBE_END
 	if ($环境.系统类型 -eq 'Linux') {
 		# 旧 glibc 兼容（官方 sysroot 妥协方案）：VS Code 1.99+ 的 server 要求 glibc >= 2.28，老系统（如 CentOS 7 glibc 2.17）需在家目录部署 sysroot 并注入 VSCODE_SERVER_CUSTOM_GLIBC_* 环境变量
 		$兼容性sysroot目录 = ''
-		$glibc版本 = 探测-远程glibc版本 -连接目标 $连接目标 -端口 $SSH端口
+		# 合并环境探测已带回 glibc/内核则直接用（各免一轮 SSH 往返），缺失才退回单独探测
+		$glibc版本 = $环境.Glibc版本
+		if ($null -eq $glibc版本) { $glibc版本 = 探测-远程glibc版本 -连接目标 $连接目标 -端口 $SSH端口 }
 		if ($null -ne $glibc版本) {
 			Write-Host ('远程 glibc 版本: {0}' -f $glibc版本)
 		}
@@ -1368,7 +1719,8 @@ echo PROBE_END
 				Write-Host '警告: 远程 glibc 过旧且登录目录未知，无法自动部署 sysroot；Remote-SSH 连接将因先决条件失败。'
 			} else {
 				# sysroot 妥协方案的硬性前提：glibc 2.28 的 loader 要求内核 ≥ 3.2，旧内核（如 CentOS 6 的 2.6.32）上 loader 启动即报 FATAL: kernel too old 拒绝加载任何程序，补丁与安装均无意义，先探明内核再决定是否继续
-				$内核版本 = 探测-远程内核版本 -连接目标 $连接目标 -端口 $SSH端口
+				$内核版本 = $环境.内核版本
+				if ($null -eq $内核版本) { $内核版本 = 探测-远程内核版本 -连接目标 $连接目标 -端口 $SSH端口 }
 				if ($null -ne $内核版本) {
 					Write-Host ('远程内核版本: {0}' -f $内核版本)
 				}
@@ -1377,7 +1729,8 @@ echo PROBE_END
 					throw ('远程内核 {0} 过旧：glibc 2.28 运行时要求内核不低于 3.2，旧内核上 loader 启动即报 FATAL: kernel too old 拒绝运行，sysroot 妥协方案无解（实测 /bin/ls 都无法加载）。请升级主机内核/系统，或对该主机改用支持旧内核的旧版 VS Code。' -f $内核版本)
 				}
 				Write-Host ('远程 glibc {0} < 2.28，不满足 VS Code Server 先决条件，自动部署官方 sysroot 妥协方案...' -f $glibc版本)
-				$兼容性sysroot目录 = 部署-远程兼容性环境 -连接目标 $连接目标 -端口 $SSH端口 -远程登录目录 $环境.登录目录
+				# 部署动作本身已并入接管编排的 sysroot 阶段；这里只定目录。旧 glibc 主机同时启用原生组件补丁阶段
+				$兼容性sysroot目录 = ($环境.登录目录.TrimEnd('/', '\')) + '/vscode-sysroot'
 			}
 		}
 
@@ -1387,8 +1740,7 @@ echo PROBE_END
 		$每行回调 = $null
 		if ($null -ne $竞速上下文) {
 			Write-Host ('已启用竞速模式：本地子进程下载+上传 与 远程自下载并行，暂存目录 {0}' -f $竞速上下文.暂存目录)
-			# 预清理暂存目录，防陈旧标记/残包造成误判
-			清理-竞速暂存目录 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型
+			# 暂存目录的预清理/预建已在环境探测的同一条连接完成（见上方 竞速预备命令），这里不再单独连一次
 			$本地供给 = 启动-本地竞速供给 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型
 			# 事件驱动即时取消：监听远程 stdout，一旦输出"竞速获胜"即竞速结束，立刻击杀本地供给进程树（零轮询）
 			# GetNewClosure 把回调绑进独立动态模块，模块里看不到本函数的嵌套函数，须先把函数体取成脚本块变量随闭包带走
@@ -1404,22 +1756,15 @@ echo PROBE_END
 		$远程安装脚本 = $远程安装脚本.Replace('__暂存目录__', $(if ($null -ne $竞速上下文) { $竞速上下文.暂存目录 } else { '' }))
 		$远程安装脚本 = $远程安装脚本.Replace('__兼容性目录__', $兼容性sysroot目录)
 
+		# 全阶段合并执行：sysroot → 安装 → 原生补丁 →（可选）保活检修 → 清理 全部在单次上传后的单次远程会话里完成
 		try {
-			执行-Linux远程安装脚本 -连接目标 $连接目标 -端口 $SSH端口 -脚本文本 $远程安装脚本 -远程登录目录 $环境.登录目录 -每行回调 $每行回调
+			执行-接管编排 -连接目标 $连接目标 -端口 $SSH端口 -远程登录目录 $环境.登录目录 `
+				-提交号 $本地信息.提交号 -发布通道 $本地信息.发布通道 `
+				-安装脚本文本 $远程安装脚本 -需要sysroot阶段 (-not [string]::IsNullOrWhiteSpace($兼容性sysroot目录)) `
+				-需要保活阶段 $含服务保活 -保活动作 '部署' -竞速上下文 $竞速上下文 -每行回调 $每行回调 -会话 $接管会话
 		} finally {
-			# 收尾：击杀本地供给进程树并回收其日志，再双保险清理暂存目录（失败无害）
+			# 收尾：击杀本地供给进程树并回收其日志（远端暂存清理已由编排脚本完成，仅异常路径由其 finally 兜底）
 			等待-供给进程并回收日志 -供给 $本地供给
-			if ($null -ne $竞速上下文) {
-				清理-竞速暂存目录 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型
-			}
-			# 旧 glibc 主机：vsce-sign 与 *.node 原生模块同样需要 sysroot 环境，收尾时统一补丁（失败仅告警不影响安装结果）
-			if (-not [string]::IsNullOrWhiteSpace($兼容性sysroot目录)) {
-				try {
-					修补-远程原生组件 -连接目标 $连接目标 -端口 $SSH端口 -远程登录目录 $环境.登录目录
-				} catch {
-					Write-Host ('警告: 原生组件补丁步骤失败: {0}' -f $_.Exception.Message)
-				}
-			}
 		}
 		清除-SSH密码复用
 		return
@@ -1525,6 +1870,10 @@ function 安装-VSCode服务保活 {
 		[ValidateSet('预览版', '稳定版')]
 		[string]$本地版本,
 
+		# 非交互环境（如 Remote-SSH preconnect）：需要密码时直接报错，不收集密码
+		[Parameter(DontShow)]
+		[switch]$非交互,
+
 		[switch]$移除
 	)
 
@@ -1535,6 +1884,7 @@ function 安装-VSCode服务保活 {
 		仅服务保活   = $true
 		移除服务保活 = $移除.IsPresent
 	}
+	if ($非交互.IsPresent) { $转发参数['非交互'] = $true }
 	if (-not [string]::IsNullOrWhiteSpace($远程账户)) { $转发参数['远程账户'] = $远程账户 }
 	if (-not [string]::IsNullOrWhiteSpace($本地版本)) { $转发参数['本地版本'] = $本地版本 }
 

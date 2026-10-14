@@ -5,6 +5,7 @@
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 # 关闭内置进度条：Invoke-WebRequest 的进度条靠移动光标反复重绘，在 SSH 会话里会把已输出的中文行重绘错乱（每个汉字重影、行首留大段空格），本脚本的关键进度均有自打印文本，不需要进度条
+$ProgressPreference = 'SilentlyContinue'
 
 function 取-系统架构标识 {
 	$原始架构 = if ($env:PROCESSOR_ARCHITEW6432) {
@@ -215,7 +216,7 @@ function 竞速-单个产物 {
 			$本地字节 = 0
 			if (Test-Path -LiteralPath $本地包路径) { $本地字节 = (Get-Item -LiteralPath $本地包路径).Length }
 			elseif (Test-Path -LiteralPath ($本地包路径 + '.uploading')) { $本地字节 = (Get-Item -LiteralPath ($本地包路径 + '.uploading')).Length }
-			Write-Host ('[{0}] {1} 竞速等待 {2}s：远程侧已下 {3} 字节，本地侧已到 {4} 字节。' -f (Get-Date -Format 'HH:mm:ss'), $产物名, $等待秒数, $远程字节, $本地字节)
+			Write-Host ('[{0}] {1} 竞速等待 {2}s：远程侧已下载 {3} 字节；本地侧已上传到远端 {4} 字节（本地供给先在本机下载、完成后才上传，下载阶段恒为 0）。' -f (Get-Date -Format 'HH:mm:ss'), $产物名, $等待秒数, $远程字节, $本地字节)
 		}
 	}
 
@@ -356,6 +357,28 @@ function 通过HTTP断点续传下载 {
 				throw ('下载提前结束: 文件 {0} 字节，预期至少 {1} 字节。' -f (Get-Item $目标路径).Length, $内容总长度)
 			}
 
+			# zip 完整性抽检：EOCD 结束记录（PK\x05\x06）必在尾部 64KB 内，缺失即截断包。chunked 响应无 Content-Length 时上面的长度核对被跳过，此为唯一防线。
+			# 本函数会以文本形式注入后台作业执行（独立进程），校验逻辑必须内联、不得调用脚本内其他函数
+			if ([System.IO.Path]::GetExtension($目标路径) -ieq '.zip') {
+				$校验信息 = Get-Item -LiteralPath $目标路径
+				$校验尾窗大小 = [int][Math]::Min(65557, $校验信息.Length)
+				$校验流 = [System.IO.File]::OpenRead($校验信息.FullName)
+				$含EOCD = $false
+				try {
+					[void]$校验流.Seek($校验信息.Length - $校验尾窗大小, 'Begin')
+					$校验尾窗 = New-Object byte[] $校验尾窗大小
+					[void]$校验流.Read($校验尾窗, 0, $校验尾窗大小)
+					for ($i = 0; $i -le $校验尾窗.Length - 4; $i++) {
+						if ($校验尾窗[$i] -eq 0x50 -and $校验尾窗[$i + 1] -eq 0x4B -and $校验尾窗[$i + 2] -eq 0x05 -and $校验尾窗[$i + 3] -eq 0x06) { $含EOCD = $true; break }
+					}
+				} finally {
+					$校验流.Dispose()
+				}
+				if (-not $含EOCD) {
+					throw ('压缩包完整性校验未通过（疑似截断，缺 EOCD）: {0}' -f $目标路径)
+				}
+			}
+
 			Write-Host ('[{0}] 下载完成。' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
 			return
 		} catch {
@@ -376,6 +399,37 @@ function 通过HTTP断点续传下载 {
 
 		# 保留已下载的部分文件，等待递增秒数后自动续传重试（1秒、2秒、3秒……）
 		Start-Sleep -Seconds $重试次数
+	}
+}
+
+function 测试-压缩包完整 {
+	param(
+		[string]$路径
+	)
+
+	# 完整性快检：zip 查头部 PK 魔数与尾部 EOCD 结束记录（PK\x05\x06，必在尾 64KB 内，截断包必缺）。Expand-Archive 对坏包只会报晦涩的 "End of Central Directory record could not be found"，前置校验可给出清晰结论并触发自愈
+	if ([string]::IsNullOrWhiteSpace($路径) -or -not (Test-Path -LiteralPath $路径)) { return $false }
+	try {
+		$信息 = Get-Item -LiteralPath $路径
+		if ($信息.Length -lt 22) { return $false }
+		$流 = [System.IO.File]::OpenRead($路径)
+		try {
+			$头 = New-Object byte[] 4
+			if ($流.Read($头, 0, 4) -ne 4) { return $false }
+			if ($头[0] -ne 0x50 -or $头[1] -ne 0x4B) { return $false }
+			$尾窗大小 = [int][Math]::Min(65557, $信息.Length)
+			[void]$流.Seek($信息.Length - $尾窗大小, 'Begin')
+			$尾窗 = New-Object byte[] $尾窗大小
+			[void]$流.Read($尾窗, 0, $尾窗大小)
+			for ($i = 0; $i -le $尾窗.Length - 4; $i++) {
+				if ($尾窗[$i] -eq 0x50 -and $尾窗[$i + 1] -eq 0x4B -and $尾窗[$i + 2] -eq 0x05 -and $尾窗[$i + 3] -eq 0x06) { return $true }
+			}
+			return $false
+		} finally {
+			$流.Dispose()
+		}
+	} catch {
+		return $false
 	}
 }
 
@@ -454,9 +508,13 @@ if ($启用竞速) {
 # ===== 安装 CLI（Remote-SSH 引导的启动入口，server 由它拉起，二者缺一不可，故先补 CLI）=====
 if ($CLI已就位) {
 	Write-Host ('[{0}] CLI 已存在，跳过安装: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $CLI信息.落地路径)
-} elseif ($null -ne $CLI获胜包路径) {
+} elseif (($null -ne $CLI获胜包路径) -and (测试-压缩包完整 $CLI获胜包路径)) {
 	安装-CLI压缩包 -压缩包路径 $CLI获胜包路径 -CLI信息 $CLI信息
 } else {
+	if ($null -ne $CLI获胜包路径) {
+		Write-Host ('警告: 竞速决出的 CLI 包不完整（疑似截断），弃用并改由远程下载: {0}' -f $CLI获胜包路径)
+		Remove-Item -LiteralPath $CLI获胜包路径 -Force -ErrorAction SilentlyContinue
+	}
 	安装-远程CLI -CLI信息 $CLI信息
 }
 
@@ -477,22 +535,41 @@ if (Test-Path $最终安装目录) {
 
 New-Item -ItemType Directory -Force $最终安装目录 | Out-Null
 
-if ($启用竞速) {
-	# 竞速决出的服务端压缩包（若服务端已就位则未竞速，上方的复用判定已提前收尾）
-	if (-not (Test-Path -LiteralPath $获胜包路径)) {
-		throw ('竞速决出的包不存在: {0}' -f $获胜包路径)
-	}
-} else {
+if (-not $启用竞速) {
 	Write-Host '开始通过 HTTP 断点续传下载压缩包。'
 	通过HTTP断点续传下载 -下载地址 $下载地址 -目标路径 $下载压缩包路径
+}
 
-	if (-not (Test-Path $下载压缩包路径)) {
-		throw ('下载完成后未找到压缩包: {0}' -f $下载压缩包路径)
+# 选取完整包：任何一侧的包都可能因网络截断损坏（坏包解压只会报晦涩的 End of Central Directory 错误），逐候选校验、坏包弃用换下一个，全不可用则回退前台重下自愈
+$候选包列表 = @($获胜包路径)
+if ($启用竞速) {
+	$候选包列表 += (Join-Path $暂存目录 'LOCAL.zip')
+	$候选包列表 += (Join-Path $暂存目录 'REMOTE.zip')
+}
+$候选包列表 += $下载压缩包路径
+$可用包路径 = ''
+foreach ($候选包 in ($候选包列表 | Select-Object -Unique)) {
+	if ([string]::IsNullOrWhiteSpace($候选包) -or -not (Test-Path -LiteralPath $候选包)) { continue }
+	if (测试-压缩包完整 $候选包) {
+		$可用包路径 = $候选包
+		break
+	}
+	Write-Host ('警告: 压缩包不完整（疑似截断），弃用: {0}' -f $候选包)
+	Remove-Item -LiteralPath $候选包 -Force -ErrorAction SilentlyContinue
+}
+if ($可用包路径 -eq '') {
+	Write-Host '所有候选压缩包均不可用，前台重新下载。'
+	Remove-Item -LiteralPath $下载压缩包路径 -Force -ErrorAction SilentlyContinue
+	通过HTTP断点续传下载 -下载地址 $下载地址 -目标路径 $下载压缩包路径
+	if (测试-压缩包完整 $下载压缩包路径) {
+		$可用包路径 = $下载压缩包路径
+	} else {
+		throw ('重新下载的压缩包仍不完整: {0}' -f $下载压缩包路径)
 	}
 }
 
 Write-Host '下载完成，开始解压。'
-展开-服务器压缩包 -压缩包路径 $获胜包路径 -目标目录 $最终安装目录
+展开-服务器压缩包 -压缩包路径 $可用包路径 -目标目录 $最终安装目录
 
 # 竞速暂存目录用完即清（本地模块收尾时也会再清一次，双保险）
 if (-not [string]::IsNullOrWhiteSpace($暂存目录)) {

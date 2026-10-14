@@ -135,8 +135,13 @@ run_remote_download() {
 		for URL in "$URL_PRIMARY" "$URL_FALLBACK"; do
 			log "开始下载: $URL"
 			if download_file "$URL" "$PKG_OUT" && [ -s "$PKG_OUT" ]; then
-				touch "$DONE_MARK"
-				return 0
+				# gzip 完整性校验：流式下载读到底不等于传完整，截断包解压只会报晦涩错误，坏包弃用换源重下
+				if gzip -t "$PKG_OUT" 2>/dev/null; then
+					touch "$DONE_MARK"
+					return 0
+				fi
+				log '压缩包完整性校验未通过（疑似截断），弃用重下。'
+				rm -f "$PKG_OUT"
 			fi
 		done
 		log '本次下载失败，清理残留文件。'
@@ -158,8 +163,12 @@ run_remote_cli_download() {
 		fi
 		log "开始下载远程 CLI: $CLI_URL"
 		if download_file "$CLI_URL" "$PKG_OUT" && [ -s "$PKG_OUT" ]; then
-			touch "$DONE_MARK"
-			return 0
+			if gzip -t "$PKG_OUT" 2>/dev/null; then
+				touch "$DONE_MARK"
+				return 0
+			fi
+			log 'CLI 压缩包完整性校验未通过（疑似截断），弃用重下。'
+			rm -f "$PKG_OUT"
 		fi
 		log '本次 CLI 下载失败，清理残留文件。'
 		rm -f "$PKG_OUT"
@@ -176,7 +185,7 @@ race_artifact() {
 	log "$1 竞速：远程自下载与本地下载+上传并行，先完成者用于安装。"
 	DL_PID=''
 	if [ -n "$7" ]; then
-		"$7" "$2" "$3" &
+		"$7" "$2" "$3" >/dev/null 2>&1 &
 		DL_PID=$!
 	else
 		log "$1：远程缺少 curl/wget，本端不参与下载，只等待本地供给。"
@@ -206,7 +215,7 @@ race_artifact() {
 			elif [ -f "$4.uploading" ]; then
 				LSIZE=$(wc -c < "$4.uploading" 2>/dev/null | tr -d ' ')
 			fi
-			log "$1 竞速等待 ${ELAPSED}s：远程侧已下 ${RSIZE} 字节，本地侧已到 ${LSIZE} 字节。"
+			log "$1 竞速等待 ${ELAPSED}s：远程侧已下载 ${RSIZE} 字节；本地侧已上传到远端 ${LSIZE} 字节（本地供给先在本机下载、完成后才上传，下载阶段恒为 0）。"
 		fi
 	done
 
@@ -353,8 +362,32 @@ else
 	run_remote_download "$REMOTE_PKG" "$REMOTE_DONE"
 	PACKAGE_PATH="$REMOTE_PKG"
 	rm -f "$REMOTE_DONE"
-	echo '下载完成，开始解压。'
 fi
+
+# ===== 包完整性校验与兑底：截断包解压只会报晦涩错误，gzip -t 一票否决，坏包换另一侧的包，全坏则前台重下自愈 =====
+if ! gzip -t "$PACKAGE_PATH" 2>/dev/null; then
+	log "压缩包完整性校验未通过（疑似截断），弃用: $PACKAGE_PATH"
+	rm -f "$PACKAGE_PATH"
+	PACKAGE_PATH=''
+	if [ -n "$STAGING" ]; then
+		for CAND in "$STAGING/LOCAL.tar.gz" "$STAGING/REMOTE.tar.gz"; do
+			if [ -f "$CAND" ] && gzip -t "$CAND" 2>/dev/null; then
+				PACKAGE_PATH="$CAND"
+				log "改用另一侧的压缩包: $CAND"
+				break
+			fi
+			rm -f "$CAND"
+		done
+	fi
+	if [ -z "$PACKAGE_PATH" ]; then
+		log '所有候选压缩包均不可用，前台重新下载。'
+		FG_PKG="$INSTALL_DIR/vscode-server-download-$$.tar.gz"
+		run_remote_download "$FG_PKG" "$INSTALL_DIR/vscode-server-download-$$.done"
+		PACKAGE_PATH="$FG_PKG"
+	fi
+fi
+
+echo '下载完成，开始解压。'
 
 # ===== 解压并铺平包装目录 =====
 tar -xzf "$PACKAGE_PATH" -C "$INSTALL_DIR"

@@ -40,9 +40,34 @@
 					"type": "boolean",
 					"default": false,
 					"scope": "application",
-					"description": "开启后，Remote-SSH 每次连接前由 Install-VSCodeRemoteServer 模块安装远程服务器（替换 Remote-SSH 自带的安装步骤）；关闭后还原为 Remote-SSH 自带安装。"
+					"description": "开启后，勾选的主机在 Remote-SSH 每次连接前由 Install-VSCodeRemoteServer 模块安装远程服务器（替换 Remote-SSH 自带的安装步骤）；未勾选的主机与关闭开关时一样保持自带安装。"
+				},
+				"安装VSCode远程服务.接管的主机": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"default": [],
+					"scope": "application",
+					"markdownDescription": "要接管远程服务器安装的主机清单（`~/.ssh/config` 里的主机别名）。推荐用命令「选择接管与保活的主机…」打开多选列表勾选（实时扫描 ssh config）；直接在此编辑等效，保存即生效。未列入的主机保持 Remote-SSH 自带安装。"
+				},
+				"安装VSCode远程服务.启用保活的主机": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"default": [],
+					"scope": "application",
+					"markdownDescription": "要启用服务保活的主机清单（`~/.ssh/config` 里的主机别名）：server 脱离 SSH 会话存活，集群回收超龄会话后本地重连热附着。勾选的主机在每次连接（preconnect）时**自动检修**保活包装（幂等部署/升级/自愈，VS Code 更新到新提交号后下一次连接即自动补上）。与「接管的主机」相互独立、可重叠。推荐用命令「选择接管与保活的主机…」勾选；直接在此编辑等效，保存即生效。"
 				}
 			}
-		}
+		},
+		"commands": [
+			{
+				"command": "安装VSCode远程服务.选择接管主机",
+				"title": "选择接管与保活的主机…",
+				"category": "RemoteSSH服务器安装"
+			}
+		]
 	}
 }

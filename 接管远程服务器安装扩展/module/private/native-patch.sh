@@ -3,7 +3,7 @@
 # 此文件通过主模块上传到远程主机执行。VS Code 有两类原生组件需要与 server 的 node 走同一套 sysroot 环境：
 #   1) vsce-sign：扩展签名校验工具（.NET 单文件），依赖较新 libstdc++，做 node 同款 patch（解释器 + RPATH）；
 #   2) *.node：扩展与服务端的 Node 原生模块。node 的 RUNPATH 不被 dlopen 的子对象继承，原生模块依赖的librt.so.1 / libutil.so.1等库（node 自身不预载）会落到系统老版本（2.17），与进程里已加载的 sysroot libc（2.28）混用后报 "undefined symbol ... version GLIBC_PRIVATE"，只需补 RPATH。
-# 脚本自带安全机制：原件备份（.orig.bak 仅保留首次）、在临时副本上 patch、patch 后实际加载验证，通过才原子替换，失败保留原文件并告警；对已补丁文件幂等跳过。
+# 脚本自带安全机制：原件备份（.orig.bak 仅保留首次）、在临时副本上 patch、patch 后实际加载验证，通过才原子替换，失败保留原文件并告警；对已补丁文件幂等跳过，对验证失败且未变化的文件记台账跳过重试（每次连接都会跑本工序，失败件徒劳重试既慢又刷屏）。
 set -eu
 
 LINKER=${VSCODE_SERVER_CUSTOM_GLIBC_LINKER:-}
@@ -27,9 +27,39 @@ if [ ! -x "$PATCHELF" ] || [ ! -f "$LINKER" ]; then
 	exit 1
 fi
 
+# ===== 失败台账：patch 验证失败的文件记「路径|大小|mtime」，文件未变就不再重试；文件被更新（大小或 mtime 变化）自动重新尝试，台账里已消失或已变化的条目随用随清 =====
+FAILBOOK="$HOME/.vscode-native-patch-failed"
+
+failbook_hit() {
+        grep -q -F "$1|$(wc -c < "$1" | tr -d ' ')|$(date -r "$1" +%s 2>/dev/null || echo 0)" "$FAILBOOK" 2>/dev/null || return 1
+}
+
+failbook_add() {
+        F="$1"
+        LINE="$F|$(wc -c < "$F" | tr -d ' ')|$(date -r "$F" +%s 2>/dev/null || echo 0)"
+        if [ -f "$FAILBOOK" ]; then
+                grep -v -F "$F|" "$FAILBOOK" > "$FAILBOOK.$$" || true
+                mv -f "$FAILBOOK.$$" "$FAILBOOK"
+        fi
+        echo "$LINE" >> "$FAILBOOK"
+}
+
+failbook_prune() {
+        [ -f "$FAILBOOK" ] || return 0
+        : > "$FAILBOOK.$$"
+        while IFS='|' read -r F S M; do
+                [ -n "$F" ] && [ -f "$F" ] || continue
+                [ "$(wc -c < "$F" | tr -d ' ')" = "$S" ] || continue
+                [ "$(date -r "$F" +%s 2>/dev/null || echo 0)" = "$M" ] || continue
+                echo "$F|$S|$M" >> "$FAILBOOK.$$"
+        done < "$FAILBOOK"
+        mv -f "$FAILBOOK.$$" "$FAILBOOK"
+}
+failbook_prune
+
 # ===== vsce-sign（可执行文件）：解释器 + RPATH 双补，验证 = .NET 托管程序实际执行 =====
 verify_vsce() {
-	COREHOST_TRACE=1 "$1" --help 2>&1 | grep -q 'Execute managed assembly'
+        COREHOST_TRACE=1 "$1" --help 2>&1 | grep -q 'Execute managed assembly'
 }
 
 patch_vsce() {
@@ -48,8 +78,7 @@ patch_vsce() {
 		return 0
 	fi
 	rm -f "$V.patching"
-	echo "[原生补丁] 警告: patch 后验证失败，保留原文件: $V" >&2
-	return 1
+	echo "[原生补丁] 警告: patch 后验证失败，保留原文件: $V" >&2; failbook_add "$V"; return 1
 }
 
 # ===== *.node（Node 原生模块）：只补 RPATH（解释器由加载它的 node 提供），验证 = node 实际 dlopen =====
@@ -133,12 +162,11 @@ patch_node() {
 		return 0
 	fi
 	rm -f "$V.patching"
-	echo "[原生补丁] 警告: patch 后验证失败，保留原文件: $V" >&2
-	return 1
+	echo "[原生补丁] 警告: patch 后验证失败，保留原文件: $V" >&2; failbook_add "$V"; return 1
 }
 
 LIST="$HOME/.vscode-native-patch-list.$$"
-trap 'rm -f "$LIST"' EXIT
+trap 'rm -f "$LIST" "$FAILBOOK.$$"' EXIT
 FALLBACK_NODE=$(find "$HOME"/.vscode-server* -name node -type f -perm -u+x 2>/dev/null | head -1 || true)
 
 # 预检：得到一个可直接运行的 node 用于 dlopen 验证（起不来的按官方两步补上）。补丁失败且连 loader 都跑不起来（如远程内核低于 glibc 2.28 要求的 3.2 时 loader 报 FATAL: kernel too old）则所有 dlopen 验证必然全军覆没，一条报错说清并整体退出，不逐文件刷"验证失败"误导排障
@@ -161,6 +189,7 @@ fi
 FOUND=0
 FAILED=0
 DEFERRED=0
+SKIPPED=0
 LAST_UNREADY_NODE=''
 for DIR in "$HOME"/.vscode-server*; do
 	[ -d "$DIR" ] || continue
@@ -168,6 +197,11 @@ for DIR in "$HOME"/.vscode-server*; do
 	while IFS= read -r V; do
 		[ -n "$V" ] || continue
 		FOUND=1
+		# 曾验证失败且文件未变：跳过重试（台账命中）；文件更新后台账自动放行
+		if failbook_hit "$V"; then
+			SKIPPED=$((SKIPPED + 1))
+			continue
+		fi
 		case "$V" in
 			*.node)
 				is_native_elf "$V" || continue
@@ -220,6 +254,9 @@ done
 
 if [ "$FOUND" -eq 0 ]; then
 	echo '[原生补丁] 未发现 vsce-sign 或原生模块（对应 server 尚未安装），跳过。'
+fi
+if [ "$SKIPPED" -gt 0 ]; then
+        echo "[原生补丁] $SKIPPED 个文件此前 patch 验证失败且未变化，本次跳过重试；文件更新后会自动重试。"
 fi
 # 延后处理不是失败：验证用 node 补丁未成功时宁可不动 .node，退出码只反映真正的补丁失败
 if [ "$DEFERRED" -eq 1 ] && [ "$FAILED" -eq 0 ]; then

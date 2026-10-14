@@ -38,6 +38,36 @@ try {
 		return ('powershell -NoProfile -EncodedCommand {0}' -f $编码)
 	}
 
+	function 测试-本地包完整([string]$路径) {
+		# 完整性快检：zip 查头部 PK 魔数与尾部 EOCD 结束记录（必在尾 64KB 内，截断包必缺）；tar.gz 查 gzip 头魔数。坏包在这里被拦下，绝不送上远端
+		try {
+			$信息 = Get-Item -LiteralPath $路径
+			if ($信息.Length -lt 22) { return $false }
+			$流 = [System.IO.File]::OpenRead($路径)
+			try {
+				$头 = New-Object byte[] 4
+				if ($流.Read($头, 0, 4) -ne 4) { return $false }
+				if ($远程包名 -like '*.zip') {
+					if ($头[0] -ne 0x50 -or $头[1] -ne 0x4B) { return $false }
+					$尾窗大小 = [int][Math]::Min(65557, $信息.Length)
+					[void]$流.Seek($信息.Length - $尾窗大小, 'Begin')
+					$尾窗 = New-Object byte[] $尾窗大小
+					[void]$流.Read($尾窗, 0, $尾窗大小)
+					for ($i = 0; $i -le $尾窗.Length - 4; $i++) {
+						if ($尾窗[$i] -eq 0x50 -and $尾窗[$i + 1] -eq 0x4B -and $尾窗[$i + 2] -eq 0x05 -and $尾窗[$i + 3] -eq 0x06) { return $true }
+					}
+					return $false
+				}
+				# tar.gz：gzip 头魔数 1f 8b（拦 HTML 错误页、全零文件等）
+				return ($头[0] -eq 0x1F -and $头[1] -eq 0x8B)
+			} finally {
+				$流.Dispose()
+			}
+		} catch {
+			return $false
+		}
+	}
+
 	function 取-取消标记命令 {
 		if ($系统类型 -eq 'Linux') {
 			return ('test -f {0}/{1}' -f $暂存目录, $取消标记名)
@@ -45,16 +75,16 @@ try {
 		return (转换-远程PowerShell命令 ('if (Test-Path -LiteralPath ''{0}\{1}'') {{ exit 0 }} else {{ exit 1 }}' -f $暂存目录, $取消标记名))
 	}
 
-	# 下载前的低成本取消检查（远程已获胜则不必下载）
-	if ((调用-远程命令 (取-取消标记命令)).退出码 -eq 0) { Write-Output '远程侧已获胜，本地供给取消（下载前）。'; return }
-
-	# 预建远程暂存目录：本地供给可能先于远程脚本跑到上传步骤，目录不存在会导致 scp 失败
-	$建目录命令 = if ($系统类型 -eq 'Linux') {
-		('mkdir -p {0}' -f $暂存目录)
-	} else {
-		(转换-远程PowerShell命令 ('New-Item -ItemType Directory -Force -Path ''{0}'' | Out-Null' -f $暂存目录))
+	# Linux：暂存目录的预清理/预建已由主流程在环境探测的同一条连接完成（残包与取消标记已清、目录已建，
+	# 且此时尚无竞速获胜的可能），本进程起步不再独占连接做检查——慢速主机上每次 SSH 往返可达数十秒。
+	# Windows：保持原样（探测附加命令是 sh -c 包装，在 cmd/powershell 下只是噪声不生效）。
+	if ($系统类型 -ne 'Linux') {
+		# 下载前的低成本取消检查（远程已获胜则不必下载）
+		if ((调用-远程命令 (取-取消标记命令)).退出码 -eq 0) { Write-Output '远程侧已获胜，本地供给取消（下载前）。'; return }
+		# 预建远程暂存目录：本地供给可能先于远程脚本跑到上传步骤，目录不存在会导致 scp 失败
+		$建目录命令 = 转换-远程PowerShell命令 ('New-Item -ItemType Directory -Force -Path ''{0}'' | Out-Null' -f $暂存目录)
+		$null = 调用-远程命令 $建目录命令
 	}
-	$null = 调用-远程命令 $建目录命令
 
 	# 分块 HTTP 断点续传下载（失败无限重试且等待秒数递增）。进程会在远程获胜时被整体击杀，故下载循环无需任何取消检查；
 	# 半成品保留在本地 TEMP 供下次运行续传，文件名带提交号：防旧版本残包被 416 误判为完整或被错误续传。
@@ -74,6 +104,8 @@ try {
 			if ($已存在字节数 -gt 0) { $请求.AddRange($已存在字节数) }
 			$响应 = $请求.GetResponse()
 			$状态码 = [int]$响应.StatusCode
+			# 期望总长：206 为已有部分+本段，其余为整段；ContentLength 未知（-1）时跳过长度核对，由完整性快检兑底
+			$期望长度 = if ($响应.ContentLength -ge 0) { $已存在字节数 + $响应.ContentLength } else { -1 }
 			if ($状态码 -eq 206) {
 				$文件流 = [System.IO.File]::Open($本地包路径, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write)
 			} else {
@@ -83,11 +115,29 @@ try {
 			$响应流 = $响应.GetResponseStream()
 			$缓冲区 = New-Object byte[] 65536
 			$已下载 = $已存在字节数
+			$上次进度输出 = [datetime]::MinValue
 			while (($读取数 = $响应流.Read($缓冲区, 0, $缓冲区.Length)) -gt 0) {
 				$文件流.Write($缓冲区, 0, $读取数)
 				$已下载 += $读取数
+				$此刻 = Get-Date
+				if (($此刻 - $上次进度输出).TotalSeconds -ge 30) {
+					$上次进度输出 = $此刻
+					Write-Output ('本地下载进度：{0} / {1} 字节。' -f $已下载, $(if ($期望长度 -gt 0) { $期望长度 } else { '未知' }))
+				}
 			}
 			$文件流.Flush()
+			# 先关流再校验：完整性快检要重新打开文件读，写句柄未关（FileShare.None）时 OpenRead 必失败，
+			# 会把完整包误判成"疑似截断"白触发一轮重试（实测每次完整下载都中招，靠 416 兜底才救回）
+			if ($null -ne $文件流) { $文件流.Dispose(); $文件流 = $null }
+			if ($null -ne $响应流) { $响应流.Dispose(); $响应流 = $null }
+			if ($null -ne $响应) { $响应.Close(); $响应 = $null }
+			# 长度核对：流式读到底只代表连接正常关闭，不代表传输完整（实测截断包曾被当完整包送解压报晦涩的 End of Central Directory 错误）
+			if ($期望长度 -gt 0 -and (Get-Item -LiteralPath $本地包路径).Length -lt $期望长度) {
+				throw ('下载提前结束：本地 {0} 字节，预期 {1} 字节。' -f (Get-Item -LiteralPath $本地包路径).Length, $期望长度)
+			}
+			if (-not (测试-本地包完整 $本地包路径)) {
+				throw '本地包完整性校验未通过（疑似截断）。'
+			}
 			Write-Output ('本地下载完成：共 {0} 字节。' -f $已下载)
 			break
 		} catch {
@@ -100,8 +150,13 @@ try {
 				$异常 = $异常.InnerException
 			}
 			if ($HTTP状态码 -eq 416 -and $已存在字节数 -gt 0) {
-				Write-Output ('服务器返回 416：本地文件 {0} 字节已完整，无需续传。' -f $已存在字节数)
-				break
+				if (测试-本地包完整 $本地包路径) {
+					Write-Output ('服务器返回 416：本地文件 {0} 字节已完整，无需续传。' -f $已存在字节数)
+					break
+				}
+				Remove-Item -LiteralPath $本地包路径 -Force -ErrorAction SilentlyContinue
+				Write-Output '服务器返回 416 但本地包完整性校验未通过，删除后从头重下。'
+				continue
 			}
 			$等待秒数 = [Math]::Min(30, $重试次数 * 2)
 			Write-Output ('下载中断（{0}），{1} 秒后重试（第 {2} 次，已续传 {3} 字节）...' -f $_.Exception.Message, $等待秒数, $重试次数, $已存在字节数)
@@ -113,6 +168,17 @@ try {
 		}
 	}
 
+	if ($系统类型 -eq 'Linux') {
+		# 交接主会话上传：本进程只负责下载，完成后写 .job 交接文件即退出，主会话的上传器线程按“文件帧→改名帧”序送入同一条连接。
+		# 原子性与 scp 方案一致：帧序天然保证“先文件后改名”，改名命令内含远端取消检查，坏包/截断包绝不会被就位。
+		$改名命令 = ("sh -c 'if [ -f {0}/{3} ]; then exit 2; fi; mv {0}/{1}.uploading {0}/{1} && touch {0}/{2}'" -f $暂存目录, $远程包名, $完成标记名, $取消标记名)
+		$交接 = @{ 数据文件 = $本地包路径; 远端名 = ('{0}.uploading' -f $远程包名); 完成命令 = $改名命令 }
+		$交接 | ConvertTo-Json | Set-Content -LiteralPath ($本地包路径 + '.job') -Encoding UTF8
+		Write-Output ('本地下载完成：共 {0} 字节，已交接主会话上传（{1}）。' -f (Get-Item -LiteralPath $本地包路径).Length, $远程包名)
+		return
+	}
+
+	# Windows：保持独立 scp 上传 + 改名（LAN 快，不走单会话）
 	# 上传前的取消复检：防止远程恰在下载完成到上传之间获胜，仍做一次低成本检查
 	if ((调用-远程命令 (取-取消标记命令)).退出码 -eq 0) { Write-Output '远程侧已获胜，本地供给取消（上传前）。'; return }
 
@@ -122,10 +188,26 @@ try {
 	$null = & $scp命令.Source (@('-P', $端口) + $密码选项 + @($本地包路径, $上传目标)) 2>&1
 	if ($LASTEXITCODE -ne 0) { Write-Output ('上传失败，退出码 {0}，本地供给退出（远程将继续自下载）。' -f $LASTEXITCODE); return }
 
+	# 上传完整性核对：远端字节数必须与本地一致才写完成标记（scp 断流截断时绝不放行，否则远端会拿坏包解压）
+	$本地大小 = (Get-Item -LiteralPath $本地包路径).Length
+	if ($系统类型 -eq 'Linux') {
+		$核对命令 = ('stat -c %s {0}/{1}.uploading' -f $暂存目录, $远程包名)
+	} else {
+		$核对命令 = 转换-远程PowerShell命令 ('[long](Get-Item -LiteralPath ''{0}\{1}.uploading'').Length' -f $暂存目录, $远程包名)
+	}
+	$核对结果 = 调用-远程命令 $核对命令
+	# 调用-远程命令 把多行输出折成 ' | ' 单行，且 ssh 的 CNAME 警告等 stderr 会混入——按分隔符+换行切段后只认纯数字段，防噪声把大小核对误判成"未知"
+	$远端大小行 = @($核对结果.输出 -split '[\r\n|]+' | Where-Object { $_ -match '^\s*\d+\s*$' } | Select-Object -Last 1)
+	if ($核对结果.退出码 -ne 0 -or $远端大小行.Count -eq 0 -or [long]$远端大小行[0] -ne $本地大小) {
+		Write-Output ('上传核对失败：远端 {0} 字节 ≠ 本地 {1} 字节，放弃本次改名与标记。' -f $(if ($远端大小行.Count -gt 0) { $远端大小行[0].Trim() } else { '未知' }), $本地大小)
+		return
+	}
+
 	# 原子改名 + 写完成标记（带远端取消检查，避免远程已获胜后仍写标记）。退出码约定：0=包已就位，2=远程已获胜跳过改名，其他=失败
 	# Linux 版包 sh -c 是防登录 shell 不是 sh（tcsh/fish 会把 if...then...fi 判成语法错误）；Windows 版经 转换-远程PowerShell命令 走 EncodedCommand，避开双引号被剥与 cmd 把 | 当管道解析
 	if ($系统类型 -eq 'Linux') {
-		$改名命令 = ("sh -c 'if [ -f {0}/{3} ]; then exit 2; fi; mv {0}/{1}.uploading {0}/{1} && touch {0}/{2}'" -f $暂存目录, $远程包名, $完成标记名, $取消标记名)
+		# gzip -t 把关：远端完整解压测试通过才改名写标记（tar.gz 的截断无法靠魔数检出，交给 gzip -t 一票否决）
+		$改名命令 = ("sh -c 'if [ -f {0}/{3} ]; then exit 2; fi; gzip -t {0}/{1}.uploading && mv {0}/{1}.uploading {0}/{1} && touch {0}/{2}'" -f $暂存目录, $远程包名, $完成标记名, $取消标记名)
 	} else {
 		$改名脚本 = ('if (Test-Path -LiteralPath ''{0}\{3}'') {{ exit 2 }}; try {{ Move-Item -LiteralPath ''{0}\{1}.uploading'' -Destination ''{0}\{1}'' -Force -ErrorAction Stop; New-Item -ItemType File -Force ''{0}\{2}'' -ErrorAction Stop | Out-Null }} catch {{ Write-Output $_.Exception.Message; exit 1 }}' -f $暂存目录, $远程包名, $完成标记名, $取消标记名)
 		$改名命令 = 转换-远程PowerShell命令 $改名脚本
