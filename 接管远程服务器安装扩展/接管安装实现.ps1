@@ -52,6 +52,13 @@ function 刷出缓冲([switch]$补足间隔) {
 	$script:上次刷出 = [DateTime]::Now
 }
 
+# 主循环的刷出由「新行到达」触发：远端安静时段（解包、tar 等）没有新行，缓冲里最后一段会滞留很久才上屏（实测竞速决出晚十余秒才显示）。模块的等待滴答每秒调用本钩子补刷；仍守 1 秒批间隔，避免相邻两块被 Remote-SSH 读端合并成一行
+$global:接管安装刷出缓冲钩子 = {
+	if (([DateTime]::Now - $script:上次刷出).TotalSeconds -ge 1) {
+		刷出缓冲
+	}
+}
+
 function 报错退出($消息) {
 	$script:缓冲.Add('[接管安装] ' + $消息)
 	刷出缓冲 -补足间隔
@@ -76,6 +83,26 @@ if ([string]::IsNullOrWhiteSpace([string]$配置.本地版本)) {
 	报错退出 ('配置文件 {0} 缺少「本地版本」，请关闭再重新开启「{1}」。' -f $配置文件, $开关名)
 }
 $模块路径 = [string]$配置.模块路径
+# 模块新鲜度自愈：配置里的路径可能指向已被替换的旧构建（扩展按版本目录安装，升级后旧目录迟早被 VS Code 清理；而扩展刷新配置发生在激活时，preconnect 可能先于激活跑起来就读到了旧配置）。旧构建的模板加载与发帧实现带着已修复的缺陷，静默加载会把帧流写坏、卡死到天荒地老。故把配置路径与扩展安装目录里的副本同台比新旧，自动改用模块代码更新的一份。
+$候选 = New-Object System.Collections.Generic.List[object]
+if (Test-Path -LiteralPath $模块路径) {
+	$候选.Add([pscustomobject]@{ 路径 = $模块路径; 时间 = (Get-Item -LiteralPath $模块路径).LastWriteTime })
+}
+foreach ($扩展根 in @((Join-Path $env:USERPROFILE '.vscode-insiders\extensions'), (Join-Path $env:USERPROFILE '.vscode\extensions'))) {
+	Get-ChildItem -LiteralPath $扩展根 -Directory -Filter 'ebola-chan-bot.remotessh-server-installer-*' -ErrorAction SilentlyContinue | ForEach-Object {
+		$副本 = Join-Path $_.FullName 'module\Install-VSCodeRemoteServer.psd1'
+		if ((Test-Path -LiteralPath $副本) -and ($副本 -ne $模块路径)) {
+			$候选.Add([pscustomobject]@{ 路径 = $副本; 时间 = (Get-Item -LiteralPath $副本).LastWriteTime })
+		}
+	}
+}
+if ($候选.Count -gt 0) {
+	$最新 = $候选 | Sort-Object 时间 -Descending | Select-Object -First 1
+	if ($最新.路径 -ne $模块路径) {
+		$script:缓冲.Add(('[接管安装] 配置里的模块路径指向较旧的构建，已自动改用更新的模块: {0}' -f $最新.路径))
+		$模块路径 = $最新.路径
+	}
+}
 $本地版本 = [string]$配置.本地版本
 # 本主机启用的能力：接管安装与服务保活相互独立（可重叠），都来自配置文件里的主机清单
 $启用接管 = @($配置.接管主机) -contains $远程主机

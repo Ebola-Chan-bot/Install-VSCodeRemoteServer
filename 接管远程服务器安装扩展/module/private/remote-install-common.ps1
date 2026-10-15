@@ -466,8 +466,33 @@ function 展开-服务器压缩包 {
 
 $提交号 = '__提交号__'
 $发布通道 = '__发布通道__'
+# ===== Remote-SSH 管道执行守卫（幂等部署到用户 profile）：远端 sshd 的默认 shell 是 PowerShell 且 Remote-SSH 的连接脚本不带 -NoProfile、经 stdin 管道喂给交互式 REPL 执行，回显与提示符让输出膨胀并滞留在管道渲染段（连接端等不到握手标记只能超时，实测 122 秒超时仍失败）。
+# 守卫把「无命令行参数的管道会话」（裸 powershell 被整本喂脚本的形态）转为非交互整本执行，输出只剩脚本本身的少量关键行，一次冲刷即达；带参数/命令的会话与交互登录不受影响，本模块自身的 -EncodedCommand 会话也不受影响。经 stdin 管道喂给守卫自身即可执行修复脚本（守卫即执行通道）；修复/部署脚本的标识符必须用 ASCII（控制台输入按 GBK 解码，中文标识符会被毁）。
+$守卫块 = @'
+
+# Remote-SSH 管道执行守卫（幂等，勿手改本块）：stdin 是管道且进程无命令行参数 = 有程序把整本脚本喂给裸 REPL 执行（带参数/命令的会话照常执行，不拦截）。
+# 交互式回显/提示符会让输出膨胀且滞留在管道渲染段（连接端等不到握手标记只能超时），这里转为非交互整本执行，输出只留脚本本身的少量关键行。
+if ([Console]::IsInputRedirected -and ([Environment]::GetCommandLineArgs().Count -eq 1)) {
+	$stdinScriptText = [Console]::In.ReadToEnd()
+	try { & ([scriptblock]::Create($stdinScriptText)) } catch { Write-Output ('脚本异常: {0}' -f $_.Exception.Message) }
+	exit
+}
+'@
+$守卫路径 = Join-Path $env:USERPROFILE 'Documents\WindowsPowerShell\profile.ps1'
+$守卫现状 = if (Test-Path -LiteralPath $守卫路径) { [System.IO.File]::ReadAllText($守卫路径) } else { '' }
+if ($守卫现状 -notmatch 'Remote-SSH 管道执行守卫') {
+	New-Item -ItemType Directory -Force -Path (Split-Path $守卫路径) | Out-Null
+	[System.IO.File]::WriteAllText($守卫路径, ($守卫现状 + $守卫块), (New-Object System.Text.UTF8Encoding($true)))
+}
+
 # 竞速暂存目录：本地模块与远程脚本约定在同一目录交换压缩包与标记文件；空串表示未启用竞速，回退远程单独下载
 $暂存目录 = '__暂存目录__'
+if ($暂存目录 -eq 'AUTO') {
+	# 单会话模式的哨兵值：暂存目录由本脚本自行推算，本地模块不探测登录目录、scp 只用相对路径。
+	# 必须解析成登录目录基准的绝对路径：相对路径随执行上下文漂移（实测 Start-Job 的 CWD 是「文档」目录，AUTO\REMOTE_CLI.zip 被解析成 文档\AUTO\... 直接报 Cannot find path 中断安装），而 scp 相对路径的落点实测就是登录目录，锚定 $env:USERPROFILE 与之对齐。
+	$数据目录名 = if ($发布通道 -eq 'insider') { '.vscode-server-insiders' } else { '.vscode-server' }
+	$暂存目录 = ('{0}\{1}\race-{2}' -f $env:USERPROFILE, $数据目录名, $提交号)
+}
 $系统架构 = 取-系统架构标识
 $最终安装目录 = 取-安装目录 -通道 $发布通道 -版本提交号 $提交号
 # 固定文件名（不含随机后缀），使同一安装目录下的下载路径确定，便于识别与断点续传定位
@@ -492,7 +517,16 @@ $获胜包路径 = $下载压缩包路径
 if ($启用竞速) {
 	# ===== 竞速模式：每个缺失产物各竞速一次（本地下载+上传 vs 远程自下载，先完成者获胜），CLI 与服务端独立判胜、互不拖累 =====
 	# 单边断网时由另一边补上：远端连不上下载服务器就等本地供给，本地下载失败就等远程自下载
-	New-Item -ItemType Directory -Force $暂存目录 | Out-Null
+		# 清建暂存目录：上一轮的残包与标记必须清掉（残留的完成标记会让本轮误判本地供给已获胜、残留半成品会被误当完整包）；本地供给听到下方标记才启动，不会误删它的在途文件。
+		Remove-Item -LiteralPath $暂存目录 -Recurse -Force -ErrorAction SilentlyContinue
+		New-Item -ItemType Directory -Force $暂存目录 | Out-Null
+		# 供给触发标记：本地模块听到此行才启动本地供给子进程（顺序保证：清建先于任何上传），只报真正待装的产物。
+		$待装产物名 = @()
+		if (-not $CLI已就位) { $待装产物名 += 'CLI' }
+		if (-not $服务端已就绪) { $待装产物名 += '服务端' }
+		if ($待装产物名.Count -gt 0) {
+			Write-Host ('__接管预备完成__{0}' -f ($待装产物名 -join ' '))
+		}
 	# 把断点续传下载函数以文本形式带入后台作业（Start-Job 是独立进程，无法直接调用本脚本函数），竞速双方产物都用它下载
 	$下载函数文本 = (Get-Command '通过HTTP断点续传下载').Definition
 	if (-not $CLI已就位) {

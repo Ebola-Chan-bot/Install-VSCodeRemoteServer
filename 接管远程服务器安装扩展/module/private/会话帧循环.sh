@@ -9,6 +9,11 @@ while IFS= read -r FT; do
 			IFS= read -r FN
 			IFS= read -r FF
 			head -c "$FN" > "$HOME/$FF"
+			# 帧完整性校验：实收字节数必须与帧头声明一致，不一致说明发端字节被文本编码改写或传输错位，立即报告并退出，绝不把错位数据当阶段文件送进编排
+			if [ "$(wc -c < "$HOME/$FF" | tr -d ' ')" != "$FN" ]; then
+				echo "__FRAME_TRUNCATED__ $FF"
+				exit 1
+			fi
 			;;
 		__CMD__)
 			IFS= read -r CC

@@ -23,6 +23,8 @@ try {
 	$提交号 = [string]$参数.提交号
 	$产物名 = [string]$参数.产物名
 	$取消标记名 = [string]$参数.取消标记名
+	# Windows 远端相对暂存目录（单会话模式约定）锚定登录目录：scp 相对路径落点与 ssh 会话位置实测都是登录目录，但命令里的相对路径随执行上下文可能漂移（实测 Start-Job 的 CWD 是「文档」目录），统一改写成 $env:USERPROFILE 绝对表达式由远端展开，与远端脚本解析出的绝对暂存目录严格同目录。
+	$远端暂存目录文本 = if ($暂存目录 -match '^[A-Za-z]:[\\/]' -or $暂存目录.StartsWith('\\')) { $暂存目录 } else { ('$env:USERPROFILE\' + ($暂存目录 -replace '/', '\')) }
 
 	function 调用-远程命令([string]$命令文本) {
 		# 返回 {退出码, 输出} 对象（不用元组：命令无 stdout 时 PowerShell 会展平数组导致下标错位），失败时把远端报错一并带回展示
@@ -72,7 +74,7 @@ try {
 		if ($系统类型 -eq 'Linux') {
 			return ('test -f {0}/{1}' -f $暂存目录, $取消标记名)
 		}
-		return (转换-远程PowerShell命令 ('if (Test-Path -LiteralPath ''{0}\{1}'') {{ exit 0 }} else {{ exit 1 }}' -f $暂存目录, $取消标记名))
+		return (转换-远程PowerShell命令 ('if (Test-Path -LiteralPath "{0}\{1}") {{ exit 0 }} else {{ exit 1 }}' -f $远端暂存目录文本, $取消标记名))
 	}
 
 	# Linux：暂存目录的预清理/预建已由主流程在环境探测的同一条连接完成（残包与取消标记已清、目录已建，
@@ -82,7 +84,7 @@ try {
 		# 下载前的低成本取消检查（远程已获胜则不必下载）
 		if ((调用-远程命令 (取-取消标记命令)).退出码 -eq 0) { Write-Output '远程侧已获胜，本地供给取消（下载前）。'; return }
 		# 预建远程暂存目录：本地供给可能先于远程脚本跑到上传步骤，目录不存在会导致 scp 失败
-		$建目录命令 = 转换-远程PowerShell命令 ('New-Item -ItemType Directory -Force -Path ''{0}'' | Out-Null' -f $暂存目录)
+		$建目录命令 = 转换-远程PowerShell命令 ('New-Item -ItemType Directory -Force -Path "{0}" | Out-Null' -f $远端暂存目录文本)
 		$null = 调用-远程命令 $建目录命令
 	}
 
@@ -201,7 +203,7 @@ try {
 	if ($系统类型 -eq 'Linux') {
 		$核对命令 = ('stat -c %s {0}/{1}.uploading' -f $暂存目录, $远程包名)
 	} else {
-		$核对命令 = 转换-远程PowerShell命令 ('[long](Get-Item -LiteralPath ''{0}\{1}.uploading'').Length' -f $暂存目录, $远程包名)
+		$核对命令 = 转换-远程PowerShell命令 ('[long](Get-Item -LiteralPath "{0}\{1}.uploading").Length' -f $远端暂存目录文本, $远程包名)
 	}
 	$核对结果 = 调用-远程命令 $核对命令
 	# 调用-远程命令 把多行输出折成 ' | ' 单行，且 ssh 的 CNAME 警告等 stderr 会混入——按分隔符+换行切段后只认纯数字段，防噪声把大小核对误判成"未知"
@@ -217,7 +219,7 @@ try {
 		# gzip -t 把关：远端完整解压测试通过才改名写标记（tar.gz 的截断无法靠魔数检出，交给 gzip -t 一票否决）
 		$改名命令 = ("sh -c 'if [ -f {0}/{3} ]; then exit 2; fi; gzip -t {0}/{1}.uploading && mv {0}/{1}.uploading {0}/{1} && touch {0}/{2}'" -f $暂存目录, $远程包名, $完成标记名, $取消标记名)
 	} else {
-		$改名脚本 = ('if (Test-Path -LiteralPath ''{0}\{3}'') {{ exit 2 }}; try {{ Move-Item -LiteralPath ''{0}\{1}.uploading'' -Destination ''{0}\{1}'' -Force -ErrorAction Stop; New-Item -ItemType File -Force ''{0}\{2}'' -ErrorAction Stop | Out-Null }} catch {{ Write-Output $_.Exception.Message; exit 1 }}' -f $暂存目录, $远程包名, $完成标记名, $取消标记名)
+		$改名脚本 = ('if (Test-Path -LiteralPath "{0}\{3}") {{ exit 2 }}; try {{ Move-Item -LiteralPath "{0}\{1}.uploading" -Destination "{0}\{1}" -Force -ErrorAction Stop; New-Item -ItemType File -Force "{0}\{2}" -ErrorAction Stop | Out-Null }} catch {{ Write-Output $_.Exception.Message; exit 1 }}' -f $远端暂存目录文本, $远程包名, $完成标记名, $取消标记名)
 		$改名命令 = 转换-远程PowerShell命令 $改名脚本
 	}
 	$改名结果 = 调用-远程命令 $改名命令

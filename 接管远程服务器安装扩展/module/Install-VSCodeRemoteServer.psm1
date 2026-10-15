@@ -16,6 +16,8 @@ $script:脚本_单会话引导 = Get-Content -Path (Join-Path $script:模块根�
 $script:脚本_会话帧循环 = (Get-Content -Path (Join-Path $script:模块根目录 'private\会话帧循环.sh') -Raw -Encoding UTF8) -replace "`r`n", "`n"
 $script:脚本_环境探测命令 = (Get-Content -Path (Join-Path $script:模块根目录 'private\环境探测命令.txt') -Raw -Encoding UTF8) -replace "`r`n", "`n"
 $script:脚本_接管编排模板 = (Get-Content -Path (Join-Path $script:模块根目录 'private\接管编排脚本模板.sh') -Raw -Encoding UTF8) -replace "`r`n", "`n"
+# 供给子进程日志的实时转发登记：{产物名; 路径; 已读字节; 残段}。子进程 stdout/stderr 重定向到日志文件，这里按字节偏移增量读出立刻上屏，本地下载/上传进度不再积压到收尾统一打印
+$script:供给日志登记 = New-Object System.Collections.ArrayList
 
 # SSH 密码复用状态（由 初始化-SSH会话 设置）
 $script:SSH密码选项 = @()
@@ -595,6 +597,7 @@ function 安装-VSCode远程服务 {
 				if ($文本 -match '^(#< CLIXML|<Objs|</Objs>)') { return }
 				Write-Host $文本
 				if ($每行回调) { & $每行回调 $文本 }
+				转发-供给日志
 			}
 			& $ssh命令.Source $ssh参数 2>&1 | ForEach-Object $处理行
 			$退出码 = $LASTEXITCODE
@@ -841,6 +844,9 @@ function 安装-VSCode远程服务 {
 				错误路径 = $错误文件
 				参数文件路径 = $参数文件
 			}
+			# 登记子进程日志供 转发-供给日志 增量转出（本地下载/上传进度随产生上屏）
+			[void]$script:供给日志登记.Add([pscustomobject]@{ 产物名 = $产物.产物名; 路径 = $日志文件; 已读字节 = [long]0; 残段 = '' })
+			[void]$script:供给日志登记.Add([pscustomobject]@{ 产物名 = $产物.产物名; 路径 = $错误文件; 已读字节 = [long]0; 残段 = '' })
 		}
 		return $供给列表
 	}
@@ -867,23 +873,67 @@ function 安装-VSCode远程服务 {
 		}
 	}
 
+	function 转发-供给日志 {
+		param([switch]$收尾)
+
+		# 增量转出供给子进程日志（[本地供给-产物名] 前缀，与收尾打印同格式）：按登记的字节偏移续读，半行残段留待拼齐再发；-收尾 把残段也作为一行发出。日志文件用共享读打开（子进程仍在写），读不到按缺失跳过
+		foreach ($登记 in @($script:供给日志登记)) {
+			$新增文本 = ''
+			try {
+				$读取流 = New-Object System.IO.FileStream($登记.路径, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+				try {
+					[void]$读取流.Seek($登记.已读字节, [System.IO.SeekOrigin]::Begin)
+					$读取器 = New-Object System.IO.StreamReader($读取流, [System.Text.Encoding]::Default)
+					$新增文本 = $读取器.ReadToEnd()
+					$登记.已读字节 = $读取流.Position
+				} finally {
+					$读取流.Dispose()
+				}
+			} catch {
+				continue
+			}
+			$段落 = @(($登记.残段 + $新增文本) -split "`r?`n")
+			$登记.残段 = $段落[$段落.Count - 1]
+			if ($段落.Count -gt 1) {
+				foreach ($行 in $段落[0..($段落.Count - 2)]) {
+					Write-Host ('[本地供给-{0}] {1}' -f $登记.产物名, $行)
+				}
+			}
+		}
+		if ($收尾) {
+			foreach ($登记 in @($script:供给日志登记)) {
+				if (-not [string]::IsNullOrEmpty($登记.残段)) {
+					Write-Host ('[本地供给-{0}] {1}' -f $登记.产物名, $登记.残段)
+					$登记.残段 = ''
+				}
+			}
+		}
+	}
+
+	function 刷新-接管输出缓冲 {
+		# 主输出缓冲由「新行到达」触发刷出，远端安静时段没有新行就不会刷；等待滴答里调用接管安装实现注册的钩子补刷（模块被单独调用时无此钩子，跳过）
+		$钩子 = Get-Variable -Name 接管安装刷出缓冲钩子 -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+		if ($null -ne $钩子) {
+			& $钩子
+		}
+	}
+
 	function 等待-供给进程并回收日志 {
 		param(
 			$供给
 		)
 
-		# 收尾：兜底击杀残留供给进程树、等待退出、按 [本地供给-产物名] 前缀打印其日志，再删除临时文件（均失败无害）
+		# 收尾：兜底击杀残留供给进程树、等待退出，补发日志残余（正文已随产生实时转发，见 转发-供给日志），再删除临时文件（均失败无害）
 		foreach ($单个供给 in @($供给)) {
 			if ($null -eq $单个供给) { continue }
 			停止-供给进程树 -供给 $单个供给
 			if ($null -ne $单个供给.进程) {
 				try { $null = $单个供给.进程.WaitForExit(10000) } catch { }
 			}
-			foreach ($日志 in @($单个供给.日志路径, $单个供给.错误路径)) {
-				if (-not [string]::IsNullOrWhiteSpace($日志) -and (Test-Path -LiteralPath $日志)) {
-					Get-Content -LiteralPath $日志 | ForEach-Object { Write-Host ('[本地供给-{0}] {1}' -f $单个供给.产物名, $_) }
-				}
-			}
+		}
+		转发-供给日志 -收尾
+		foreach ($单个供给 in @($供给)) {
+			if ($null -eq $单个供给) { continue }
 			foreach ($临时文件 in @($单个供给.日志路径, $单个供给.错误路径, $单个供给.参数文件路径)) {
 				if (-not [string]::IsNullOrWhiteSpace($临时文件)) {
 					Remove-Item -LiteralPath $临时文件 -Force -ErrorAction SilentlyContinue
@@ -1185,8 +1235,23 @@ function 安装-VSCode远程服务 {
 		$编排退出码 = $null
 		try {
 			while ($true) {
-				$文本行 = $会话.标准输出.ReadLine()
+				# 异步读 + 无输出看门狗：帧流错位或远端卡死时没有任何输出，同步 ReadLine 会永久挂起，这里 30 分钟无输出即带诊断中止
+				$读取任务 = $会话.标准输出.ReadLineAsync()
+				$静默累计毫秒 = 0
+				while (-not $读取任务.Wait(1000)) {
+					# 等待按 1 秒切片：每秒转出供给日志新行（本地下载/上传进度实时上屏）并补刷主输出缓冲（远端安静时没有新行触发刷出，上一段末行会滞留）
+					$静默累计毫秒 += 1000
+					if ($静默累计毫秒 -ge 1800000) {
+						throw '单会话 30 分钟无任何输出（远端帧流可能已错位或编排卡死），放弃等待。'
+					}
+					转发-供给日志
+					刷新-接管输出缓冲
+				}
+				$文本行 = $读取任务.Result
 				if ($null -eq $文本行) { break }
+				if ($文本行 -match '^__FRAME_TRUNCATED__') {
+					throw ('远端报告帧数据不完整（发端字节被改写或传输错位）：{0}' -f $文本行)
+				}
 				if ($文本行 -match '^__ORCH_EXIT__=(\d+)') {
 					$编排退出码 = [int]$Matches[1]
 					break
