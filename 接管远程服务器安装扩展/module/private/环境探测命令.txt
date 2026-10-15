@@ -1,0 +1,10 @@
+echo HOMEDIR_CMD=%USERPROFILE%
+powershell -NoProfile -Command Write-Output $PSVersionTable.PSVersion.Major
+powershell -NoProfile -Command Write-Output $env:USERPROFILE
+powershell -NoProfile -Command Write-Output $env:PROCESSOR_ARCHITECTURE
+uname -s
+uname -m
+uname -r
+ldd --version | head -1
+printf 'HOMEDIR_SH=%s\n' $HOME
+echo PROBE_END

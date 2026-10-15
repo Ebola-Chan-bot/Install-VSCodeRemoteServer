@@ -192,6 +192,9 @@ race_artifact() {
 	fi
 
 	ELAPSED=0
+	# 竞速等待心跳的报告周期同款自适应：进度不足 2/3 时每周期加 1 秒，超过 2/3 后每周期减 1 秒（下限 1 秒）；心跳没有产物总大小可比对，按未达 2/3 处理只增不减
+	REPORT_PERIOD=1
+	NEXT_REPORT=$REPORT_PERIOD
 	while true; do
 		if [ -f "$3" ]; then
 			RACE_WINNER_SIDE='remote'
@@ -203,19 +206,18 @@ race_artifact() {
 		fi
 		sleep 1
 		ELAPSED=$((ELAPSED + 1))
-		if [ $((ELAPSED % 30)) -eq 0 ]; then
-			RSIZE=0
-			if [ -f "$2" ]; then
-				RSIZE=$(wc -c < "$2" 2>/dev/null | tr -d ' ')
+		if [ "$ELAPSED" -ge "$NEXT_REPORT" ]; then
+			if [ -n "$7" ]; then
+				RSIZE=0
+				if [ -f "$2" ]; then
+					RSIZE=$(wc -c < "$2" 2>/dev/null | tr -d ' ')
+				fi
+				log "$1 竞速等待 ${ELAPSED}s：远程侧已下载 ${RSIZE} 字节。"
+			else
+				log "$1 竞速等待 ${ELAPSED}s：远程侧不参与下载，等待本地供给。"
 			fi
-			LSIZE=0
-			# 本地供给包：上传完成前为 <包名>.uploading（scp 写入），完成后更名
-			if [ -f "$4" ]; then
-				LSIZE=$(wc -c < "$4" 2>/dev/null | tr -d ' ')
-			elif [ -f "$4.uploading" ]; then
-				LSIZE=$(wc -c < "$4.uploading" 2>/dev/null | tr -d ' ')
-			fi
-			log "$1 竞速等待 ${ELAPSED}s：远程侧已下载 ${RSIZE} 字节；本地侧已上传到远端 ${LSIZE} 字节（本地供给先在本机下载、完成后才上传，下载阶段恒为 0）。"
+			REPORT_PERIOD=$((REPORT_PERIOD + 1))
+			NEXT_REPORT=$((ELAPSED + REPORT_PERIOD))
 		fi
 	done
 
@@ -285,11 +287,6 @@ install_cli() {
 	done
 }
 
-# ===== 停止正在运行的旧版服务进程 =====
-if command -v pkill >/dev/null 2>&1; then
-	pkill -f "$COMMIT" 2>/dev/null || true
-fi
-
 # ===== 判定待装产物：已就位的产物不参与竞速，避免无谓的下载与上传 =====
 NEED_CLI=1
 if [ -f "$CLI_ON_DISK" ]; then
@@ -298,6 +295,14 @@ fi
 NEED_SERVER=1
 if [ -f "$INSTALL_DIR/product.json" ] && [ -d "$INSTALL_DIR/bin" ]; then
 	NEED_SERVER=0
+fi
+
+# ===== 仅当确有产物需要重装时才停止正在运行的旧版服务进程 =====
+# 无条件 pkill -f "$COMMIT" 会把命令行含提交号的 command-shell daemon 与 VS Code Server 一并杀掉（提交号就嵌在它们的路径里），于是每次连接的接管安装都会打死上次会话正在服务的进程，重连与多开窗口互相残杀。产物齐备时没有任何重装动作，绝不碰运行中的进程；真正要重装产物时才清理旧进程，避免旧进程占住将被覆盖的文件。
+if [ "$NEED_CLI" = '1' ] || [ "$NEED_SERVER" = '1' ]; then
+	if command -v pkill >/dev/null 2>&1; then
+		pkill -f "$COMMIT" 2>/dev/null || true
+	fi
 fi
 
 CLI_WINNER_PKG=''

@@ -2,7 +2,7 @@
 	"name": "RemoteSSH-server-installer",
 	"displayName": "RemoteSSH服务器安装",
 	"description": "接管Remote-SSH的远程服务器安装步骤，提供更稳健的断线重连、本地远程双线竞速下载和旧版本环境支持",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"publisher": "Ebola-Chan-bot",
 	"license": "MIT",
 	"icon": "icon.png",

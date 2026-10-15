@@ -95,8 +95,8 @@ if (-not $启用接管 -and -not $启用保活) {
 		Import-Module -Name $模块路径 -Force -ErrorAction Stop -DisableNameChecking
 
 		if ($启用接管) {
-			# 接管+保活同跑时把保活检修并入同一次远程会话（-含服务保活），不再单独走一轮连接
-			安装-VSCode远程服务 -远程主机 $远程主机 -本地版本 $本地版本 -非交互 -含服务保活:$启用保活 -ErrorAction Stop
+			# 接管+保活同跑时把保活检修并入同一次远程会话（-含服务保活），不再单独走一轮连接；平台提示随参传入，Windows 主机由模块直走 powershell 单会话流程
+			安装-VSCode远程服务 -远程主机 $远程主机 -本地版本 $本地版本 -非交互 -含服务保活:$启用保活 -平台提示映射 $配置.平台提示映射 -ErrorAction Stop
 		} elseif ($启用保活) {
 			# 仅保活主机：不安装 Server，只做保活包装的幂等检修（已部署跳过、旧版升级、CLI 缺失自动下载真身再包装）。
 			# 新提交号的 CLI 由 Remote-SSH 在本次连接安装，当次不受保护属预期，下一次连接由本步自动补上。

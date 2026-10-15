@@ -29,7 +29,7 @@ KEEP=2
 MARK='vscode-persistent-wrapper-v2'
 # 包装脚本内容版本标记：与包装脚本模板（服务保活包装脚本.sh）头部「包装脚本版本:」那一行对应。
 # 步骤 3 靠它区分“已是当前版本”与“旧版包装脚本”；凡改变脱逃方式或 wrapper 行为，必须同步递增本标记与模板头部那一行，否则已部署的旧 wrapper 永远不会被升级。MARK 只标识身份、不随内容版本变动：移除路径靠它认出已部署的 wrapper 并把真身放回原位，改 MARK 会导致旧 wrapper 无法还原。
-WRAP_VERSION='WRAPPER-V5-NAME-EXEMPT'
+WRAP_VERSION='WRAPPER-V6-SINGLE-DAEMON'
 URL_BASE='https://update.code.visualstudio.com'
 
 log() {

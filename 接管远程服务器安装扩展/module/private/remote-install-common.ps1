@@ -203,6 +203,9 @@ function 竞速-单个产物 {
 
 	$等待秒数 = 0
 	$获胜方 = $null
+	# 竞速等待心跳的报告周期同款自适应：进度不足 2/3 时每周期加 1 秒，超过 2/3 后每周期减 1 秒（下限 1 秒）；心跳没有产物总大小可比对，按未达 2/3 处理只增不减
+	$报告周期秒数 = 1
+	$下次报告秒数 = $报告周期秒数
 	while ($true) {
 		if (Test-Path -LiteralPath $远程完成标记) { $获胜方 = '远程自下载'; break }
 		if (Test-Path -LiteralPath $本地完成标记) { $获胜方 = '本地供给'; break }
@@ -210,13 +213,12 @@ function 竞速-单个产物 {
 		Receive-Job -Job $下载作业 | ForEach-Object { Write-Host ('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $_) }
 		Start-Sleep -Seconds 1
 		$等待秒数++
-		if (($等待秒数 % 30) -eq 0) {
+		if ($等待秒数 -ge $下次报告秒数) {
 			$远程字节 = 0
 			if (Test-Path -LiteralPath $远程包路径) { $远程字节 = (Get-Item -LiteralPath $远程包路径).Length }
-			$本地字节 = 0
-			if (Test-Path -LiteralPath $本地包路径) { $本地字节 = (Get-Item -LiteralPath $本地包路径).Length }
-			elseif (Test-Path -LiteralPath ($本地包路径 + '.uploading')) { $本地字节 = (Get-Item -LiteralPath ($本地包路径 + '.uploading')).Length }
-			Write-Host ('[{0}] {1} 竞速等待 {2}s：远程侧已下载 {3} 字节；本地侧已上传到远端 {4} 字节（本地供给先在本机下载、完成后才上传，下载阶段恒为 0）。' -f (Get-Date -Format 'HH:mm:ss'), $产物名, $等待秒数, $远程字节, $本地字节)
+			Write-Host ('[{0}] {1} 竞速等待 {2}s：远程侧已下载 {3} 字节。' -f (Get-Date -Format 'HH:mm:ss'), $产物名, $等待秒数, $远程字节)
+			$报告周期秒数++
+			$下次报告秒数 = $等待秒数 + $报告周期秒数
 		}
 	}
 
