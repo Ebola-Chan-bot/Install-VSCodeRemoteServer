@@ -519,7 +519,7 @@ function 安装-VSCode远程服务 {
 		if ($非交互) {
 			$诊断 = '无法连接远程主机'
 			if ($script:环境探测诊断 -match 'Permission denied|denied|password|认证') { $诊断 = '未配置免密登录（密钥认证）' }
-			throw ('{0}（{1}）：本环境无法交互输入密码（Remote-SSH preconnect 的标准输入被忽略）。请为该主机配置密钥认证，或关闭接管开关改用 Remote-SSH 自带安装。' -f $诊断, $连接目标)
+			throw ('{0}（{1}）：本环境无法交互输入密码（Remote-SSH preconnect 的标准输入被忽略）。请为该主机配置密钥认证，或取消勾选该主机改用 Remote-SSH 自带安装。' -f $诊断, $连接目标)
 		}
 
 		# 需要密码：交互收集一次，之后通过 SSH_ASKPASS 注入到后续每次 ssh/scp 调用

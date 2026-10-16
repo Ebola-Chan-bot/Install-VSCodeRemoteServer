@@ -1,7 +1,7 @@
 // 接管远程服务器安装 扩展入口：把 Install-VSCodeRemoteServer 模块接入 Remote-SSH 的远程服务器安装步骤。
-// 设置项：「安装VSCode远程服务.接管远程服务器安装」总开关；「安装VSCode远程服务.接管的主机」用户勾选的主机清单（命令「选择要接管的主机…」弹多选列表、实时扫描 ~/.ssh/config，勾选后写回该设置；直接在设置页编辑也行，保存即生效）。
+// 设置项：「安装VSCode远程服务.接管的主机」「安装VSCode远程服务.启用保活的主机」两份用户勾选的主机清单（命令「选择接管与保活的主机…」弹多选列表、实时扫描 ~/.ssh/config，勾选后写回设置；直接在设置页编辑也行，保存即生效）。没有总开关：勾选哪些主机就接管/保活哪些主机，两份清单都为空即整体还原。
 // 勾选的主机：Remote-SSH 每次连接前先由本模块安装远程服务器（竞速供给 + 旧 glibc 自动部署官方 sysroot + CLI 引导预装），自带的安装步骤检测到服务端已就位便直接复用；未勾选的主机完全不动，保持自带安装——逐主机选择性隔离。
-// 关闭开关：摘掉指向本扩展的钩子、删除生成的脚本——即「还原」（覆盖方式已把原脚本引用丢弃不可恢复，故还原不回填任何值）。
+// 取消勾选全部主机（两份清单都为空）：摘掉指向本扩展的钩子、删除生成的脚本——即「还原」（覆盖方式已把原脚本引用丢弃不可恢复，故还原不回填任何值）。
 //
 // 机制依据（Remote-SSH 0.128 源码实测：out/extension.js 的 preconnectScript）：remote.SSH.preconnect 取字符串时对全部主机生效、取对象时按主机映射；Windows 上必须是 .ps1，以 spawn('powershell.exe', ['-NoProfile','-ExecutionPolicy','Bypass','-File', 脚本路径],
 // { stdio: ['ignore','pipe','pipe'] }) 调用——参数硬编码、不注入环境变量、不设工作目录、标准输入为 ignore，脚本运行时对自己被哪台主机触发一无所知（主机名只被用来挑路径，不传下来），故唯一能携带主机名的途径就是每主机一个薄脚本。非零退出会中止连接；脚本内容 sha256 参与一次性授权确认（内容变化即重新弹窗）。
@@ -18,7 +18,6 @@ const path = require('path');
 const os = require('os');
 
 const 设置节 = '安装VSCode远程服务';
-const 开关键 = '接管远程服务器安装';
 const 钩子设置键 = 'remote.SSH.preconnect';
 const 接管文件前缀 = '接管安装';
 const 生成脚本前缀 = 接管文件前缀 + '-';
@@ -33,7 +32,7 @@ const 状态键_接管前设置 = '接管前的remote.SSH.preconnect'; // 旧版
 // 对齐串行化：勾选写回设置会再次触发对齐，链式排队避免两个对齐任务并发读写同一批文件
 let 对齐队列 = Promise.resolve();
 function 串行对齐(context, 交互) {
-	const 执行 = () => 对齐接管状态(context, 交互).catch(错误 => {
+	const 执行 = () => 执行接管(context, 交互).catch(错误 => {
 		console.error('[接管远程服务器安装] 对齐出错：' + 取错误信息(错误));
 		vscode.window.showErrorMessage('接管远程服务器安装出错：' + 取错误信息(错误));
 	});
@@ -42,9 +41,9 @@ function 串行对齐(context, 交互) {
 }
 
 function 激活(context) {
-	// 开关或主机清单任一变化（设置页保存、手改 settings.json 都算）→ 立即对齐，交互模式下允许弹窗
+	// 主机清单变化（设置页保存、手改 settings.json 都算）→ 立即对齐，交互模式下允许弹窗
 	context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(事件 => {
-		if (事件.affectsConfiguration(设置节 + '.' + 开关键) || 事件.affectsConfiguration(设置节 + '.' + 接管主机键) || 事件.affectsConfiguration(设置节 + '.' + 保活主机键)) {
+		if (事件.affectsConfiguration(设置节 + '.' + 接管主机键) || 事件.affectsConfiguration(设置节 + '.' + 保活主机键)) {
 			串行对齐(context, true);
 		}
 	}));
@@ -64,14 +63,6 @@ function 激活(context) {
 }
 
 function 停用() { }
-
-async function 对齐接管状态(context, 交互) {
-	if (取开关值()) {
-		await 执行接管(context, 交互);
-	} else {
-		await 执行还原(context, 交互);
-	}
-}
 
 // 「选择接管与保活的主机…」命令：两个多选 QuickPick 依次勾选（接管安装 / 服务保活，相互独立可重叠），候选实时来自 ssh config（含已勾选但已从 config 消失的，便于取消）
 async function 选择接管主机() {
@@ -125,25 +116,17 @@ function 取主机清单设置(键) {
 	return 结果;
 }
 
-function 取开关值() {
-	return Boolean(vscode.workspace.getConfiguration(设置节).get(开关键, false));
-}
-
 function 取钩子全局值() {
 	const 详情 = vscode.workspace.getConfiguration().inspect(钩子设置键);
 	return 详情 ? 详情.globalValue : undefined;
 }
 
-async function 写钩子全局值(值) {
-	await vscode.workspace.getConfiguration().update(钩子设置键, 值, vscode.ConfigurationTarget.Global);
-}
-
-// 执行接管：为勾选的主机生成薄脚本并让 remote.SSH.preconnect 指向它们，替换 Remote-SSH 自带安装
+// 执行接管：为勾选的主机生成薄脚本并让 remote.SSH.preconnect 指向它们，替换 Remote-SSH 自带安装；两份清单都为空时整体还原
 async function 执行接管(context, 交互) {
 	// 取代的对象是 Remote-SSH 的安装步骤，Remote-SSH 不在场时其设置项未注册，VS Code 会拒绝写入 remote.SSH.preconnect
 	if (!vscode.extensions.getExtension('ms-vscode-remote.remote-ssh')) {
 		if (交互) {
-			vscode.window.showWarningMessage('接管远程服务器安装需要 Remote-SSH 扩展，请先安装并启用 Remote-SSH，再开启开关。');
+			vscode.window.showWarningMessage('接管远程服务器安装需要 Remote-SSH 扩展，请先安装并启用 Remote-SSH。');
 		}
 		return;
 	}
@@ -175,12 +158,10 @@ async function 执行接管(context, 交互) {
 		}
 	}
 
-	if (需要钩子.length === 0 && 交互) {
-		const 选择 = await vscode.window.showWarningMessage('接管远程服务器安装：开关已开启，但还没有勾选任何接管或保活的主机。', '选择主机…');
-		if (选择 === '选择主机…') {
-			await vscode.commands.executeCommand(命令_选择主机);
-		}
-		// 即使不选也继续往下走：清单为空时重建钩子会把遗留的我方条目清干净（如用户清空了清单）
+	// 两份清单都为空 = 没有任何主机被勾选：整体还原（摘钩子、删生成文件），接管范围完全由清单决定
+	if (需要钩子.length === 0) {
+		await 执行还原(context, 交互);
+		return;
 	}
 
 	// 有外部原脚本且尚未决策的主机：交互时逐个弹窗询问；启动静默对齐时不打扰，只留通知并跳过这些主机
@@ -621,9 +602,7 @@ let 终端失灵提示已弹 = false;
 function 检测安装命令未执行(context) {
 	if (终端失灵提示已弹) { return; }
 	try {
-		if (!取开关值()) { return; }
 		const 上次 = context.globalState.get(状态键_终端失灵提示时刻, 0);
-		if (Date.now() - 上次 < 30 * 60 * 1000) { return; } // 30 分钟内不重复打扰
 		const 名单 = [...new Set([...取主机清单设置(接管主机键), ...取主机清单设置(保活主机键)])];
 		if (名单.length === 0) { return; }
 		const 命中 = 找近期安装超时日志(名单);
