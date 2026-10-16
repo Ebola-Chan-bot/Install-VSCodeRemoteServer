@@ -1724,6 +1724,44 @@ function 安装-VSCode远程服务 {
 	}
 
 	$连接目标 = 取-SSH连接目标 -主机 $远程主机 -账户 $远程账户
+	# ===== 本地孤儿会话清理：断线/失败的连接留下的 ssh/scp/cmd 孤儿（父进程已死）仍持有远程会话，是远端僵尸会话的源头；只清引用本主机且父进程已死的，活动连接（父进程存活）一概不碰
+	try {
+		$孤儿数 = 0
+		foreach ($候 in @(Get-CimInstance Win32_Process -Filter "Name = 'ssh.exe' or Name = 'scp.exe' or Name = 'cmd.exe'" -ErrorAction SilentlyContinue)) {
+			if ($候.CommandLine -notmatch [regex]::Escape($远程主机)) { continue }
+			if ($null -ne (Get-Process -Id $候.ParentProcessId -ErrorAction SilentlyContinue)) { continue }
+			try { Stop-Process -Id $候.ProcessId -Force -ErrorAction Stop; $孤儿数++ } catch { }
+		}
+		if ($孤儿数 -gt 0) {
+			Write-Output ('已清理本地孤儿连接进程 {0} 个（断线残留，仍持有远程会话）。' -f $孤儿数)
+		}
+	} catch { }
+	# ===== 死安装终端清理：Remote-SSH 在隐藏终端里跑安装脚本，连接超时放弃/窗口异常后终端的 pty 宿主先死，cmd（连带内层 cmd 与 ssh 子树）成为孤儿挂在死管道上——仍占控制台会话、仍握着已放弃的远程会话隧道，残留累积会拖垮后续连接的输出投递（实测同窗口残留累积后新连接的安装命令根本不被执行、终端一个字节都不上屏）。判据 = 命令行带安装终端特征（vscode-linux-multi-line-command）且向上 8 代祖先链找不到存活的 OpenConsole/conhost 宿主（存活安装终端必有宿主在侧且由 Remote-SSH 自我管理，一概不碰）；整树击杀（taskkill /T 连带内层 cmd/ssh），pty 宿主若侥幸存活一并杀。
+	try {
+		$进程快照 = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+		$按Pid索引 = @{}
+		foreach ($项 in $进程快照) { $按Pid索引[[int]$项.ProcessId] = $项 }
+		$死终端数 = 0
+		foreach ($候 in $进程快照) {
+			if ($候.Name -ne 'cmd.exe') { continue }
+			if ($候.CommandLine -notmatch 'vscode-linux-multi-line-command') { continue }
+			$宿主存活 = $false
+			$宿主Pid = 0
+			$游标 = $候
+			for ($代 = 0; $代 -lt 8; $代++) {
+				if ($null -eq $游标.ParentProcessId -or [int]$游标.ParentProcessId -le 4) { break }
+				if (-not $按Pid索引.ContainsKey([int]$游标.ParentProcessId)) { break }
+				$游标 = $按Pid索引[[int]$游标.ParentProcessId]
+				if ($游标.Name -match 'OpenConsole|conhost') { $宿主存活 = $true; $宿主Pid = [int]$游标.ProcessId; break }
+			}
+			if ($宿主存活) { continue }
+			& taskkill /PID $候.ProcessId /T /F 2>&1 | Out-Null
+			$死终端数++
+		}
+		if ($死终端数 -gt 0) {
+			Write-Output ('已清理死安装终端进程树 {0} 棵（超时放弃的残留，占据会话并拖慢后续连接）。' -f $死终端数)
+		}
+	} catch { }
 	$本地附加压缩包路径 = $null
 	$远程附加压缩包文件名 = $null
 

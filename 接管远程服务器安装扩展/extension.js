@@ -56,6 +56,11 @@ function 激活(context) {
 
 	// 启动时静默对齐一次：修补丢失的脚本与钩子，不打扰用户（需要决策的事项只留通知）
 	串行对齐(context, false);
+
+	// 安装命令未执行（窗口终端服务异常）自动检测：启动后立查一次，此后每 5 分钟复查（同一告警 30 分钟节流一次）
+	检测安装命令未执行(context);
+	const 检测定时器 = setInterval(() => 检测安装命令未执行(context), 5 * 60 * 1000);
+	context.subscriptions.push({ dispose: () => clearInterval(检测定时器) });
 }
 
 function 停用() { }
@@ -606,6 +611,118 @@ function 展开含通配的路径(模式) {
 
 function 取错误信息(错误) {
 	return 错误 instanceof Error ? 错误.message : String(错误);
+}
+
+// ===== 安装命令未执行的自动检测与自救 =====
+// 故障形态（实测，VS Code 窗口终端服务的上游缺陷）：某个窗口里 Remote-SSH 经终端下发的安装/升级命令既不执行也无回显——连接终端整段空白、被拉起的 ssh 进程根本未启动、窗口反复重连只反复超时；残留的死安装终端树会由接管安装的连接前清理自动扫掉，但终端服务状态在窗口进程内部，重载窗口不换它（终端持久化会重连旧 pty 宿主）、扩展 API 也无法重建，唯一有效恢复 = 新窗口重开远程。扩展负责把这条恢复路径自动化：检测特征（近 20 分钟的 Remote-SSH 日志里同名主机反复超时、且无真实网络/凭据层报错特征）→ 主动通知 → 一键在新窗口打开远程或关闭本窗口。
+const 状态键_终端失灵提示时刻 = '安装命令未执行提示时刻';
+let 终端失灵提示已弹 = false;
+
+function 检测安装命令未执行(context) {
+	if (终端失灵提示已弹) { return; }
+	try {
+		if (!取开关值()) { return; }
+		const 上次 = context.globalState.get(状态键_终端失灵提示时刻, 0);
+		if (Date.now() - 上次 < 30 * 60 * 1000) { return; } // 30 分钟内不重复打扰
+		const 名单 = [...new Set([...取主机清单设置(接管主机键), ...取主机清单设置(保活主机键)])];
+		if (名单.length === 0) { return; }
+		const 命中 = 找近期安装超时日志(名单);
+		if (!命中) { return; }
+		终端失灵提示已弹 = true;
+		context.globalState.update(状态键_终端失灵提示时刻, Date.now());
+		const 主机文本 = 命中.主机.length > 0 ? ('「' + 命中.主机.join('」「') + '」') : '接管主机';
+		vscode.window.showWarningMessage(
+			'接管远程服务器安装：Remote-SSH 连接反复超时（20 分钟内 ' + 命中.次数 + ' 次），且安装命令未在终端侧执行——本窗口的 VS Code 终端服务已异常（上游缺陷；残留进程树已自动清理，重载本窗口无效）。' + 主机文本 + '请在新窗口打开即可恢复。',
+			'在新窗口打开…', '关闭本窗口'
+		).then(选择 => {
+			if (选择 === '在新窗口打开…') {
+				在新窗口打开远程(命中.主机[0] || null, 名单).catch(错误 => {
+					vscode.window.showErrorMessage('接管远程服务器安装：新窗口打开失败：' + 取错误信息(错误));
+				});
+			} else if (选择 === '关闭本窗口') {
+				vscode.commands.executeCommand('workbench.action.closeWindow');
+			}
+		});
+	} catch (错误) {
+		console.error('[接管远程服务器安装] 安装命令未执行检测出错：' + 取错误信息(错误));
+	}
+}
+
+// 近 20 分钟内被改写的 Remote-SSH 输出日志中找「同名主机 ≥2 次连接超时且无网络/凭据层报错」的窗口
+function 找近期安装超时日志(名单) {
+	let 最佳 = null;
+	for (const 文件 of 列近期RemoteSshLog()) {
+		let 内容 = '';
+		try { 内容 = fs.readFileSync(文件, 'utf8'); } catch (e) { continue; }
+		// 真实网络/凭据故障自带明确报错特征，不属于终端服务异常，排除避免误报
+		if (/Permission denied|Connection refused|Connection closed by|Could not resolve hostname|Network is unreachable|No route to host|Connection timed out/i.test(内容)) { continue; }
+		const 次数 = (内容.match(/Connecting with SSH timed out|timed out after/gi) || []).length;
+		if (次数 < 2) { continue; }
+		const 主机 = 名单.filter(名 => {
+			const hex = Buffer.from(名, 'utf8').toString('hex');
+			return 内容.includes(hex) || 内容.includes(hex.toUpperCase()) || 内容.includes(名);
+		});
+		if (主机.length === 0) { continue; }
+		if (!最佳 || 次数 > 最佳.次数) { 最佳 = { 主机, 次数 }; }
+	}
+	return 最佳;
+}
+
+// 所有窗口的扩展输出日志都在 <数据目录>\logs\<会话>\window<N>\exthost\output_logging_*\ 下：由本窗口 logUri 反推到 logs 根，再取最近两个会话目录
+function 列近期RemoteSshLog() {
+	const 结果 = [];
+	const 根 = 找logs根目录();
+	if (!根) { return 结果; }
+	const 截点 = Date.now() - 20 * 60 * 1000;
+	let 会话;
+	try { 会话 = fs.readdirSync(根).filter(名 => /^\d{8}T\d{6}$/.test(名)).sort().reverse().slice(0, 2); } catch (e) { return 结果; }
+	for (const 会 of 会话) {
+		let 窗口目录;
+		try { 窗口目录 = fs.readdirSync(path.join(根, 会)).filter(名 => /^window\d+$/.test(名)); } catch (e) { continue; }
+		for (const 窗 of 窗口目录) {
+			const 扩展宿主目录 = path.join(根, 会, 窗, 'exthost');
+			let 输出目录;
+			try { 输出目录 = fs.readdirSync(扩展宿主目录).filter(名 => 名.startsWith('output_logging')); } catch (e) { continue; }
+			for (const 输 of 输出目录) {
+				let 文件;
+				try { 文件 = fs.readdirSync(path.join(扩展宿主目录, 输)).filter(名 => 名.endsWith('.log') && 名.includes('Remote - SSH')); } catch (e) { continue; }
+				for (const 文 of 文件) {
+					const 全路径 = path.join(扩展宿主目录, 输, 文);
+					try { if (fs.statSync(全路径).mtimeMs >= 截点) { 结果.push(全路径); } } catch (e) { }
+				}
+			}
+		}
+	}
+	return 结果;
+}
+
+function 找logs根目录() {
+	// 本窗口的 logUri 形如 .../logs/<会话>/window<N>/exthost/<扩展标识>/...，逐级上溯到 logs 目录
+	const 日志Uri = vscode.env.logUri;
+	if (日志Uri) {
+		let 目录 = 日志Uri.fsPath;
+		while (目录) {
+			if (path.basename(目录) === 'logs') { return 目录; }
+			const 上级 = path.dirname(目录);
+			if (上级 === 目录) { break; }
+			目录 = 上级;
+		}
+	}
+	// 兜底：按产品名拼常见数据目录
+	const 产品目录 = { 'Visual Studio Code': 'Code', 'Visual Studio Code - Insiders': 'Code - Insiders', 'Visual Studio Code - Exploration': 'Code - Exploration' }[vscode.env.appName];
+	if (产品目录 && process.env.APPDATA) { return path.join(process.env.APPDATA, 产品目录, 'logs'); }
+	return null;
+}
+
+async function 在新窗口打开远程(首选主机, 名单) {
+	let 主机 = 首选主机;
+	if (!主机) {
+		主机 = await vscode.window.showQuickPick(名单, { placeHolder: '选择要在新窗口打开的主机' });
+	}
+	if (!主机) { return; }
+	// Remote-SSH 的非 ASCII 主机 authority 采用 UTF-8 十六进制编码形态（与 code-insiders --remote ssh-remote+<hex> 实测一致）
+	const authority = 'ssh-remote+' + Buffer.from(主机, 'utf8').toString('hex');
+	await vscode.commands.executeCommand('vscode.open', vscode.Uri.parse('vscode-remote://' + authority + '/'));
 }
 
 module.exports = { activate: 激活, deactivate: 停用 };

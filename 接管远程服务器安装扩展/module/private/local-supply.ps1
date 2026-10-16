@@ -62,10 +62,12 @@ try {
 				}
 				# tar.gz：gzip 头魔数 1f 8b（拦 HTML 错误页、全零文件等）
 				return ($头[0] -eq 0x1F -and $头[1] -eq 0x8B)
-			} finally {
+			}
+			finally {
 				$流.Dispose()
 			}
-		} catch {
+		}
+		catch {
 			return $false
 		}
 	}
@@ -75,6 +77,16 @@ try {
 			return ('test -f {0}/{1}' -f $暂存目录, $取消标记名)
 		}
 		return (转换-远程PowerShell命令 ('if (Test-Path -LiteralPath "{0}\{1}") {{ exit 0 }} else {{ exit 1 }}' -f $远端暂存目录文本, $取消标记名))
+	}
+
+	function 下次汇报间隔($上次汇报间隔, $总计已用秒数, $已下载字节数, $预计总大小) {
+		# 自适应报告节奏：判据等价于「预计剩余时间 < 间隔逐级回落到 1 秒所需的总时长 上次汇报间隔*(上次汇报间隔-1)/2」，其中预计剩余时间 = 剩余字节 /（已下载字节数 / 总计已用秒数）；不足即收紧 1 秒、否则放宽 1 秒，切换点随实际速度浮动而非固定 2/3 进度；判据乘开避免除法，已下载 0 字节时恒判放宽，返回值下限 1 秒
+		if (($预计总大小 - $已下载字节数) * $总计已用秒数 * 2 -lt $上次汇报间隔 * ($上次汇报间隔 - 1) * $已下载字节数) {
+			return [Math]::Max(1, $上次汇报间隔 - 1)
+		}
+		else {
+			return $上次汇报间隔 + 1
+		}
 	}
 
 	# Linux：暂存目录的预清理/预建已由主流程在环境探测的同一条连接完成（残包与取消标记已清、目录已建，
@@ -94,6 +106,8 @@ try {
 	$重试次数 = 0
 	# 报告周期在重试循环外初始化：断点续传时继承上一段的周期，不从 1 秒重新开始
 	$报告周期秒数 = 1
+	# 总计已用秒数的计时起点同样在重试循环外：估算平均速度 = 已下载字节数 / 总计已用秒数
+	$下载起始时刻 = Get-Date
 	while ($true) {
 		$重试次数++
 		$已存在字节数 = 0
@@ -112,7 +126,8 @@ try {
 			$期望长度 = if ($响应.ContentLength -ge 0) { $已存在字节数 + $响应.ContentLength } else { -1 }
 			if ($状态码 -eq 206) {
 				$文件流 = [System.IO.File]::Open($本地包路径, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write)
-			} else {
+			}
+			else {
 				$文件流 = [System.IO.File]::Open($本地包路径, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
 				$已存在字节数 = 0
 			}
@@ -127,10 +142,11 @@ try {
 				if (($此刻 - $上次进度输出).TotalSeconds -ge $报告周期秒数) {
 					$上次进度输出 = $此刻
 					Write-Output ('本地下载进度：{0} / {1} 字节。' -f $已下载, $(if ($期望长度 -gt 0) { $期望长度 } else { '未知' }))
-					# 报告周期同款自适应：进度不足 2/3 时每周期加 1 秒，超过 2/3 后每周期减 1 秒（下限 1 秒）；总大小未知时按未达 2/3 处理递增周期
-					if ($期望长度 -gt 0 -and $已下载 * 3 -gt $期望长度 * 2) {
-						if ($报告周期秒数 -gt 1) { $报告周期秒数-- }
-					} else {
+					# 报告周期自适应（见 下次汇报间隔）：按预计剩余时间决定收紧或放宽；总大小未知时无法估算剩余时间，只增不减
+					if ($期望长度 -gt 0) {
+						$报告周期秒数 = 下次汇报间隔 $报告周期秒数 ($此刻 - $下载起始时刻).TotalSeconds $已下载 $期望长度
+					}
+					else {
 						$报告周期秒数++
 					}
 				}
@@ -150,7 +166,8 @@ try {
 			}
 			Write-Output ('本地下载完成：共 {0} 字节。' -f $已下载)
 			break
-		} catch {
+		}
+		catch {
 			# 416 = 请求区间无效：断点续传起点已不小于服务器完整大小，说明本地文件早已下载完整（如实测 231MB 包上次运行被击杀后残留），视为成功退出重试循环。
 			# PS 5.1 中 GetResponse 抛出的 $_.Exception 常是 MethodInvocationException 包装（实测取不到状态码），真正的 WebException 在 InnerException 里，须遍历异常链
 			$HTTP状态码 = 0
@@ -171,7 +188,8 @@ try {
 			$等待秒数 = [Math]::Min(30, $重试次数 * 2)
 			Write-Output ('下载中断（{0}），{1} 秒后重试（第 {2} 次，已续传 {3} 字节）...' -f $_.Exception.Message, $等待秒数, $重试次数, $已存在字节数)
 			Start-Sleep -Seconds $等待秒数
-		} finally {
+		}
+		finally {
 			if ($null -ne $文件流) { $文件流.Dispose() }
 			if ($null -ne $响应流) { $响应流.Dispose() }
 			if ($null -ne $响应) { $响应.Close() }
@@ -202,7 +220,8 @@ try {
 	$本地大小 = (Get-Item -LiteralPath $本地包路径).Length
 	if ($系统类型 -eq 'Linux') {
 		$核对命令 = ('stat -c %s {0}/{1}.uploading' -f $暂存目录, $远程包名)
-	} else {
+	}
+ else {
 		$核对命令 = 转换-远程PowerShell命令 ('[long](Get-Item -LiteralPath "{0}\{1}.uploading").Length' -f $远端暂存目录文本, $远程包名)
 	}
 	$核对结果 = 调用-远程命令 $核对命令
@@ -218,18 +237,22 @@ try {
 	if ($系统类型 -eq 'Linux') {
 		# gzip -t 把关：远端完整解压测试通过才改名写标记（tar.gz 的截断无法靠魔数检出，交给 gzip -t 一票否决）
 		$改名命令 = ("sh -c 'if [ -f {0}/{3} ]; then exit 2; fi; gzip -t {0}/{1}.uploading && mv {0}/{1}.uploading {0}/{1} && touch {0}/{2}'" -f $暂存目录, $远程包名, $完成标记名, $取消标记名)
-	} else {
+	}
+ else {
 		$改名脚本 = ('if (Test-Path -LiteralPath "{0}\{3}") {{ exit 2 }}; try {{ Move-Item -LiteralPath "{0}\{1}.uploading" -Destination "{0}\{1}" -Force -ErrorAction Stop; New-Item -ItemType File -Force "{0}\{2}" -ErrorAction Stop | Out-Null }} catch {{ Write-Output $_.Exception.Message; exit 1 }}' -f $远端暂存目录文本, $远程包名, $完成标记名, $取消标记名)
 		$改名命令 = 转换-远程PowerShell命令 $改名脚本
 	}
 	$改名结果 = 调用-远程命令 $改名命令
 	if ($改名结果.退出码 -eq 0) {
 		Write-Output '本地供给完成：包已就位并写入完成标记。'
-	} elseif ($改名结果.退出码 -eq 2) {
+	}
+ elseif ($改名结果.退出码 -eq 2) {
 		Write-Output '远程侧已获胜，本地供给取消（改名前）。'
-	} else {
+	}
+ else {
 		Write-Output ('改名/标记命令失败（退出码 {0}），远端报错：{1}，远程将继续自下载。' -f $改名结果.退出码, $(if ([string]::IsNullOrWhiteSpace($改名结果.输出)) { '无' } else { $改名结果.输出 }))
 	}
-} catch {
+}
+catch {
 	Write-Output ('本地供给任务异常终止: {0}' -f $_.Exception.Message)
 }

@@ -203,7 +203,7 @@ function 竞速-单个产物 {
 
 	$等待秒数 = 0
 	$获胜方 = $null
-	# 竞速等待心跳的报告周期同款自适应：进度不足 2/3 时每周期加 1 秒，超过 2/3 后每周期减 1 秒（下限 1 秒）；心跳没有产物总大小可比对，按未达 2/3 处理只增不减
+	# 竞速等待心跳没有产物总大小可比对，无法估算剩余时间，报告周期只增不减（每个周期比上个周期多 1 秒）
 	$报告周期秒数 = 1
 	$下次报告秒数 = $报告周期秒数
 	while ($true) {
@@ -273,11 +273,24 @@ function 通过HTTP断点续传下载 {
 		[string]$目标路径
 	)
 
+	# 本函数的函数体会被整段文本化送进后台下载作业重新定义（见 $下载函数文本），故自适应函数必须内嵌在函数体内随行，不能依赖外部定义
+	function 下次汇报间隔($上次汇报间隔, $总计已用秒数, $已下载字节数, $预计总大小) {
+		# 自适应报告节奏：判据等价于「预计剩余时间 < 间隔逐级回落到 1 秒所需的总时长 上次汇报间隔*(上次汇报间隔-1)/2」，其中预计剩余时间 = 剩余字节 /（已下载字节数 / 总计已用秒数）；不足即收紧 1 秒、否则放宽 1 秒，切换点随实际速度浮动而非固定 2/3 进度；判据乘开避免除法，已下载 0 字节时恒判放宽，返回值下限 1 秒
+		if (($预计总大小 - $已下载字节数) * $总计已用秒数 * 2 -lt $上次汇报间隔 * ($上次汇报间隔 - 1) * $已下载字节数) {
+			return [Math]::Max(1, $上次汇报间隔 - 1)
+		}
+		else {
+			return $上次汇报间隔 + 1
+		}
+	}
+
 	# 基于 HTTP Range 头的断点续传：本地已存在部分文件时从偏移处继续。
 	# 不限重试次数与总时长，失败等待秒数逐次递增（1秒、2秒、3秒……），所有输出带时间戳。
 	# 报告周期在重试循环外初始化：断点续传时继承上一段的周期，不从 1 秒重新开始
 	$重试次数 = 0
 	$报告周期秒数 = 1
+	# 总计已用秒数的计时起点同样在重试循环外：估算平均速度 = 已下载字节数 / 总计已用秒数
+	$下载起始时刻 = Get-Date
 	while ($true) {
 		$重试次数++
 		$已存在字节数 = 0
@@ -322,7 +335,7 @@ function 通过HTTP断点续传下载 {
 				$缓冲区 = New-Object byte[] 65536
 				$已写入字节数 = 0
 				$上次报告时间 = [datetime]::MinValue
-				# 报告周期沿用外层变量：进度不足 2/3 时每个周期比上个周期多 1 秒，超过 2/3 后每个周期比上个周期少 1 秒，不低于 1 秒；断点续传不重置
+				# 报告周期沿用外层变量且断点续传不重置；疏密由 下次汇报间隔 按预计剩余时间自动决定，下限 1 秒
 				while ($true) {
 					$读取字节数 = $响应流.Read($缓冲区, 0, $缓冲区.Length)
 					if ($读取字节数 -le 0) { break }
@@ -336,15 +349,11 @@ function 通过HTTP断点续传下载 {
 						if ($内容总长度 -gt 0) {
 							$进度 = [math]::Round(($已传总字节数 * 100.0) / $内容总长度, 1)
 							Write-Host ('[{0}] 状态: Transferring | 进度: {1}% | {2} / {3} 字节' -f ($当前时间.ToString('HH:mm:ss')), $进度, $已传总字节数, $内容总长度)
-							# 按当前进度决定下个周期：不足 2/3 递增，超过 2/3 递减（下限 1 秒）
-							if ($已传总字节数 * 3 -gt $内容总长度 * 2) {
-								if ($报告周期秒数 -gt 1) { $报告周期秒数-- }
-							} else {
-								$报告周期秒数++
-							}
+							# 报告周期自适应（见 下次汇报间隔）：按预计剩余时间决定收紧或放宽
+							$报告周期秒数 = 下次汇报间隔 $报告周期秒数 ($当前时间 - $下载起始时刻).TotalSeconds $已传总字节数 $内容总长度
 						} else {
 							Write-Host ('[{0}] 状态: Transferring | 已传: {1} 字节' -f ($当前时间.ToString('HH:mm:ss')), $已传总字节数)
-							# 总大小未知时无法计算进度比例，按未达 2/3 处理递增周期
+							# 总大小未知时无法估算剩余时间，只增不减
 							$报告周期秒数++
 						}
 					}
@@ -470,19 +479,65 @@ $发布通道 = '__发布通道__'
 # 守卫把「无命令行参数的管道会话」（裸 powershell 被整本喂脚本的形态）转为非交互整本执行，输出只剩脚本本身的少量关键行，一次冲刷即达；带参数/命令的会话与交互登录不受影响，本模块自身的 -EncodedCommand 会话也不受影响。经 stdin 管道喂给守卫自身即可执行修复脚本（守卫即执行通道）；修复/部署脚本的标识符必须用 ASCII（控制台输入按 GBK 解码，中文标识符会被毁）。
 $守卫块 = @'
 
-# Remote-SSH 管道执行守卫（幂等，勿手改本块）：stdin 是管道且进程无命令行参数 = 有程序把整本脚本喂给裸 REPL 执行（带参数/命令的会话照常执行，不拦截）。
-# 交互式回显/提示符会让输出膨胀且滞留在管道渲染段（连接端等不到握手标记只能超时），这里转为非交互整本执行，输出只留脚本本身的少量关键行。
+$守卫标记 = 'Remote-SSH 管道执行守卫 v3' # 幂等标记与版本号（勿删本行）：标记必须留在代码行尾注释里（整行注释会被载荷的去注释步骤剥掉，标记丢失会导致每连一次就重贴一份守卫）
+# stdin 是管道且进程无命令行参数 = 有程序把整本脚本喂给裸 REPL 执行（带参数/命令的会话照常执行，不拦截）。
+# 分块即读即执行、绝不等 EOF：实测管道 EOF 在终端场景下经常不来，等 EOF 的旧守卫会永久卡在 ReadToEnd（追踪只有 GUARD_START 没有 STDIN_BYTES）；逐行累积、能解析就立即点执行，脚本跑到哪算哪；非交互执行让输出只剩脚本本身的少量关键行，不再有回显/提示符膨胀滞留问题。
 if ([Console]::IsInputRedirected -and ([Environment]::GetCommandLineArgs().Count -eq 1)) {
-	$stdinScriptText = [Console]::In.ReadToEnd()
-	try { & ([scriptblock]::Create($stdinScriptText)) } catch { Write-Output ('脚本异常: {0}' -f $_.Exception.Message) }
+	$缓冲 = New-Object System.Text.StringBuilder
+	while ($true) {
+		$行文本 = [Console]::In.ReadLine()
+		if ($null -eq $行文本) { break }
+		[void]$缓冲.AppendLine($行文本)
+		try { $块 = [scriptblock]::Create($缓冲.ToString()) } catch { continue }
+		[void]$缓冲.Clear()
+		try { . $块 } catch { Write-Output ('脚本异常: {0}' -f $_.Exception.Message) }
+	}
+	if ($缓冲.Length -gt 0) {
+		try { . ([scriptblock]::Create($缓冲.ToString())) } catch { Write-Output ('脚本异常: {0}' -f $_.Exception.Message) }
+	}
 	exit
 }
+$守卫结束 = 1 # 守卫块结束标记（勿删本行）
 '@
 $守卫路径 = Join-Path $env:USERPROFILE 'Documents\WindowsPowerShell\profile.ps1'
 $守卫现状 = if (Test-Path -LiteralPath $守卫路径) { [System.IO.File]::ReadAllText($守卫路径) } else { '' }
-if ($守卫现状 -notmatch 'Remote-SSH 管道执行守卫') {
+if ($守卫现状 -notmatch "管道执行守卫 v3'") {
+	# 先剥离旧版守卫块再贴新版：守卫总是追加在文件末尾，从首个守卫特征行截到文件尾即可；旧块若留在前面会先于新版触发并永久卡死（等 EOF 的旧 ReadToEnd）
+	$截断位置 = -1
+	foreach ($特征 in @('$守卫标记 = ''Remote-SSH 管道执行守卫', '# Remote-SSH 管道执行守卫', '$stdinScriptText', '[Console]::IsInputRedirected')) {
+		$位置 = $守卫现状.IndexOf($特征)
+		if ($位置 -ge 0 -and ($截断位置 -lt 0 -or $位置 -lt $截断位置)) { $截断位置 = $位置 }
+	}
+	if ($截断位置 -eq 0) { $守卫现状 = '' }
+	elseif ($截断位置 -gt 0) { $守卫现状 = $守卫现状.Substring(0, $截断位置) }
 	New-Item -ItemType Directory -Force -Path (Split-Path $守卫路径) | Out-Null
 	[System.IO.File]::WriteAllText($守卫路径, ($守卫现状 + $守卫块), (New-Object System.Text.UTF8Encoding($true)))
+}
+
+# ===== 僵尸会话自动清理：断线/失败的连接在 Windows 上会留下孤儿 powershell（sshd 会话已死但进程不随死），每个占一个控制台会话，累积后会拖慢新连接的输出投递（实测同一条连接命令，干净时 0.3 秒出首字节、僵尸成堆时 100+ 秒）。判据只看祖先链：向上 12 代找不到 sshd（实际进程名是 sshd.exe，必须用前缀匹配）= 整条会话已死的孤儿；命令行形态不作判据（实测孤儿有三种形态：裸 REPL、sftp 子系统外层壳、命令会话外层壳）；活动连接的会话进程（祖先链里有存活 sshd）与新启动进程（5 分钟内）一概不碰。
+$全进程表 = @{}
+foreach ($项 in (Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
+	$全进程表[[int]$项.ProcessId] = $项
+}
+$僵尸数 = 0
+foreach ($候 in $全进程表.Values) {
+	if ($候.Name -ne 'powershell.exe') { continue }
+	if (((Get-Date) - $候.CreationDate).TotalMinutes -lt 5) { continue }
+	$祖先有sshd = $false
+	$游标 = $候
+	for ($i = 0; $i -lt 12; $i++) {
+		if ($null -eq $游标.ParentProcessId -or $游标.ParentProcessId -eq 0) { break }
+		$父 = $全进程表[[int]$游标.ParentProcessId]
+		if ($null -eq $父) { break }
+		if ($父.Name -like 'sshd*') { $祖先有sshd = $true; break }
+		$游标 = $父
+	}
+	if (-not $祖先有sshd) {
+		try { Stop-Process -Id $候.ProcessId -Force -ErrorAction Stop; $僵尸数++ } catch { }
+	}
+}
+if ($僵尸数 -gt 0) {
+	Write-Output ('已清理僵尸会话 {0} 个，后续连接的输出投递不再被拖慢。' -f $僵尸数)
 }
 
 # 竞速暂存目录：本地模块与远程脚本约定在同一目录交换压缩包与标记文件；空串表示未启用竞速，回退远程单独下载
