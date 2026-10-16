@@ -121,6 +121,10 @@ function 取钩子全局值() {
 	return 详情 ? 详情.globalValue : undefined;
 }
 
+async function 写钩子全局值(值) {
+	await vscode.workspace.getConfiguration().update(钩子设置键, 值, vscode.ConfigurationTarget.Global);
+}
+
 // 执行接管：为勾选的主机生成薄脚本并让 remote.SSH.preconnect 指向它们，替换 Remote-SSH 自带安装；两份清单都为空时整体还原
 async function 执行接管(context, 交互) {
 	// 取代的对象是 Remote-SSH 的安装步骤，Remote-SSH 不在场时其设置项未注册，VS Code 会拒绝写入 remote.SSH.preconnect
