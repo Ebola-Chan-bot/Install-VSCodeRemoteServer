@@ -1379,7 +1379,7 @@ function 安装-VSCode远程服务 {
 				& $落盘 'vsi-stage-install.sh' $安装脚本文本
 			}
 			if ($需要sysroot阶段) {
-				& $落盘 'vsi-stage-native.sh' $script:脚本_原生组件补丁
+				& $落盘 'vsi-stage-native.sh' ($script:脚本_原生组件补丁.Replace('__提交号__', $提交号).Replace('__发布通道__', $发布通道))
 				& $落盘 'vsi-stage-sysroot.sh' ($script:脚本_sysroot部署.Replace('__目录__', $兼容性目录))
 				# sysroot 工具包（glibc/libstdc++/libgcc 的 rpm 与 patchelf 压缩包）带 bundle- 前缀随批上传，编排脚本按原名归位到 .stage 供部署脚本解包
 				$缓存目录 = 下载-兼容性工具包
@@ -1724,11 +1724,13 @@ function 安装-VSCode远程服务 {
 	}
 
 	$连接目标 = 取-SSH连接目标 -主机 $远程主机 -账户 $远程账户
-	# ===== 本地孤儿会话清理：断线/失败的连接留下的 ssh/scp/cmd 孤儿（父进程已死）仍持有远程会话，是远端僵尸会话的源头；只清引用本主机且父进程已死的，活动连接（父进程存活）一概不碰
+	# ===== 本地孤儿会话清理：断线/失败的连接留下的 ssh/scp/cmd 孤儿（父进程已死）仍持有远程会话，是远端僵尸会话的源头；只清引用本主机、本 Windows 会话且父进程已死的，活动连接（父进程存活）与其它登录会话一概不碰
+	$本会话ID = [int](Get-Process -Id $PID).SessionId
 	try {
 		$孤儿数 = 0
 		foreach ($候 in @(Get-CimInstance Win32_Process -Filter "Name = 'ssh.exe' or Name = 'scp.exe' or Name = 'cmd.exe'" -ErrorAction SilentlyContinue)) {
 			if ($候.CommandLine -notmatch [regex]::Escape($远程主机)) { continue }
+			if ($null -ne $候.SessionId -and [int]$候.SessionId -ne $本会话ID) { continue }
 			if ($null -ne (Get-Process -Id $候.ParentProcessId -ErrorAction SilentlyContinue)) { continue }
 			try { Stop-Process -Id $候.ProcessId -Force -ErrorAction Stop; $孤儿数++ } catch { }
 		}
@@ -1736,7 +1738,7 @@ function 安装-VSCode远程服务 {
 			Write-Output ('已清理本地孤儿连接进程 {0} 个（断线残留，仍持有远程会话）。' -f $孤儿数)
 		}
 	} catch { }
-	# ===== 死安装终端清理：Remote-SSH 在隐藏终端里跑安装脚本，连接超时放弃/窗口异常后终端的 pty 宿主先死，cmd（连带内层 cmd 与 ssh 子树）成为孤儿挂在死管道上——仍占控制台会话、仍握着已放弃的远程会话隧道，残留累积会拖垮后续连接的输出投递（实测同窗口残留累积后新连接的安装命令根本不被执行、终端一个字节都不上屏）。判据 = 命令行带安装终端特征（vscode-linux-multi-line-command）且向上 8 代祖先链找不到存活的 OpenConsole/conhost 宿主（存活安装终端必有宿主在侧且由 Remote-SSH 自我管理，一概不碰）；整树击杀（taskkill /T 连带内层 cmd/ssh），pty 宿主若侥幸存活一并杀。
+	# ===== 死安装终端清理：Remote-SSH 在隐藏终端里跑安装脚本，连接超时放弃/窗口异常后终端的 pty 宿主先死，cmd（连带内层 cmd 与 ssh 子树）成为孤儿挂在死管道上——仍占控制台会话、仍握着已放弃的远程会话隧道，残留累积会拖垮后续连接的输出投递（实测同窗口残留累积后新连接的安装命令根本不被执行、终端一个字节都不上屏）。判据三重全满足才杀：①命令行带安装终端特征（vscode-linux-multi-line-command）；②仅限本 Windows 会话内的候选；③直系父进程已死且向上 8 代祖先链找不到任何存活终端宿主。宿主名单必须含 VS Code 窗口/pty 宿主进程（^Code/VSCodium）：实测存活终端的进程链是 cmd ← Code(pty宿主) ← Code(窗口)，conhost/OpenConsole 是旁挂兄弟而非祖先，旧判据只认 conhost 会把一切存活安装终端（含其它窗口正在跑的）误判成孤儿整树杀掉、对方窗口弹“终端进程已终止”；现在凡有存活宿主或存活父进程在侧的一概不碰，只有窗口已亡的无主孤儿才清。
 	try {
 		$进程快照 = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
 		$按Pid索引 = @{}
@@ -1745,14 +1747,15 @@ function 安装-VSCode远程服务 {
 		foreach ($候 in $进程快照) {
 			if ($候.Name -ne 'cmd.exe') { continue }
 			if ($候.CommandLine -notmatch 'vscode-linux-multi-line-command') { continue }
+			if ($null -ne $候.SessionId -and [int]$候.SessionId -ne $本会话ID) { continue }
+			if ($null -ne (Get-Process -Id $候.ParentProcessId -ErrorAction SilentlyContinue)) { continue }
 			$宿主存活 = $false
-			$宿主Pid = 0
 			$游标 = $候
 			for ($代 = 0; $代 -lt 8; $代++) {
 				if ($null -eq $游标.ParentProcessId -or [int]$游标.ParentProcessId -le 4) { break }
 				if (-not $按Pid索引.ContainsKey([int]$游标.ParentProcessId)) { break }
 				$游标 = $按Pid索引[[int]$游标.ParentProcessId]
-				if ($游标.Name -match 'OpenConsole|conhost') { $宿主存活 = $true; $宿主Pid = [int]$游标.ProcessId; break }
+				if ($游标.Name -match 'OpenConsole|conhost|winpty-agent|VSCodium|^Code') { $宿主存活 = $true; break }
 			}
 			if ($宿主存活) { continue }
 			& taskkill /PID $候.ProcessId /T /F 2>&1 | Out-Null

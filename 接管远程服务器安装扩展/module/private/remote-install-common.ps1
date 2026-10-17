@@ -203,20 +203,20 @@ function 竞速-单个产物 {
 
 	$等待秒数 = 0
 	$获胜方 = $null
-	# 竞速等待心跳没有产物总大小可比对，无法估算剩余时间，报告周期只增不减（每个周期比上个周期多 1 秒）
+	# 竞速心跳并入远程下载进度句式（无产物总大小可比对，只报已传字节数），报告周期只增不减（每个周期比上个周期多 1 秒）
 	$报告周期秒数 = 1
 	$下次报告秒数 = $报告周期秒数
 	while ($true) {
 		if (Test-Path -LiteralPath $远程完成标记) { $获胜方 = '远程自下载'; break }
 		if (Test-Path -LiteralPath $本地完成标记) { $获胜方 = '本地供给'; break }
 		# 流式转发后台作业的输出（下载进度/重试消息）
-		Receive-Job -Job $下载作业 | ForEach-Object { Write-Host ('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $_) }
+		Receive-Job -Job $下载作业 | ForEach-Object { Write-Host ('{0}' -f $_) }
 		Start-Sleep -Seconds 1
 		$等待秒数++
 		if ($等待秒数 -ge $下次报告秒数) {
 			$远程字节 = 0
 			if (Test-Path -LiteralPath $远程包路径) { $远程字节 = (Get-Item -LiteralPath $远程包路径).Length }
-			Write-Host ('[{0}] {1} 竞速等待 {2}s：远程侧已下载 {3} 字节。' -f (Get-Date -Format 'HH:mm:ss'), $产物名, $等待秒数, $远程字节)
+			Write-Host ('远程下载进度：已传 {0} 字节（竞速等待 {1}s）' -f $远程字节, $等待秒数)
 			$报告周期秒数++
 			$下次报告秒数 = $等待秒数 + $报告周期秒数
 		}
@@ -225,7 +225,7 @@ function 竞速-单个产物 {
 	# 胜负已定：写该产物的取消标记让本地供给任务停止该产物的后续动作，并终止远程后台下载
 	New-Item -ItemType File -Force $本地取消标记 | Out-Null
 	Stop-Job -Job $下载作业 -ErrorAction SilentlyContinue
-	Receive-Job -Job $下载作业 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $_) }
+	Receive-Job -Job $下载作业 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ('{0}' -f $_) }
 	Remove-Job -Job $下载作业 -Force -ErrorAction SilentlyContinue
 
 	$获胜包路径 = if ($获胜方 -eq '本地供给') { $本地包路径 } else { $远程包路径 }
@@ -263,6 +263,45 @@ function 停止-占用安装目录的进程 {
 		try {
 			Stop-Process -Id $进程.ProcessId -Force -ErrorAction SilentlyContinue
 		} catch {
+		}
+	}
+}
+
+function 清理-历史版本服务端 {
+	param(
+		[string]$版本提交号
+	)
+
+	# 历史版本回收：客户端只认自己提交号的 server，更新后的客户端不会回头调用旧版本，旧版本留着只吃磁盘（每套约 250MB）。
+	# 保留三类：本次提交号的版本、有进程正在使用的版本（命令行含该版本提交号，可能是活会话或保活 daemon）、按目录修改时间最新的 5 个（多台机器/回滚场景的缓冲，与官方启动入口 GC 的保留量一致）；其余一律删除。
+	# 目录修改时间当作最后使用时间，每次连接把当前版本目录刷新为此刻；Stable 与 Insiders 两棵数据目录同规则各清各的。
+	$全部命令行 = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object { $_.CommandLine })
+	foreach ($数据目录 in @((Join-Path $HOME '.vscode-server'), (Join-Path $HOME '.vscode-server-insiders'))) {
+		if (-not (Test-Path -LiteralPath $数据目录)) { continue }
+		$候选 = @()
+		foreach ($根 in @((Join-Path $数据目录 'cli\servers'), (Join-Path $数据目录 'bin'))) {
+			if (-not (Test-Path -LiteralPath $根)) { continue }
+			$候选 += @(Get-ChildItem -LiteralPath $根 -Directory -ErrorAction SilentlyContinue)
+		}
+		$名次 = 0
+		foreach ($版本目录 in @($候选 | Sort-Object LastWriteTime -Descending)) {
+			$版本提交号段 = if ($版本目录.Name -match '^[0-9a-fA-F]{40}$') { $版本目录.Name } else { ($版本目录.Name -split '-', 2)[-1] }
+			if ($版本提交号段 -notmatch '^[0-9a-fA-F]{40}$') { continue }
+			if ($版本提交号段 -eq $版本提交号) {
+				$版本目录.LastWriteTime = Get-Date
+				continue
+			}
+			$在用 = $false
+			foreach ($命令行 in $全部命令行) {
+				if ($命令行 -and $命令行.Contains($版本提交号段)) { $在用 = $true; break }
+			}
+			if ($在用) { continue }
+			$名次++
+			if ($名次 -le 5) { continue }
+			Remove-Item -LiteralPath $版本目录.FullName -Recurse -Force -ErrorAction SilentlyContinue
+			if (-not (Test-Path -LiteralPath $版本目录.FullName)) {
+				Write-Host ('[{0}] 已清理历史版本服务端: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $版本目录.Name)
+			}
 		}
 	}
 }
@@ -346,13 +385,14 @@ function 通过HTTP断点续传下载 {
 					if (($当前时间 - $上次报告时间).TotalSeconds -ge $报告周期秒数) {
 						$上次报告时间 = $当前时间
 						$已传总字节数 = $已存在字节数 + $已写入字节数
+						# 进度行只有远程/本地两种句式且不带内嵌时间戳：批量补刷后外层显示时刻与实际发生时刻一致，内嵌远端时钟只会与外层本地时钟打架
 						if ($内容总长度 -gt 0) {
 							$进度 = [math]::Round(($已传总字节数 * 100.0) / $内容总长度, 1)
-							Write-Host ('[{0}] 状态: Transferring | 进度: {1}% | {2} / {3} 字节' -f ($当前时间.ToString('HH:mm:ss')), $进度, $已传总字节数, $内容总长度)
+							Write-Host ('远程下载进度：{0} / {1} 字节（{2}%）' -f $已传总字节数, $内容总长度, $进度)
 							# 报告周期自适应（见 下次汇报间隔）：按预计剩余时间决定收紧或放宽
 							$报告周期秒数 = 下次汇报间隔 $报告周期秒数 ($当前时间 - $下载起始时刻).TotalSeconds $已传总字节数 $内容总长度
 						} else {
-							Write-Host ('[{0}] 状态: Transferring | 已传: {1} 字节' -f ($当前时间.ToString('HH:mm:ss')), $已传总字节数)
+							Write-Host ('远程下载进度：已传 {0} 字节' -f $已传总字节数)
 							# 总大小未知时无法估算剩余时间，只增不减
 							$报告周期秒数++
 						}
@@ -560,6 +600,9 @@ Write-Host ('发布通道: {0}' -f $发布通道)
 Write-Host ('自动检测到的系统架构: {0}' -f $系统架构)
 Write-Host ('自动检测到的安装目录: {0}' -f $最终安装目录)
 Write-Host ('下载地址: {0}' -f $下载地址)
+
+# ===== 历史版本回收：每次连接顺手清旧版（先于下载，磁盘紧张时先腾地方） =====
+清理-历史版本服务端 -版本提交号 $提交号
 
 # ===== 判定待装产物：已就位的产物不参与竞速，避免无谓的下载与上传 =====
 $CLI已就位 = Test-Path -LiteralPath $CLI信息.落地路径

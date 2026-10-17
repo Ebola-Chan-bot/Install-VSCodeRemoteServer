@@ -6,6 +6,20 @@
 # 脚本自带安全机制：原件备份（.orig.bak 仅保留首次）、在临时副本上 patch、patch 后实际加载验证，通过才原子替换，失败保留原文件并告警；对已补丁文件幂等跳过，对验证失败且未变化的文件记台账跳过重试（每次连接都会跑本工序，失败件徒劳重试既慢又刷屏）。
 set -eu
 
+# ===== 由主模块替换的参数 =====
+COMMIT='__提交号__'
+CHANNEL='__发布通道__'
+
+# 只补丁当前连接客户端用得到的组件：当前提交号的 server（vsce-sign 与内置扩展的 .node）+ 共享扩展目录（用户扩展的 .node）+ 当前提交号的旧 bin 布局（若在）。历史版本是别的客户端的"当前版"，由它们自己的连接补丁，这里一概不碰——逐个扫历史版本既拖慢每次连接又刷屏。
+if [ "$CHANNEL" = 'insider' ]; then
+	DATA_DIR="$HOME/.vscode-server-insiders"
+	QUALITY='Insiders'
+else
+	DATA_DIR="$HOME/.vscode-server"
+	QUALITY='Stable'
+fi
+CURRENT_SERVER="$DATA_DIR/cli/servers/$QUALITY-$COMMIT/server"
+
 LINKER=${VSCODE_SERVER_CUSTOM_GLIBC_LINKER:-}
 LIBDIR=${VSCODE_SERVER_CUSTOM_GLIBC_PATH:-}
 PATCHELF=${VSCODE_SERVER_PATCHELF_PATH:-}
@@ -167,7 +181,8 @@ patch_node() {
 
 LIST="$HOME/.vscode-native-patch-list.$$"
 trap 'rm -f "$LIST" "$FAILBOOK.$$"' EXIT
-FALLBACK_NODE=$(find "$HOME"/.vscode-server* -name node -type f -perm -u+x 2>/dev/null | head -1 || true)
+# 验证用 node 只认当前版本自带的（ABI 必须与加载方一致），不再从历史版本里随便捡一个
+FALLBACK_NODE=$(find "$CURRENT_SERVER" "$DATA_DIR/bin/$COMMIT" -name node -type f -perm -u+x 2>/dev/null | head -1 || true)
 
 # 预检：得到一个可直接运行的 node 用于 dlopen 验证（起不来的按官方两步补上）。补丁失败且连 loader 都跑不起来（如远程内核低于 glibc 2.28 要求的 3.2 时 loader 报 FATAL: kernel too old）则所有 dlopen 验证必然全军覆没，一条报错说清并整体退出，不逐文件刷"验证失败"误导排障
 if [ -n "${FALLBACK_NODE:-}" ]; then
@@ -191,7 +206,7 @@ FAILED=0
 DEFERRED=0
 SKIPPED=0
 LAST_UNREADY_NODE=''
-for DIR in "$HOME"/.vscode-server*; do
+for DIR in "$CURRENT_SERVER" "$DATA_DIR/bin/$COMMIT" "$DATA_DIR/extensions"; do
 	[ -d "$DIR" ] || continue
 	find "$DIR" \( -path '*/@vscode/vsce-sign/bin/vsce-sign' -o -name '*.node' \) -type f 2>/dev/null > "$LIST" || true
 	while IFS= read -r V; do

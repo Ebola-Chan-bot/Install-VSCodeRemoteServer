@@ -85,7 +85,8 @@ download_file() {
 	url="$1"
 	output="$2"
 	if [ "$DOWNLOADER" = 'curl' ]; then
-		curl -fL --connect-timeout 30 -o "$output" "$url"
+		# curl 默认往 stderr 打英文进度条（回车刷屏文案），会污染输出流；-s 静音进度条、-S 仍显示错误
+		curl -fsSL --connect-timeout 30 -o "$output" "$url"
 	else
 		wget -q -O "$output" "$url"
 	fi
@@ -212,7 +213,8 @@ race_artifact() {
 				if [ -f "$2" ]; then
 					RSIZE=$(wc -c < "$2" 2>/dev/null | tr -d ' ')
 				fi
-				log "$1 竞速等待 ${ELAPSED}s：远程侧已下载 ${RSIZE} 字节。"
+				# 心跳并入远程下载进度句式（无产物总大小可比对，只报已传字节数）；进度行不带内嵌时间戳，故不经 log 前缀
+				echo "远程下载进度：已传 ${RSIZE} 字节（竞速等待 ${ELAPSED}s）"
 			else
 				log "$1 竞速等待 ${ELAPSED}s：远程侧不参与下载，等待本地供给。"
 			fi
@@ -287,6 +289,46 @@ install_cli() {
 	done
 }
 
+# ===== 历史版本回收（每次连接顺手做）：客户端只认自己提交号的 server，更新后的客户端不会回头调用旧版本，旧版本留着只吃磁盘（每套约 250MB） =====
+# 保留三类：本次提交号的版本、有进程正在使用的版本（命令行含该版本提交号，可能是活会话或保活 daemon）、按目录修改时间最新的 5 个（多台机器/回滚场景的缓冲，与官方启动入口 GC 的保留量一致）；其余一律删除。
+# 目录修改时间当作最后使用时间，每次连接把当前版本目录 touch 成此刻；Stable 与 Insiders 是两个客户端各自的领地，两棵数据目录同规则各清各的。
+cleanup_old_versions() {
+	for DATA_ROOT in "$HOME/.vscode-server" "$HOME/.vscode-server-insiders"; do
+		[ -d "$DATA_ROOT" ] || continue
+		LIST_TMP="$DATA_ROOT/.vsi-gc-list.$$"
+		rm -f "$DATA_ROOT"/.vsi-gc-list.* 2>/dev/null || true
+		: > "$LIST_TMP"
+		for DIR in "$DATA_ROOT"/cli/servers/* "$DATA_ROOT"/bin/*; do
+			[ -d "$DIR" ] || continue
+			NAME=${DIR##*/}
+			case "$NAME" in
+				[0-9a-fA-F]*) VER_COMMIT=$NAME ;;
+				*) VER_COMMIT=${NAME#*-} ;;
+			esac
+			case "$VER_COMMIT" in
+				'' | *[!0-9a-fA-F]*) continue ;;
+			esac
+			[ ${#VER_COMMIT} -eq 40 ] || continue
+			echo "$(date -r "$DIR" +%s 2>/dev/null || echo 0) $DIR $VER_COMMIT" >> "$LIST_TMP"
+		done
+		sort -rn "$LIST_TMP" > "$LIST_TMP.sorted"
+		KEPT=0
+		while read -r TS DIR VER_COMMIT; do
+			if [ "$VER_COMMIT" = "$COMMIT" ]; then
+				touch "$DIR" 2>/dev/null || true
+				continue
+			fi
+			# 有进程命令行引用该版本提交号即视为在用，绝不删（活会话/保活 daemon 的路径里带着提交号）
+			if grep -qs -- "$VER_COMMIT" /proc/[0-9]*/cmdline 2>/dev/null; then continue; fi
+			KEPT=$((KEPT + 1))
+			if [ "$KEPT" -le 5 ]; then continue; fi
+			rm -rf "$DIR"
+			log "已清理历史版本服务端: ${DIR##*/}"
+		done < "$LIST_TMP.sorted"
+		rm -f "$LIST_TMP" "$LIST_TMP.sorted"
+	done
+}
+
 # ===== 判定待装产物：已就位的产物不参与竞速，避免无谓的下载与上传 =====
 NEED_CLI=1
 if [ -f "$CLI_ON_DISK" ]; then
@@ -296,6 +338,9 @@ NEED_SERVER=1
 if [ -f "$INSTALL_DIR/product.json" ] && [ -d "$INSTALL_DIR/bin" ]; then
 	NEED_SERVER=0
 fi
+
+# ===== 历史版本回收：每次连接顺手清旧版（先于下载，磁盘紧张时先腾地方） =====
+cleanup_old_versions || true
 
 # ===== 仅当确有产物需要重装时才停止正在运行的旧版服务进程 =====
 # 无条件 pkill -f "$COMMIT" 会把命令行含提交号的 command-shell daemon 与 VS Code Server 一并杀掉（提交号就嵌在它们的路径里），于是每次连接的接管安装都会打死上次会话正在服务的进程，重连与多开窗口互相残杀。产物齐备时没有任何重装动作，绝不碰运行中的进程；真正要重装产物时才清理旧进程，避免旧进程占住将被覆盖的文件。
