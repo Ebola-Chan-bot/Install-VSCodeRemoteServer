@@ -9,6 +9,69 @@ echo "[sysroot] 开始组装: $SYSROOT"
 mkdir -p "$SYSROOT/glibc" "$SYSROOT/bin"
 cd "$STAGE"
 
+# ===== 双端竞速取材：本地供给上传（上传器落在竞速暂存目录）与远程自下载并行，先到先得 =====
+# 远程胜出即写取消标记让本地供给止损；本地胜出直接取件。远程全部源失败不立即放弃——继续等本地供给，两边都取不到才报错。
+RACE='__竞速暂存目录__'
+
+start_fetch() {
+	NAME=$1
+	shift
+	if [ -f "$NAME" ] || [ -f "$STAGE/$NAME" ]; then
+		echo "[sysroot] $NAME 已就位"
+		return 0
+	fi
+	if [ -n "$RACE" ] && [ -f "$RACE/$NAME" ]; then
+		mv -f "$RACE/$NAME" "$STAGE/$NAME"
+		echo "[sysroot] $NAME 由本地供给提供"
+		return 0
+	fi
+	# 远程自下载：多源断点续传、逐源轮试，落 .part 就绪后原子改名；胜利后写取消标记让本地供给止损
+	(
+		for U in "$@"; do
+			if command -v curl >/dev/null 2>&1; then
+				# 显式 UA 必带：centos-vault 镜像对无 UA 请求回 403（同本地侧硬约束）
+				curl -fL -C - -A 'Mozilla/5.0' --connect-timeout 10 --retry 2 -o "$STAGE/$NAME.part" "$U" && mv -f "$STAGE/$NAME.part" "$STAGE/$NAME" && exit 0
+			fi
+			if command -v wget >/dev/null 2>&1; then
+				wget -c -q -U 'Mozilla/5.0' -T 10 -O "$STAGE/$NAME.part" "$U" && mv -f "$STAGE/$NAME.part" "$STAGE/$NAME" && exit 0
+			fi
+		done
+		rm -f "$STAGE/$NAME.part"
+	) >/dev/null 2>&1 &
+	echo "[sysroot] $NAME 远程自下载已在后台启动"
+}
+
+wait_fetch() {
+	DEADLINE=$(( $(date +%s) + 600 ))
+	while :; do
+		MISSING=''
+		for NAME in "$@"; do
+			if [ -f "$STAGE/$NAME" ]; then
+				# 已就位（远程下载或先前取件）：顺手让本地供给止损
+				if [ -n "$RACE" ]; then touch "$RACE/BUNDLE_CANCEL.$NAME" 2>/dev/null; fi
+				continue
+			fi
+			if [ -n "$RACE" ] && [ -f "$RACE/$NAME" ]; then
+				mv -f "$RACE/$NAME" "$STAGE/$NAME"
+				echo "[sysroot] $NAME 由本地供给提供"
+				continue
+			fi
+			MISSING="$MISSING $NAME"
+		done
+		if [ -z "$MISSING" ]; then
+			return 0
+		fi
+		if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+			echo "[sysroot] 错误: 双端均未取到素材:$MISSING（本地下载/上传与远程自下载都未成功，请检查网络后重试）" >&2
+			return 1
+		fi
+		echo "[sysroot] 等待素材就位:$MISSING（本地供给上传或远程下载中）"
+		sleep 20
+	done
+}
+
+__取材阶段__
+
 for RPM in glibc-*.rpm libstdc++-*.rpm libgcc-*.rpm; do
 	echo "[sysroot] 解包 $RPM"
 	rpm2cpio "$RPM" | (cd "$SYSROOT/glibc" && cpio -idmu --quiet)

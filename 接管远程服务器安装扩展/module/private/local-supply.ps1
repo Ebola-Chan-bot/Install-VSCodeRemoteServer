@@ -23,6 +23,11 @@ try {
 	$提交号 = [string]$参数.提交号
 	$产物名 = [string]$参数.产物名
 	$取消标记名 = [string]$参数.取消标记名
+	# 多源地址列表（sysroot 素材等有镜像备源）与可选的稳定本地缓存名（文件名自带版本号的素材跨提交号复用）；.job 交接文件恒按 race-supply-<提交号>-<远程包名> 命名落 TEMP 根目录，与数据文件位置解耦，上传器按固定模式照常发现
+	$地址列表 = @($参数.下载地址列表 | Where-Object { $_ })
+	if ($地址列表.Count -eq 0) { $地址列表 = @([string]$参数.下载地址) }
+	$本地文件名 = [string]$参数.本地文件名
+	if ([string]::IsNullOrWhiteSpace($本地文件名)) { $本地文件名 = 'race-supply-{0}-{1}' -f $提交号, $远程包名 }
 	# Windows 远端相对暂存目录（单会话模式约定）锚定登录目录：scp 相对路径落点与 ssh 会话位置实测都是登录目录，但命令里的相对路径随执行上下文可能漂移（实测 Start-Job 的 CWD 是「文档」目录），统一改写成 $env:USERPROFILE 绝对表达式由远端展开，与远端脚本解析出的绝对暂存目录严格同目录。
 	$远端暂存目录文本 = if ($暂存目录 -match '^[A-Za-z]:[\\/]' -or $暂存目录.StartsWith('\\')) { $暂存目录 } else { ('$env:USERPROFILE\' + ($暂存目录 -replace '/', '\')) }
 
@@ -59,6 +64,10 @@ try {
 						if ($尾窗[$i] -eq 0x50 -and $尾窗[$i + 1] -eq 0x4B -and $尾窗[$i + 2] -eq 0x05 -and $尾窗[$i + 3] -eq 0x06) { return $true }
 					}
 					return $false
+				}
+				# rpm：头魔数 ed ab ee db（拦 HTML 错误页、截断包等）
+				if ($远程包名 -like '*.rpm') {
+					return ($头[0] -eq 0xED -and $头[1] -eq 0xAB -and $头[2] -eq 0xEE -and $头[3] -eq 0xDB)
 				}
 				# tar.gz：gzip 头魔数 1f 8b（拦 HTML 错误页、全零文件等）
 				return ($头[0] -eq 0x1F -and $头[1] -eq 0x8B)
@@ -100,15 +109,21 @@ try {
 		$null = 调用-远程命令 $建目录命令
 	}
 
-	# 分块 HTTP 断点续传下载（失败无限重试且等待秒数递增）。进程会在远程获胜时被整体击杀，故下载循环无需任何取消检查；
-	# 半成品保留在本地 TEMP 供下次运行续传，文件名带提交号：防旧版本残包被 416 误判为完整或被错误续传。
-	$本地包路径 = Join-Path $env:TEMP ('race-supply-{0}-{1}' -f $提交号, $远程包名)
+	# 分块 HTTP 断点续传下载（失败无限重试且等待秒数递增、逐源轮试）。进程会在远程获胜时被整体击杀，故下载循环无需任何取消检查；
+	# 半成品保留在本地供下次运行续传；默认文件名带提交号防旧版本残包被 416 误判为完整或被错误续传，文件名自带版本号的素材用稳定缓存名跨提交号复用。
+	$本地包路径 = Join-Path $env:TEMP $本地文件名
+	$null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $本地包路径)
 	$重试次数 = 0
 	# 报告周期在重试循环外初始化：断点续传时继承上一段的周期，不从 1 秒重新开始
 	$报告周期秒数 = 1
 	# 总计已用秒数的计时起点同样在重试循环外：估算平均速度 = 已下载字节数 / 总计已用秒数
 	$下载起始时刻 = Get-Date
 	while ($true) {
+		# 缓存已完整（过完整性快检）就不再碰网络：稳定缓存名的素材跨提交号复用，每次连接不再白下一遭；坏包/半成品仍走下方断点续传
+		if ((Test-Path -LiteralPath $本地包路径) -and (测试-本地包完整 $本地包路径)) {
+			Write-Output ('本地缓存已完整：{0} 字节，跳过下载。' -f (Get-Item -LiteralPath $本地包路径).Length)
+			break
+		}
 		$重试次数++
 		$已存在字节数 = 0
 		if (Test-Path -LiteralPath $本地包路径) { $已存在字节数 = (Get-Item -LiteralPath $本地包路径).Length }
@@ -116,7 +131,11 @@ try {
 		$响应流 = $null
 		$文件流 = $null
 		try {
-			$请求 = [System.Net.HttpWebRequest]::Create($下载地址)
+			# 多源轮试：每次重试换下一个源（部分源可能整站不可达，如 GitHub 直连被断），同一半成品跨源续传（各源内容一致）
+			$当前地址 = $地址列表[($重试次数 - 1) % $地址列表.Count]
+			$请求 = [System.Net.HttpWebRequest]::Create($当前地址)
+			# 显式 UA 必带：centos-vault 镜像对无 UA/非浏览器请求回 403（实测阿里云拒裸 HttpWebRequest）
+			$请求.UserAgent = 'Mozilla/5.0'
 			$请求.Timeout = 60000
 			$请求.ReadWriteTimeout = 60000
 			if ($已存在字节数 -gt 0) { $请求.AddRange($已存在字节数) }
@@ -190,7 +209,7 @@ try {
 				continue
 			}
 			$等待秒数 = [Math]::Min(30, $重试次数 * 2)
-			Write-Output ('下载中断（{0}），{1} 秒后重试（第 {2} 次，已续传 {3} 字节）...' -f $_.Exception.Message, $等待秒数, $重试次数, $已存在字节数)
+				Write-Output ('下载中断（{0}，源: {1}），{2} 秒后重试（第 {3} 次，已续传 {4} 字节）...' -f $_.Exception.Message, $当前地址, $等待秒数, $重试次数, $已存在字节数)
 			Start-Sleep -Seconds $等待秒数
 		}
 		finally {
@@ -203,9 +222,10 @@ try {
 	if ($系统类型 -eq 'Linux') {
 		# 交接主会话上传：本进程只负责下载，完成后写 .job 交接文件即退出，主会话的上传器线程按“文件帧→改名帧”序送入同一条连接。
 		# 原子性与 scp 方案一致：帧序天然保证“先文件后改名”，改名命令内含远端取消检查，坏包/截断包绝不会被就位。
-		$改名命令 = ("sh -c 'if [ -f {0}/{3} ]; then exit 2; fi; mv {0}/{1}.uploading {0}/{1} && touch {0}/{2}'" -f $暂存目录, $远程包名, $完成标记名, $取消标记名)
+		# 帧通道的落盘点恒为 $HOME/<远端名>（见 会话帧循环.sh），故改名从 ~ 取件再移入暂存目录；.job 恒落 TEMP 根目录按固定模式命名（见上方注释）。
+		$改名命令 = ("sh -c 'if [ -f {0}/{3} ]; then exit 2; fi; mv ~/{1}.uploading {0}/{1} && touch {0}/{2}'" -f $暂存目录, $远程包名, $完成标记名, $取消标记名)
 		$交接 = @{ 数据文件 = $本地包路径; 远端名 = ('{0}.uploading' -f $远程包名); 完成命令 = $改名命令 }
-		$交接 | ConvertTo-Json | Set-Content -LiteralPath ($本地包路径 + '.job') -Encoding UTF8
+		$交接 | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:TEMP ('race-supply-{0}-{1}.job' -f $提交号, $远程包名)) -Encoding UTF8
 		Write-Output ('本地下载完成：共 {0} 字节，已交接主会话上传（{1}）。' -f (Get-Item -LiteralPath $本地包路径).Length, $远程包名)
 		return
 	}

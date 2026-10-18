@@ -757,7 +757,8 @@ function 安装-VSCode远程服务 {
 		param(
 			[pscustomobject]$环境,
 			[string]$发布通道,
-			[string]$提交号
+			[string]$提交号,
+			[switch]$需要sysroot材料
 		)
 
 		# 汇总竞速所需信息：暂存目录（登录目录下 .vscode-server[-insiders]/race-<提交号>）与逐产物的包名/标记名/下载地址。
@@ -782,9 +783,16 @@ function 安装-VSCode远程服务 {
 
 		# 远程侧约定的包名与标记名（与远程脚本内的命名保持一致；完成标记带架构后缀防串包，取消标记按产物区分让本地供给逐产物止损）
 		$产物列表 = @(
-			[pscustomobject]@{ 产物名 = 'CLI'; 下载地址 = $CLI下载地址; 远程包名 = ('LOCAL_CLI{0}' -f $包扩展名); 完成标记名 = ('LOCAL_CLI_DONE.{0}' -f $架构标识); 取消标记名 = 'LOCAL_CLI_CANCEL' }
-			[pscustomobject]@{ 产物名 = '服务端'; 下载地址 = $服务端下载地址; 远程包名 = ('LOCAL{0}' -f $包扩展名); 完成标记名 = ('LOCAL_DONE.{0}' -f $架构标识); 取消标记名 = 'LOCAL_CANCEL' }
+			[pscustomobject]@{ 产物名 = 'CLI'; 下载地址列表 = @($CLI下载地址); 本地文件名 = ''; 远程包名 = ('LOCAL_CLI{0}' -f $包扩展名); 完成标记名 = ('LOCAL_CLI_DONE.{0}' -f $架构标识); 取消标记名 = 'LOCAL_CLI_CANCEL' }
+			[pscustomobject]@{ 产物名 = '服务端'; 下载地址列表 = @($服务端下载地址); 本地文件名 = ''; 远程包名 = ('LOCAL{0}' -f $包扩展名); 完成标记名 = ('LOCAL_DONE.{0}' -f $架构标识); 取消标记名 = 'LOCAL_CANCEL' }
 		)
+		# sysroot 素材并入同一套竞速（旧 glibc 主机）：与 CLI/服务端同规则双端供给、断点续传，任一边能取到即可部署；
+		# 素材文件名自带版本号，本地缓存名保持稳定跨提交号复用（.job 交接文件另按 race-supply-<提交号>-<名> 命名落 TEMP 根目录，上传器照常发现）
+		if ($需要sysroot材料) {
+			foreach ($素材 in 取-sysroot素材清单) {
+				$产物列表 += [pscustomobject]@{ 产物名 = $素材.文件名; 下载地址列表 = @($素材.地址列表); 本地文件名 = ('vscode-sysroot-bundle\{0}' -f $素材.文件名); 远程包名 = $素材.文件名; 完成标记名 = ('LOCAL_BUNDLE_DONE.{0}' -f $素材.文件名); 取消标记名 = ('BUNDLE_CANCEL.{0}' -f $素材.文件名) }
+			}
+		}
 
 		return [pscustomobject]@{
 			暂存目录 = $暂存目录
@@ -821,7 +829,8 @@ function 安装-VSCode远程服务 {
 				端口 = $端口
 				密码选项 = @($script:SSH密码选项)
 				暂存目录 = $竞速上下文.暂存目录
-				下载地址 = $产物.下载地址
+				下载地址列表 = @($产物.下载地址列表)
+				本地文件名 = [string]$产物.本地文件名
 				远程包名 = $产物.远程包名
 				完成标记名 = $产物.完成标记名
 				取消标记名 = $产物.取消标记名
@@ -1003,47 +1012,23 @@ function 安装-VSCode远程服务 {
 		return $null
 	}
 
-	function 下载-兼容性工具包 {
-		# 本地下载并缓存 sysroot 素材（glibc/libstdc++/libgcc 的 CentOS 8 RPM + patchelf 0.18 静态二进制，共约 5MB）
-		# vault.centos.org 对无 UA 请求返回 403，故走清华/阿里镜像并显式 UA；patchelf 用 GitHub Release 官方静态包（0.17.x 有 segfault 问题，官方要求 >= 0.18）
-		$缓存目录 = Join-Path $env:TEMP 'vscode-sysroot-bundle'
-		New-Item -ItemType Directory -Force $缓存目录 | Out-Null
-
+	function 取-sysroot素材清单 {
+		# sysroot 素材定义（glibc/libstdc++/libgcc 的 CentOS 8 RPM + patchelf 0.18 静态二进制，共约 5MB）：本地供给与远程自下载共用同一地址列表
+		# vault.centos.org 对无 UA 请求返回 403，故走清华/阿里镜像并显式 UA；patchelf 用 GitHub Release 官方静态包（0.17.x 有 segfault 问题，官方要求 >= 0.18），并附 GitHub 加速镜像作备源（部分网络 GitHub 直连不可达，实测 ghfast.top 可达）
 		$镜像前缀列表 = @(
 			'https://mirrors.tuna.tsinghua.edu.cn/centos-vault/8.5.2111/BaseOS/x86_64/os/Packages',
 			'https://mirrors.aliyun.com/centos-vault/8.5.2111/BaseOS/x86_64/os/Packages'
 		)
-
-		$素材清单 = New-Object System.Collections.ArrayList
+		$清单 = New-Object System.Collections.ArrayList
 		foreach ($rpm名称 in @('glibc-2.28-164.el8.x86_64.rpm', 'libstdc++-8.5.0-4.el8_5.x86_64.rpm', 'libgcc-8.5.0-4.el8_5.x86_64.rpm')) {
-			[void]$素材清单.Add([pscustomobject]@{ 文件名 = $rpm名称; 地址列表 = @($镜像前缀列表 | ForEach-Object { $_ + '/' + $rpm名称 }) })
+			[void]$清单.Add([pscustomobject]@{ 文件名 = $rpm名称; 地址列表 = @($镜像前缀列表 | ForEach-Object { $_ + '/' + $rpm名称 }) })
 		}
-		[void]$素材清单.Add([pscustomobject]@{
+		$patchelf地址 = 'https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz'
+		[void]$清单.Add([pscustomobject]@{
 			文件名 = 'patchelf-0.18.0-x86_64.tar.gz'
-			地址列表 = @('https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz')
+			地址列表 = @($patchelf地址, ('https://ghfast.top/{0}' -f $patchelf地址), ('https://gh-proxy.com/{0}' -f $patchelf地址))
 		})
-
-		foreach ($素材 in $素材清单) {
-			$本地路径 = Join-Path $缓存目录 $素材.文件名
-			if ((Test-Path $本地路径) -and ((Get-Item $本地路径).Length -gt 0)) { continue }
-
-			$下载成功 = $false
-			foreach ($地址 in $素材.地址列表) {
-				try {
-					Write-Host ('下载 sysroot 素材: {0}' -f $素材.文件名)
-					Invoke-WebRequest -Uri $地址 -OutFile $本地路径 -UseBasicParsing -UserAgent 'Mozilla/5.0'
-					if ((Get-Item $本地路径).Length -gt 0) { $下载成功 = $true; break }
-				} catch {
-					Remove-Item $本地路径 -Force -ErrorAction SilentlyContinue
-				}
-			}
-
-			if (-not $下载成功) {
-				throw ('sysroot 素材下载失败: {0}（已尝试 {1} 个源）' -f $素材.文件名, $素材.地址列表.Count)
-			}
-		}
-
-		return $缓存目录
+		return @($清单)
 	}
 
 	function 上传-一批文件到远程 {
@@ -1380,14 +1365,10 @@ function 安装-VSCode远程服务 {
 			}
 			if ($需要sysroot阶段) {
 				& $落盘 'vsi-stage-native.sh' ($script:脚本_原生组件补丁.Replace('__提交号__', $提交号).Replace('__发布通道__', $发布通道))
-				& $落盘 'vsi-stage-sysroot.sh' ($script:脚本_sysroot部署.Replace('__目录__', $兼容性目录))
-				# sysroot 工具包（glibc/libstdc++/libgcc 的 rpm 与 patchelf 压缩包）带 bundle- 前缀随批上传，编排脚本按原名归位到 .stage 供部署脚本解包
-				$缓存目录 = 下载-兼容性工具包
-				foreach ($素材文件 in (Get-ChildItem $缓存目录 -File)) {
-					$路径 = Join-Path $本地目录 ('vsi-stage-bundle-' + $素材文件.Name)
-					Copy-Item -LiteralPath $素材文件.FullName -Destination $路径 -Force
-					[void]$上传清单.Add($路径)
-				}
+				# sysroot 素材走双端竞速：本地供给进程（竞速产物，断点续传多源下载）与远程自下载（部署脚本的取材阶段，多源断点续传）并行、先到先得，不再随批上传 bundle；地址列表两共，任一边能取到即可部署
+				$取材行 = @(取-sysroot素材清单 | ForEach-Object { "start_fetch '{0}' {1}" -f $_.文件名, (($_.地址列表 | ForEach-Object { "'{0}'" -f $_ }) -join ' ') })
+				$取材行 += ('wait_fetch {0} || exit 1' -f ((取-sysroot素材清单 | ForEach-Object { "'{0}'" -f $_.文件名 }) -join ' '))
+				& $落盘 'vsi-stage-sysroot.sh' ($script:脚本_sysroot部署.Replace('__目录__', $兼容性目录).Replace('__竞速暂存目录__', $暂存目录).Replace('__取材阶段__', ($取材行 -join "`n")))
 			}
 			if ($需要保活阶段) {
 				& $落盘 'vsi-stage-keepalive.sh' (构造-保活部署文本 -远程登录目录 $远程登录目录 -提交号 $提交号 -发布通道 $发布通道 -动作 $保活动作 -包装模板远程路径 ($根目录 + '/vsi-stage-wrapper.sh') -改名模板远程路径 ($根目录 + '/vsi-stage-renamer.js'))
@@ -1618,8 +1599,8 @@ function 安装-VSCode远程服务 {
 		$服务端下载地址 = ('https://vscode.download.prss.microsoft.com/dbazure/download/{0}/{1}/vscode-server-{2}.zip' -f $发布通道, $提交号, $架构标识)
 		$CLI下载地址 = 取-CLI下载地址 -发布通道 $发布通道 -提交号 $提交号 -架构标识 $架构标识
 		$产物列表 = @(
-			[pscustomobject]@{ 产物名 = 'CLI'; 下载地址 = $CLI下载地址; 远程包名 = 'LOCAL_CLI.zip'; 完成标记名 = ('LOCAL_CLI_DONE.{0}' -f $架构标识); 取消标记名 = 'LOCAL_CLI_CANCEL' }
-			[pscustomobject]@{ 产物名 = '服务端'; 下载地址 = $服务端下载地址; 远程包名 = 'LOCAL.zip'; 完成标记名 = ('LOCAL_DONE.{0}' -f $架构标识); 取消标记名 = 'LOCAL_CANCEL' }
+			[pscustomobject]@{ 产物名 = 'CLI'; 下载地址列表 = @($CLI下载地址); 本地文件名 = ''; 远程包名 = 'LOCAL_CLI.zip'; 完成标记名 = ('LOCAL_CLI_DONE.{0}' -f $架构标识); 取消标记名 = 'LOCAL_CLI_CANCEL' }
+			[pscustomobject]@{ 产物名 = '服务端'; 下载地址列表 = @($服务端下载地址); 本地文件名 = ''; 远程包名 = 'LOCAL.zip'; 完成标记名 = ('LOCAL_DONE.{0}' -f $架构标识); 取消标记名 = 'LOCAL_CANCEL' }
 		)
 		return [pscustomobject]@{
 			暂存目录 = '{0}/race-{1}' -f $数据目录名, $提交号
@@ -1866,7 +1847,7 @@ function 安装-VSCode远程服务 {
 		}
 
 		# Linux 远程主机走 sh 安装流程；能确定暂存目录与远程架构时启用竞速（本地子进程下载+上传 与 远程自下载 并行，先完成者胜）
-		$竞速上下文 = 初始化-竞速上下文 -环境 $环境 -发布通道 $本地信息.发布通道 -提交号 $本地信息.提交号
+		$竞速上下文 = 初始化-竞速上下文 -环境 $环境 -发布通道 $本地信息.发布通道 -提交号 $本地信息.提交号 -需要sysroot材料 (-not [string]::IsNullOrWhiteSpace($兼容性sysroot目录))
 		$本地供给 = $null
 		$每行回调 = $null
 		if ($null -ne $竞速上下文) {
