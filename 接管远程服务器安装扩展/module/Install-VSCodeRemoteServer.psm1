@@ -321,6 +321,9 @@ function 安装-VSCode远程服务 {
 		$原始架构 = ''
 		$内核版本 = $null
 		$Glibc版本 = $null
+		$提交上限KB = $null
+		$已提交KB = $null
+		$提交模式 = $null
 		foreach ($原始行 in $输出) {
 			$行 = ([string]$原始行).Trim()
 			if ($行 -eq 'Linux') {
@@ -363,6 +366,11 @@ function 安装-VSCode远程服务 {
 				continue
 			}
 
+			# Linux 专用：内存提交额度（CommitLimit/Committed_AS 原样行 + OVERCOMMIT= 模式行），解析出余量供内存紧张预警
+			if ($null -eq $提交上限KB -and $行 -match '^CommitLimit:\s+(\d+)') { $提交上限KB = [long]$Matches[1]; continue }
+			if ($null -eq $已提交KB -and $行 -match '^Committed_AS:\s+(\d+)') { $已提交KB = [long]$Matches[1]; continue }
+			if ($null -eq $提交模式 -and $行 -match '^OVERCOMMIT=(\d+)$') { $提交模式 = [int]$Matches[1]; continue }
+
 			# Windows 默认 shell 为 PowerShell 时，探测命令中的 powershell 行直接输出裸路径（无标记前缀），按 Windows 路径形态识别
 			if ($系统类型 -eq 'Windows' -and $登录目录 -eq '' -and $行 -match '^[A-Za-z]:\\') {
 				$登录目录 = $行.TrimEnd('\', '/')
@@ -374,6 +382,13 @@ function 安装-VSCode远程服务 {
 			}
 		}
 
+		$提交余量KB = $null
+		$严格提交模式 = $false
+		if ($null -ne $提交上限KB -and $null -ne $已提交KB) {
+			$提交余量KB = [Math]::Max(0L, $提交上限KB - $已提交KB)
+			$严格提交模式 = ($提交模式 -eq 2)
+		}
+
 		$完整 = if ($系统类型 -eq 'Linux') { $登录目录 -ne '' } else { ($登录目录 -ne '') -and ($null -ne $PS主版本) }
 
 		return [pscustomobject]@{
@@ -383,6 +398,8 @@ function 安装-VSCode远程服务 {
 			原始架构 = $原始架构
 			内核版本 = $内核版本
 			Glibc版本 = $Glibc版本
+			提交余量KB = $提交余量KB
+			严格提交模式 = $严格提交模式
 			完整 = $完整
 		}
 	}
@@ -460,6 +477,8 @@ function 安装-VSCode远程服务 {
 			原始架构 = $原始架构
 			内核版本 = $报告.内核版本
 			Glibc版本 = $报告.Glibc版本
+			提交余量KB = $报告.提交余量KB
+			严格提交模式 = $报告.严格提交模式
 			完整 = $true
 		}
 	}
@@ -786,8 +805,7 @@ function 安装-VSCode远程服务 {
 			[pscustomobject]@{ 产物名 = 'CLI'; 下载地址列表 = @($CLI下载地址); 本地文件名 = ''; 远程包名 = ('LOCAL_CLI{0}' -f $包扩展名); 完成标记名 = ('LOCAL_CLI_DONE.{0}' -f $架构标识); 取消标记名 = 'LOCAL_CLI_CANCEL' }
 			[pscustomobject]@{ 产物名 = '服务端'; 下载地址列表 = @($服务端下载地址); 本地文件名 = ''; 远程包名 = ('LOCAL{0}' -f $包扩展名); 完成标记名 = ('LOCAL_DONE.{0}' -f $架构标识); 取消标记名 = 'LOCAL_CANCEL' }
 		)
-		# sysroot 素材并入同一套竞速（旧 glibc 主机）：与 CLI/服务端同规则双端供给、断点续传，任一边能取到即可部署；
-		# 素材文件名自带版本号，本地缓存名保持稳定跨提交号复用（.job 交接文件另按 race-supply-<提交号>-<名> 命名落 TEMP 根目录，上传器照常发现）
+		# sysroot 素材并入同一套竞速（旧 glibc 主机）：与 CLI/服务端同规则双端供给、断点续传，任一边能取到即可部署；素材文件名自带版本号，本地缓存名保持稳定跨提交号复用（.job 交接文件另按 race-supply-<提交号>-<名> 命名落 TEMP 根目录，上传器照常发现）
 		if ($需要sysroot材料) {
 			foreach ($素材 in 取-sysroot素材清单) {
 				$产物列表 += [pscustomobject]@{ 产物名 = $素材.文件名; 下载地址列表 = @($素材.地址列表); 本地文件名 = ('vscode-sysroot-bundle\{0}' -f $素材.文件名); 远程包名 = $素材.文件名; 完成标记名 = ('LOCAL_BUNDLE_DONE.{0}' -f $素材.文件名); 取消标记名 = ('BUNDLE_CANCEL.{0}' -f $素材.文件名) }
@@ -1818,6 +1836,10 @@ function 安装-VSCode远程服务 {
 	}
 
 	if ($环境.系统类型 -eq 'Linux') {
+		# 远端内存提交余量预警（只警告不干预后续流程）：严格提交模式（overcommit=2）下余量耗尽时一切新内存分配都会失败，实测表现为新开终端报 forkpty(3) failed、服务端与扩展主机 V8 报 Committing semi space failed 堆溢出；通常是集群上其他任务占满全机提交额度所致，待其释放后重连即恢复
+		if ($环境.严格提交模式 -and $null -ne $环境.提交余量KB -and $环境.提交余量KB -lt 4194304) {
+			Write-Host ('警告: 远端内存提交余量仅 {0:N1} GB（严格提交模式下全机额度接近上限），新开终端或扩展主机可能报 forkpty 失败/堆内存溢出；通常是集群上其他任务占满所致，与本工具无关，待其释放后重连即可。' -f ($环境.提交余量KB / 1MB))
+		}
 		# 旧 glibc 兼容（官方 sysroot 妥协方案）：VS Code 1.99+ 的 server 要求 glibc >= 2.28，老系统（如 CentOS 7 glibc 2.17）需在家目录部署 sysroot 并注入 VSCODE_SERVER_CUSTOM_GLIBC_* 环境变量
 		$兼容性sysroot目录 = ''
 		# 合并环境探测已带回 glibc/内核则直接用（各免一轮 SSH 往返），缺失才退回单独探测

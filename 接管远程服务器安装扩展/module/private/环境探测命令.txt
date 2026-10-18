@@ -6,5 +6,8 @@ uname -s
 uname -m
 uname -r
 ldd --version | head -1
+grep CommitLimit /proc/meminfo
+grep Committed_AS /proc/meminfo
+head -1 /proc/sys/vm/overcommit_memory | sed s/^/OVERCOMMIT=/
 printf 'HOMEDIR_SH=%s\n' $HOME
 echo PROBE_END
