@@ -193,7 +193,7 @@ race_artifact() {
 	fi
 
 	ELAPSED=0
-	# 竞速等待心跳没有产物总大小可比对，无法估算剩余时间，报告周期只增不减（每次报告后加 1 秒）
+	# 远端进度心跳无产物总大小可比对（只报已传字节数），报告周期只增不减（每次报告后加 1 秒）
 	REPORT_PERIOD=1
 	NEXT_REPORT=$REPORT_PERIOD
 	while true; do
@@ -213,8 +213,8 @@ race_artifact() {
 				if [ -f "$2" ]; then
 					RSIZE=$(wc -c < "$2" 2>/dev/null | tr -d ' ')
 				fi
-				# 心跳并入远程下载进度句式（无产物总大小可比对，只报已传字节数）；进度行不带内嵌时间戳，故不经 log 前缀
-				echo "远程下载进度：已传 ${RSIZE} 字节（竞速等待 ${ELAPSED}s）"
+				# 该平台远程自下载的输出被静音（curl 进度条是英文噪声），本心跳是唯一的远端进度来源：用统一句式的总量未知形态，不带竞速等待后缀；进度行不带内嵌时间戳，故不经 log 前缀
+				echo "远程下载进度：已传 ${RSIZE} 字节"
 			else
 				log "$1 竞速等待 ${ELAPSED}s：远程侧不参与下载，等待本地供给。"
 			fi
