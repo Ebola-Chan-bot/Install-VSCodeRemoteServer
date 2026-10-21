@@ -6,6 +6,8 @@ $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 # 关闭内置进度条：Invoke-WebRequest 的进度条靠移动光标反复重绘，在 SSH 会话里会把已输出的中文行重绘错乱（每个汉字重影、行首留大段空格），本脚本的关键进度均有自打印文本，不需要进度条
 $ProgressPreference = 'SilentlyContinue'
+# 后台历史清理的完成标记：清理改由脱离本会话的后台进程执行，它往报告文件写完本标记就说明那一轮已结束，下一轮据此判定能否回放
+$script:历史清理完成标记 = '__清理完成__'
 
 function 取-系统架构标识 {
 	$原始架构 = if ($env:PROCESSOR_ARCHITEW6432) {
@@ -288,10 +290,68 @@ function 清理-历史版本服务端 {
 			if ($名次 -le 5) { continue }
 			Remove-Item -LiteralPath $版本目录.FullName -Recurse -Force -ErrorAction SilentlyContinue
 			if (-not (Test-Path -LiteralPath $版本目录.FullName)) {
-				Write-Host ('[{0}] 已清理历史版本服务端: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $版本目录.Name)
+				# 走成功流而非 Write-Host：本函数现由后台进程执行，输出经 -RedirectStandardOutput 落进报告文件，下一轮开头回放
+				Write-Output ('[{0}] 已清理历史版本服务端: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $版本目录.Name)
 			}
 		}
 	}
+}
+
+function 启动-后台历史清理 {
+	param(
+		[string]$版本提交号,
+		[string]$报告路径
+	)
+
+	# 删除每个约 250MB 的旧版本目录实测要数秒，十几个版本能把连接前流程占住近一分钟（实测 12:54:10~12:55:03 全在做清理），而历史清理与本次安装毫无先后依赖，故改由脱离本会话的后台 powershell 执行。
+	# 报告行经 -RedirectStandardOutput 落进报告文件（.NET 进程重定向以 FileShare.Read 建文件，主流程与下一轮都能共享读），末尾附完成标记供回放判定。
+	# Start-Process 起的进程不随本会话退出而死（Windows 无父死连坐）；本脚本的僵尸会话清理只杀启动超过 5 分钟且祖先链无 sshd 的 powershell，本进程寿命远不到 5 分钟且父链含存活 sshd，不沾。
+	# 代价：不再保证“清理先于下载腾出磁盘”，磁盘吃紧的主机上删除与下载会并发。
+	$清理脚本 = 'function 清理-历史版本服务端 { ' + (Get-Command '清理-历史版本服务端').Definition + " }`r`n" + ("清理-历史版本服务端 -版本提交号 '{0}'`r`n" -f $版本提交号) + ("Write-Output '{0}'" -f $script:历史清理完成标记)
+	$报告目录 = Split-Path -Parent $报告路径
+	if (-not [string]::IsNullOrWhiteSpace($报告目录) -and -not (Test-Path -LiteralPath $报告目录)) {
+		New-Item -ItemType Directory -Force -Path $报告目录 | Out-Null
+	}
+	$编码 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($清理脚本))
+	$powershell路径 = (Get-Process -Id $PID).Path
+	if ([string]::IsNullOrWhiteSpace($powershell路径)) { $powershell路径 = 'powershell.exe' }
+	try {
+		$null = Start-Process -FilePath $powershell路径 -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', $编码) -WindowStyle Hidden -RedirectStandardOutput $报告路径 -RedirectStandardError ($报告路径 + '.err') -PassThru
+		Write-Output ('[{0}] 历史版本清理已在远端后台启动（不占用本次安装流程），清理明细在下一次连接开头回放。' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+	} catch {
+		# 起不了后台进程（主机策略限制等）时退化为本轮同步清理，磁盘卫生不因改造而丢失
+		Write-Output ('[{0}] 后台历史清理启动失败（{1}），本轮改为同步清理。' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $_.Exception.Message)
+		清理-历史版本服务端 -版本提交号 $版本提交号
+	}
+}
+
+function 回放-历史清理报告 {
+	param(
+		[string]$报告路径
+	)
+
+	# 后台清理的输出不在本轮会话里，这里把上一轮报告原样回放（读文件不阻塞）。完成标记齐备 = 回放后删除；报告新鲜但无标记 = 上一轮仍在跑，本轮不重复启动（避免两个进程同写一份报告、互相抢删）；报告超龄仍无标记 = 上一轮进程已随断线/重启消失，删掉重开
+	# 返回 $true 表示报告文件仍在（本轮不必再起后台清理）
+	if (-not (Test-Path -LiteralPath $报告路径)) { return $false }
+	if ((Get-Item -LiteralPath $报告路径).LastWriteTime -lt (Get-Date).AddMinutes(-30)) {
+		Write-Output ('[{0}] 后台历史清理报告超过 30 分钟仍未完成（进程可能已随断线消失），本轮重新启动。' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+		Remove-Item -LiteralPath $报告路径 -Force -ErrorAction SilentlyContinue
+		Remove-Item -LiteralPath ($报告路径 + '.err') -Force -ErrorAction SilentlyContinue
+		return $false
+	}
+	$行 = @()
+	try {
+		$行 = @(Get-Content -LiteralPath $报告路径 -ErrorAction Stop | Where-Object { $_ -ne '' })
+	} catch {
+		return $true
+	}
+	if ($行 -notcontains $script:历史清理完成标记) { return $true }
+	foreach ($一行 in $行) {
+		if ($一行 -ne $script:历史清理完成标记) { Write-Output ('[上一轮后台历史清理] {0}' -f $一行) }
+	}
+	Remove-Item -LiteralPath $报告路径 -Force -ErrorAction SilentlyContinue
+	Remove-Item -LiteralPath ($报告路径 + '.err') -Force -ErrorAction SilentlyContinue
+	return $false
 }
 
 function 通过HTTP断点续传下载 {
@@ -589,8 +649,11 @@ Write-Host ('自动检测到的系统架构: {0}' -f $系统架构)
 Write-Host ('自动检测到的安装目录: {0}' -f $最终安装目录)
 Write-Host ('下载地址: {0}' -f $下载地址)
 
-# ===== 历史版本回收：每次连接顺手清旧版（先于下载，磁盘紧张时先腾地方） =====
-清理-历史版本服务端 -版本提交号 $提交号
+# ===== 历史版本回收：后台进程执行，不占用本次连接的主流程 =====
+$历史清理报告路径 = Join-Path (Join-Path $HOME $(if ($发布通道 -eq 'insider') { '.vscode-server-insiders' } else { '.vscode-server' })) '.vsi-gc-report.log'
+if (-not (回放-历史清理报告 -报告路径 $历史清理报告路径)) {
+	启动-后台历史清理 -版本提交号 $提交号 -报告路径 $历史清理报告路径
+}
 
 # ===== 判定待装产物：已就位的产物不参与竞速，避免无谓的下载与上传 =====
 $CLI已就位 = Test-Path -LiteralPath $CLI信息.落地路径
@@ -623,8 +686,14 @@ if ($启用竞速) {
 		$服务端竞速结果 = 竞速-单个产物 -产物名 '服务端' -下载地址 $下载地址 -远程包路径 (Join-Path $暂存目录 'REMOTE.zip') -远程完成标记 (Join-Path $暂存目录 'REMOTE_DONE') -本地包路径 (Join-Path $暂存目录 'LOCAL.zip') -本地完成标记 (Join-Path $暂存目录 ('LOCAL_DONE.{0}' -f $系统架构)) -本地取消标记 (Join-Path $暂存目录 'LOCAL_CANCEL') -下载函数文本 $下载函数文本
 		$获胜包路径 = $服务端竞速结果.获胜包路径
 	}
-	# 全部产物竞速决出：该行触发主流程立即击杀本地供给进程树（零轮询即时取消）
-	Write-Host '竞速获胜：全部产物已就位，开始安装。'
+	if ($待装产物名.Count -gt 0) {
+		# 至少一个产物竞速决出：该行触发主流程立即击杀本地供给进程树（零轮询即时取消）
+		Write-Host '竞速获胜：全部产物已就位，开始安装。'
+	}
+	else {
+		# CLI 与服务端均已就位时根本没发生竞速与下载，如实说明，避免"竞速获胜/下载地址"被误读成每次连接都在重新下载
+		Write-Host 'CLI 与服务端均已就位：本轮零下载，跳过竞速，直接进入安装检查。'
+	}
 }
 
 # ===== 安装 CLI（Remote-SSH 引导的启动入口，server 由它拉起，二者缺一不可，故先补 CLI）=====

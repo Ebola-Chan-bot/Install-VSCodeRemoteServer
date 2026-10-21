@@ -45,6 +45,10 @@ else
 fi
 INSTALL_DIR="$DATA_DIR/cli/servers/$QUALITY-$COMMIT/server"
 
+# 后台历史清理的报告文件与完成标记：清理改由后台子进程执行，它的输出落进报告文件，下一次连接开头回放（同 Windows 通用版的做法）
+GC_REPORT="$DATA_DIR/.vsi-gc-report.log"
+GC_DONE_MARK='__清理完成__'
+
 # ===== CLI 名称与下载 artifact（Remote-SSH 引导契约：数据根目录需存在 <cli名>-<提交号>，cli 名稳定版 code、预览版 code-insiders；x64/arm64 用 cli-alpine-<架构>，armhf 用 cli-linux-armhf） =====
 if [ "$CHANNEL" = 'insider' ]; then
 	CLI_BASE_NAME='code-insiders'
@@ -339,8 +343,39 @@ if [ -f "$INSTALL_DIR/product.json" ] && [ -d "$INSTALL_DIR/bin" ]; then
 	NEED_SERVER=0
 fi
 
-# ===== 历史版本回收：每次连接顺手清旧版（先于下载，磁盘紧张时先腾地方） =====
-cleanup_old_versions || true
+# ===== 历史版本回收：后台子进程执行，不占用本次连接的主流程 =====
+# 删除每个约 250MB 的旧版本目录实测要数秒一个，十几个版本能把连接前流程占住近一分钟，而历史清理与本次安装毫无先后依赖，故改后台执行，明细在下一次连接开头回放。
+# 报告含完成标记 = 上一轮已结束，回放后删除；报告新鲜且无标记 = 上一轮仍在跑，本轮不重复启动（避免两个进程同写一份报告、互相抢删）；报告超龄仍无标记 = 上一轮进程已随断线消失，删掉重开。
+# 代价：不再保证“清理先于下载腾出磁盘”，磁盘吃紧的主机上删除与下载会并发。
+if [ -f "$GC_REPORT" ]; then
+	if grep -qs "$GC_DONE_MARK" "$GC_REPORT"; then
+		while IFS= read -r GC_LINE; do
+			if [ -n "$GC_LINE" ] && [ "$GC_LINE" != "$GC_DONE_MARK" ]; then
+				log "[上一轮后台历史清理] $GC_LINE"
+			fi
+		done < "$GC_REPORT"
+		rm -f "$GC_REPORT"
+	else
+		GC_STALE=1
+		# find 不支持 -mmin 的主机取不到年龄信息，一律按超龄处理：宁可重开一轮，也不要永远卡在“仍在进行”而不再清理
+		if find "$GC_REPORT" -mmin -30 2>/dev/null | grep -q .; then
+			GC_STALE=0
+		fi
+		if [ "$GC_STALE" = '1' ]; then
+			log '后台历史清理报告超过 30 分钟仍未完成（进程可能已随断线消失），本轮重新启动。'
+			rm -f "$GC_REPORT"
+		else
+			log '上一轮后台历史清理仍在进行，本轮不重复启动。'
+		fi
+	fi
+fi
+if [ ! -f "$GC_REPORT" ]; then
+	# 报告落在数据目录下，首次安装时该目录还不存在，重定向会静默失败导致清理永不执行，先建好
+	mkdir -p "$DATA_DIR" 2>/dev/null || true
+	# 双层子 shell + 后台：外层子 shell 立即退出让后台作业 PPID 归 1（脱离按祖先链收割的会话策略，同保活方案的双 fork 思路）；stdout/stderr 落报告文件、stdin 接 /dev/null，不再持有本会话管道，SSH 不会为它挂住
+	( { cleanup_old_versions || true; echo "$GC_DONE_MARK"; } > "$GC_REPORT" 2>&1 < /dev/null & )
+	log '历史版本清理已在远端后台启动（不占用本次安装流程），清理明细在下一次连接开头回放。'
+fi
 
 # ===== 仅当确有产物需要重装时才停止正在运行的旧版服务进程 =====
 # 无条件 pkill -f "$COMMIT" 会把命令行含提交号的 command-shell daemon 与 VS Code Server 一并杀掉（提交号就嵌在它们的路径里），于是每次连接的接管安装都会打死上次会话正在服务的进程，重连与多开窗口互相残杀。产物齐备时没有任何重装动作，绝不碰运行中的进程；真正要重装产物时才清理旧进程，避免旧进程占住将被覆盖的文件。
@@ -370,8 +405,13 @@ if [ -n "$STAGING" ]; then
 		race_artifact '服务端' "$STAGING/REMOTE.tar.gz" "$STAGING/REMOTE_DONE" "$STAGING/LOCAL.tar.gz" "$STAGING/LOCAL_DONE.$ARCH" "$STAGING/LOCAL_CANCEL" "$RACE_SERVER_DL_FN"
 		SERVER_WINNER_PKG="$RACE_WINNER_PKG"
 	fi
-	# 全部产物竞速决出：该行触发主流程立即击杀本地供给进程树（零轮询即时取消）
-	echo '竞速获胜：全部产物已就位，开始安装。'
+	if [ "$NEED_CLI" = '1' ] || [ "$NEED_SERVER" = '1' ]; then
+		# 至少一个产物竞速决出：该行触发主流程立即击杀本地供给进程树（零轮询即时取消）
+		echo '竞速获胜：全部产物已就位，开始安装。'
+	else
+		# CLI 与服务端均已就位时根本没发生竞速与下载，如实说明，避免"竞速获胜/下载地址"被误读成每次连接都在重新下载
+		echo 'CLI 与服务端均已就位：本轮零下载，跳过竞速，直接进入安装检查。'
+	fi
 fi
 
 # ===== 安装 CLI（Remote-SSH 引导的启动入口，server 由它拉起，二者缺一不可）=====

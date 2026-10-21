@@ -16,6 +16,7 @@ const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const 终端救援 = require('./terminalRescue.js');
 
 const 设置节 = '安装VSCode远程服务';
 const 钩子设置键 = 'remote.SSH.preconnect';
@@ -26,6 +27,7 @@ const 配置文件名 = '接管安装配置.json';
 const 接管主机键 = '接管的主机';
 const 保活主机键 = '启用保活的主机';
 const 命令_选择主机 = 设置节 + '.选择接管主机';
+const 命令_诊断终端通道 = 设置节 + '.诊断终端通道';
 const 状态键_接管方式 = '接管方式'; // 主机 → { 方式: '覆盖'|'自调', 原脚本 }；只对有过外部原脚本的主机记录
 const 状态键_接管前设置 = '接管前的remote.SSH.preconnect'; // 旧版遗留记录，只读取用于追溯原脚本，用完即清
 
@@ -48,18 +50,26 @@ function 激活(context) {
 		}
 	}));
 
-	// 多选勾选列表：实时扫描 ssh config 供勾选（先接管、后保活），确认后写回对应设置（写回即触发上面的对齐）
+	// 多选勾选列表：实时扫描 ssh config 供勾选（先接管、后保活），确认后写回对应设置（回写即触发上面的对齐）
 	context.subscriptions.push(vscode.commands.registerCommand(命令_选择主机, () => 选择接管主机().catch(错误 => {
 		vscode.window.showErrorMessage('接管远程服务器安装：打开主机选择失败：' + 取错误信息(错误));
 	})));
 
+	// 手动命令：探测/诊断/救援本窗口终端通道（探测正常时只报平安；死亡时走完整救援阶梯且逃逸不受冷却限制）
+	context.subscriptions.push(vscode.commands.registerCommand(命令_诊断终端通道, () => 启动终端救援(context, null, true)));
+
 	// 启动时静默对齐一次：修补丢失的脚本与钩子，不打扰用户（需要决策的事项只留通知）
 	串行对齐(context, false);
 
-	// 安装命令未执行（窗口终端服务异常）自动检测：启动后立查一次，此后每 5 分钟复查（同一告警 30 分钟节流一次）
+	// 安装命令未执行（窗口终端通道死亡）自动检测：启动后立查一次，此后每 5 分钟复查；命中即自动走救援阶梯（探测→restartPtyHost→CDP 深诊断→新窗口逃逸）
 	检测安装命令未执行(context);
 	const 检测定时器 = setInterval(() => 检测安装命令未执行(context), 5 * 60 * 1000);
 	context.subscriptions.push({ dispose: () => clearInterval(检测定时器) });
+
+	// 开发自测钩子：隔离 dev host 里设 VSI_RESCUE_SELFTEST=1 时激活后自动跑一遍救援阶梯（正常环境此变量不存在，无任何影响）
+	if (process.env.VSI_RESCUE_SELFTEST === '1') {
+		setTimeout(() => 启动终端救援(context, null, true), 4000);
+	}
 }
 
 function 停用() { }
@@ -285,7 +295,7 @@ async function 执行还原(context, 交互) {
 		}
 		await 写钩子全局值(新值);
 	}
-	// 自调主机的薄脚本、公共实现与配置都要保留：用户脚本里粘贴的那行可能还在，删文件会让连接直接报错
+	// 自调主机的薄脚本、公共实现与配置都要保留：用户脚本里粘贴的那行可能还在，删文件会让它的连接直接报错
 	const 清理数量 = 清理生成脚本(保存目录, 自调主机);
 	await context.globalState.update(状态键_接管方式, undefined);
 	await context.globalState.update(状态键_接管前设置, undefined);
@@ -598,36 +608,91 @@ function 取错误信息(错误) {
 	return 错误 instanceof Error ? 错误.message : String(错误);
 }
 
-// ===== 安装命令未执行的自动检测与自救 =====
-// 故障形态（实测，VS Code 窗口终端服务的上游缺陷）：某个窗口里 Remote-SSH 经终端下发的安装/升级命令既不执行也无回显——连接终端整段空白、被拉起的 ssh 进程根本未启动、窗口反复重连只反复超时；残留的死安装终端树会由接管安装的连接前清理自动扫掉，但终端服务状态在窗口进程内部，重载窗口不换它（终端持久化会重连旧 pty 宿主）、扩展 API 也无法重建，唯一有效恢复 = 新窗口重开远程。扩展负责把这条恢复路径自动化：检测特征（近 20 分钟的 Remote-SSH 日志里同名主机反复超时、且无真实网络/凭据层报错特征）→ 主动通知 → 一键在新窗口打开远程或关闭本窗口。
+// ===== 窗口终端通道死亡的自动检测与救援 =====
+// 故障形态（实测，VS Code 的上游缺陷）：某个窗口里 Remote-SSH 经终端下发的安装/连接命令既不执行也无回显——连接终端整段空白、ssh 进程根本没启动（远端 sshd 日志也无认证痕迹）、窗口反复重连只反复超时；病灶是窗口 renderer ↔ pty host 的终端通道在窗口进程内部坏了（更新换代期 pty host 懒启动撞上版本目录交接时最易触发），重载窗口/重装扩展/清理远端都够不着它，而同期新窗口对同一主机秒连成功。
+// 检测（日志特征）只是触发器，定罪靠探针实测（terminalRescue.js）：createTerminal 限时竞速 processId。救援阶梯全自动：L1 restartPtyHost → L2 CDP 断点交接深诊断+安全修复（取证落盘 %TEMP%\vsi-terminal-rescue-report.json）→ L3 自动新窗口重开远程（实测 100% 有效），每主机逃逸冷却 10 分钟防窗口风暴。
 const 状态键_终端失灵提示时刻 = '安装命令未执行提示时刻';
 let 终端失灵提示已弹 = false;
+let 救援进行中 = false;
+let 救援日志通道 = null;
+
+function 取救援日志通道() {
+	if (!救援日志通道) { 救援日志通道 = vscode.window.createOutputChannel('接管安装·终端救援'); }
+	return 救援日志通道;
+}
 
 function 检测安装命令未执行(context) {
-	if (终端失灵提示已弹) { return; }
+	if (终端失灵提示已弹 || 救援进行中) { return; }
 	try {
-		const 上次 = context.globalState.get(状态键_终端失灵提示时刻, 0);
 		const 名单 = [...new Set([...取主机清单设置(接管主机键), ...取主机清单设置(保活主机键)])];
 		if (名单.length === 0) { return; }
 		const 命中 = 找近期安装超时日志(名单);
 		if (!命中) { return; }
 		终端失灵提示已弹 = true;
 		context.globalState.update(状态键_终端失灵提示时刻, Date.now());
-		const 主机文本 = 命中.主机.length > 0 ? ('「' + 命中.主机.join('」「') + '」') : '接管主机';
-		vscode.window.showWarningMessage(
-			'接管远程服务器安装：Remote-SSH 连接反复超时（20 分钟内 ' + 命中.次数 + ' 次），且安装命令未在终端侧执行——本窗口的 VS Code 终端服务已异常（上游缺陷；残留进程树已自动清理，重载本窗口无效）。' + 主机文本 + '请在新窗口打开即可恢复。',
-			'在新窗口打开…', '关闭本窗口'
-		).then(选择 => {
-			if (选择 === '在新窗口打开…') {
-				在新窗口打开远程(命中.主机[0] || null, 名单).catch(错误 => {
-					vscode.window.showErrorMessage('接管远程服务器安装：新窗口打开失败：' + 取错误信息(错误));
-				});
-			} else if (选择 === '关闭本窗口') {
-				vscode.commands.executeCommand('workbench.action.closeWindow');
-			}
-		});
+		void 启动终端救援(context, 命中.主机[0] || null, false);
 	} catch (错误) {
 		console.error('[接管远程服务器安装] 安装命令未执行检测出错：' + 取错误信息(错误));
+	}
+}
+
+// 救援阶梯编排入口（检测触发与手动命令共用）。探测正常时说明超时另有原因（远端慢/网络/凭据），绝不误逃逸。
+async function 启动终端救援(context, 主机, 手动) {
+	if (救援进行中) { return; }
+	救援进行中 = true;
+	const 通道 = 取救援日志通道();
+	const 日志 = 消息 => { 通道.appendLine('[' + new Date().toLocaleTimeString() + '] ' + 消息); console.log('[接管远程服务器安装·终端救援] ' + 消息); };
+	日志('===== 救援开始（主机: ' + (主机 || '(自动判定)') + '，触发: ' + (手动 ? '手动命令' : '连接反复超时检测') + '）=====');
+	try {
+		const 结果 = await 终端救援.救援终端通道(context, 主机, 日志, { 手动 });
+		if (结果.结果 === '健康') {
+			日志('探针实测终端通道正常——反复超时另有原因（远端慢/网络/凭据等），不做窗口级救援');
+			if (手动) {
+				// 手动模式下顺带跑一次 L2 只读深诊断：验证 CDP 交接链路，并给出健康窗口的基线报告（backend 注册、connectionState 等）
+				const 仅诊断 = await 终端救援.经CDP诊断并修复(日志, false);
+				void vscode.window.showInformationMessage('终端通道探测：正常。' + (仅诊断 ? 'CDP 深诊断：' + JSON.stringify(仅诊断.诊断) : '（CDP 诊断跳过/失败，详见日志）'), '查看救援日志').then(选 => { if (选) { 通道.show(true); } });
+			}
+			return;
+		}
+		if (结果.结果 === '判定失败') {
+			日志('探针判定失败（非通道死亡），未做任何救援：' + JSON.stringify(结果.详情?.探 ?? {}));
+			if (手动) { void vscode.window.showWarningMessage('终端通道探测：无法判定（探针立即报错，不构成通道死亡证据）。详见日志。', '查看救援日志').then(选 => { if (选) { 通道.show(true); } }); }
+			return;
+		}
+		if (结果.结果 === 'L1就地修复' || 结果.结果 === 'L2重启pty宿主') {
+			日志('救援成功（' + 结果.结果 + '），本窗口可重试连接');
+			void vscode.window.showInformationMessage('接管远程服务器安装：本窗口终端通道曾异常，已自动修复（' + 结果.结果 + '）。现在可以重试远程连接。', '查看救援日志').then(选 => { if (选) { 通道.show(true); } });
+			return;
+		}
+		if (结果.结果 === '已逃逸') {
+			日志('已自动在新窗口重开远程「' + 结果.详情.主机 + '」');
+			void vscode.window.showWarningMessage(
+				'接管远程服务器安装：本窗口终端通道已死亡且无法在窗口内自愈（VS Code 上游缺陷；重载本窗口无效）。已自动在新窗口重开远程「' + 结果.详情.主机 + '」，请在新窗口继续（本窗口可关闭）。',
+				'查看救援日志', '关闭本窗口'
+			).then(选 => {
+				if (选 === '查看救援日志') { 通道.show(true); }
+				else if (选 === '关闭本窗口') { vscode.commands.executeCommand('workbench.action.closeWindow'); }
+			});
+			return;
+		}
+		// 救援失败：保留手动兜底入口
+		const 名单 = [...new Set([...取主机清单设置(接管主机键), ...取主机清单设置(保活主机键)])];
+		void vscode.window.showWarningMessage(
+			'接管远程服务器安装：本窗口终端通道已死亡，自动救援未成功' + (结果.详情?.冷却中 ? '（逃逸冷却中，稍后将自动重试）' : '') + '。在新窗口打开远程即可恢复。',
+			'在新窗口打开…', '查看救援日志', '关闭本窗口'
+		).then(选择 => {
+			if (选择 === '在新窗口打开…') {
+				在新窗口打开远程(主机, 名单).catch(错误 => {
+					vscode.window.showErrorMessage('接管远程服务器安装：新窗口打开失败：' + 取错误信息(错误));
+				});
+			} else if (选择 === '查看救援日志') { 通道.show(true); }
+			else if (选择 === '关闭本窗口') { vscode.commands.executeCommand('workbench.action.closeWindow'); }
+		});
+	} catch (错误) {
+		日志('救援流程异常：' + 取错误信息(错误));
+		console.error('[接管远程服务器安装] 终端救援异常：' + 取错误信息(错误));
+	} finally {
+		救援进行中 = false;
 	}
 }
 
@@ -706,6 +771,54 @@ async function 在新窗口打开远程(首选主机, 名单) {
 	// Remote-SSH 的非 ASCII 主机 authority 采用 UTF-8 十六进制编码形态（与 code-insiders --remote ssh-remote+<hex> 实测一致）
 	const authority = 'ssh-remote+' + Buffer.from(主机, 'utf8').toString('hex');
 	await vscode.commands.executeCommand('vscode.open', vscode.Uri.parse('vscode-remote://' + authority + '/'));
+}
+
+// 检测 VS Code 或 Remote-SSH 版本更新，提示清理连接状态避免旧窗口 reload 失败
+function 检测版本更新并清理状态(context) {
+	const 状态键_上次版本 = 'lastSeenVersion';
+	const 状态键_清理提示抑制 = 'cleanupPromptSuppressed';
+	
+	const 当前版本 = vscode.version;
+	const 上次版本 = context.globalState.get(状态键_上次版本);
+	
+	if (上次版本 && 上次版本 !== 当前版本) {
+		const 已抑制 = context.globalState.get(状态键_清理提示抑制, false);
+		if (!已抑制) {
+			vscode.window.showWarningMessage(
+				'检测到 VS Code 已从 ' + 上次版本 + ' 更新至 ' + 当前版本 + '。若当前窗口重新加载后远程连接失败，请执行「Remote-SSH: Kill VS Code Server on Host」清理状态，或关闭当前窗口并重新打开。',
+				'立即清理全部主机', '不再提示'
+			).then(选择 => {
+				if (选择 === '立即清理全部主机') {
+					清理全部主机连接状态(context);
+				} else if (选择 === '不再提示') {
+					context.globalState.update(状态键_清理提示抑制, true);
+				}
+			});
+		}
+	}
+	
+	context.globalState.update(状态键_上次版本, 当前版本);
+}
+
+// 清理所有已配置主机的 Remote-SSH 连接状态
+async function 清理全部主机连接状态(context) {
+	const 接管的 = 取主机清单设置(接管主机键);
+	const 保活的 = 取主机清单设置(保活主机键);
+	const 全部主机 = Array.from(new Set([...接管的, ...保活的]));
+	
+	if (全部主机.length === 0) {
+		vscode.window.showInformationMessage('未配置任何接管的主机，无需清理。');
+		return;
+	}
+	
+	try {
+		for (const 主机 of 全部主机) {
+			await vscode.commands.executeCommand('remote-ssh.killServerOnHost', 主机);
+		}
+		vscode.window.showInformationMessage('已清理 ' + 全部主机.length + ' 个主机的连接状态。关闭当前窗口并重新打开以建立全新连接。');
+	} catch (错误) {
+		vscode.window.showErrorMessage('清理连接状态时出错：' + 取错误信息(错误));
+	}
 }
 
 module.exports = { activate: 激活, deactivate: 停用 };
