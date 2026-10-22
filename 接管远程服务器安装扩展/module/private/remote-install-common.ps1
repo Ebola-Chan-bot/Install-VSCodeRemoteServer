@@ -77,7 +77,7 @@ function 安装-远程CLI {
 		[pscustomobject]$CLI信息
 	)
 
-	# 仅补装缺失的 CLI（Remote-SSH 引导仅做文件存在性检查，存在即视为已安装）；CLI 压缩包约 30MB，直接整包下载，无需断点续传，失败按递增间隔无限重试
+	# 仅补装缺失的 CLI（Remote-SSH 引导仅做文件存在性检查，存在即视为已安装）；CLI 压缩包约 30MB，直接整包下载，无需断点续传；失败无限重试，重试时刻对齐到下个汇报周期（见下方「单一时钟」注释）
 	# VS Code 连接时的官方引导会与本脚本并行下载并启动同名 CLI：运行中的 exe 被系统锁定、无法覆盖，只复制不复查会永远报"文件被占用"并无限重试，故每轮重试前与失败后都复查落地文件，只要它已出现即视为安装完成（文件名含提交号，同名即同版本，无需覆盖）
 	# 落位用改名而非复制：解包目录与目标同在数据目录下，改名是原子操作，中断也不会留下残缺 exe 占着正式名而被误判为已安装
 	if (Test-Path -LiteralPath $CLI信息.落地路径) {
@@ -90,6 +90,14 @@ function 安装-远程CLI {
 	$cli压缩包路径 = Join-Path $数据目录 ('vscode-cli-{0}.zip' -f [System.IO.Path]::GetFileNameWithoutExtension($CLI信息.落地路径))
 
 	$重试次数 = 0
+	# 下载地址只在首次尝试时公布一次：无限重试下每轮都重刷整条 URL 会把日志淹掉
+	$地址已公布 = $false
+	# 单一时钟（汇报周期既是打印节奏也是重试节奏）：一次中断只打一条中断行（它就是本轮的汇报），重试等到下个汇报周期，不再有写死的固定等待秒数、也不另立一套事件周期。本函数是整包下载（无分块进度），失败即本轮毫无进展，故每轮失败都把周期放宽一档（与「总量未知只增不减」同规则），避免瞬时失败把日志刷成每秒一条；周期上限不写死
+	# 报告周期秒数 与 上次汇报时刻 均在重试循环外初始化（断点续传时继承上一段的节奏，不从 1 秒重新开始）。
+	# 上次汇报时刻必须用现实时刻初始化，绝不能用 [datetime]::MinValue：那样 ($此刻 − 上次汇报时刻).TotalSeconds ≈ 6.4e10，catch里的 [int] 转换会抛 InvalidCastIConvertible — 异常从 catch 逸出会穿透重试循环，整条下载当场中止（实测缺陷，已由 _probe 自检拦下）
+	$报告周期秒数 = 1
+	$上次汇报时刻 = Get-Date
+	$等待秒数 = 1
 	while ($true) {
 		$重试次数++
 		# 重试前复查：并行的官方引导可能已把 CLI 装好（甚至已启动），此时安装实际已完成，直接收尾退出，不再徒劳下载 30MB 后必然复制失败
@@ -98,7 +106,11 @@ function 安装-远程CLI {
 			return
 		}
 		try {
-			Write-Host ('[{0}] 开始下载远程 CLI（第 {1} 次尝试）: {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $重试次数, $CLI信息.下载地址)
+			# 起始行只在首次打一次（含下载地址）；其后每轮不再回显，重试事实由 catch 里受节的出口带出
+			if (-not $地址已公布) {
+				$地址已公布 = $true
+				Write-Host ('[{0}] 开始下载远程 CLI: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $CLI信息.下载地址)
+			}
 			Invoke-WebRequest -Uri $CLI信息.下载地址 -OutFile $cli压缩包路径 -UseBasicParsing
 
 			展开-CLI压缩包 -压缩包路径 $cli压缩包路径 -CLI信息 $CLI信息
@@ -106,7 +118,14 @@ function 安装-远程CLI {
 			Write-Host ('[{0}] 远程 CLI 安装完成: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $CLI信息.落地路径)
 			return
 		} catch {
-			Write-Host ('[{0}] 第 {1} 次 CLI 下载中断: {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $重试次数, $_.Exception.Message)
+			$中断原因 = $_.Exception.Message
+			$此刻 = Get-Date
+			# 整包下载失败即本轮毫无进展：周期放宽一档（下限 1 秒、上限不写死）
+			$报告周期秒数++
+			# 重试对齐到下个汇报周期：扣掉本轮在上次汇报之后已经耗掉的秒数（一次耗时几十秒的尝试本身就算消耗了一个周期），下限 1 秒
+			$等待秒数 = [Math]::Max(1, [int][Math]::Ceiling($报告周期秒数 - ($此刻 - $上次汇报时刻).TotalSeconds))
+			$上次汇报时刻 = $此刻
+			Write-Host ('[{0}] 第 {1} 次 CLI 下载中断: {2}，下个汇报周期（{3} 秒后）重试' -f $此刻.ToString('yyyy-MM-dd HH:mm:ss'), $重试次数, $中断原因, $等待秒数)
 			# 失败后复查：报"被另一进程占用"通常就是并行引导已把 CLI 装好并在运行，此时安装实际已完成，视为成功收尾而非无限重试
 			if (Test-Path -LiteralPath $CLI信息.落地路径) {
 				Write-Host ('[{0}] CLI 已就位（并行安装完成），视为安装完成: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $CLI信息.落地路径)
@@ -114,7 +133,7 @@ function 安装-远程CLI {
 			}
 		}
 
-		Start-Sleep -Seconds $重试次数
+		Start-Sleep -Seconds $等待秒数
 	}
 }
 
@@ -225,6 +244,26 @@ function 竞速-单个产物 {
 	}
 
 	return [pscustomobject]@{ 获胜方 = $获胜方; 获胜包路径 = $获胜包路径 }
+}
+
+function 清理-竞速暂存目录 {
+	param(
+		[string]$暂存目录
+	)
+
+	# 竞速暂存目录的清理规则（并发安全）：**绝不整目录删除**——另一窗口/另一条连接（同一主机、同一提交号，暂存目录名也相同）可能正在往本目录上传在途文件，整删会把它的 <包名>.uploading 连目录一起清走，它的改名命令随即报「在途文件不在」并放弃本地供给（实测已发生：远端 race-<提交号> 目录整个消失，本地供给只拿到退出码 1，真因还被 CLIXML 噪声淹没）。
+	# 必清的只有「会让本轮误判」的东西：完成/取消标记（残留标记 = 假获胜）与已完成产物包（本轮要重新竞速）；
+	# 在途 .uploading 按年龄判归属：6 小时内还在动 = 活连接的文件，一概不碰；更旧 = 死连接遗留，顺手清掉免得堆积。
+	if ([string]::IsNullOrWhiteSpace($暂存目录)) { return }
+	if (-not (Test-Path -LiteralPath $暂存目录)) {
+		New-Item -ItemType Directory -Force -Path $暂存目录 | Out-Null
+		return
+	}
+	$在途保留下限 = (Get-Date).AddHours(-6)
+	foreach ($项 in @(Get-ChildItem -LiteralPath $暂存目录 -Force -ErrorAction SilentlyContinue)) {
+		if ($项.Name -like '*.uploading' -and $项.LastWriteTime -gt $在途保留下限) { continue }
+		Remove-Item -LiteralPath $项.FullName -Recurse -Force -ErrorAction SilentlyContinue
+	}
 }
 
 function 取-下载地址 {
@@ -372,15 +411,25 @@ function 通过HTTP断点续传下载 {
 	}
 
 	# 基于 HTTP Range 头的断点续传：本地已存在部分文件时从偏移处继续。
-	# 不限重试次数与总时长，失败等待秒数逐次递增（1秒、2秒、3秒……），所有输出带时间戳。
+	# 不限重试次数与总时长；重试时刻对齐到下个汇报周期（见下方单一时钟），所有输出带时间戳。
 	# 报告周期在重试循环外初始化：断点续传时继承上一段的周期，不从 1 秒重新开始
 	$重试次数 = 0
 	$报告周期秒数 = 1
 	# 总计已用秒数的计时起点同样在重试循环外：估算平均速度 = 已下载字节数 / 总计已用秒数
 	$下载起始时刻 = Get-Date
+	# 单一时钟（汇报周期既是进度行的打印节奏，也是中断行与重试的节奏）：
+	# ①下载地址随首次尝试的起始行公布一次，其后每轮不再回显（实测一次截断风暴重试到 50 余轮，同一条链接把日志刷满）；
+	# ②上次汇报时刻由进度行与中断行共同推进，故一轮里两类行不会各打一遍——一次中断恒为一条消息，不再有「起始行 + 中断行」两条；
+	# ③重试等到下个汇报周期：等待 = 周期 − 本轮在上次汇报之后已耗掉的秒数（下限 1 秒）。一次耗时几十秒的停等本身就算消耗了一个周期，故不会在其上再叠一段固定等待；周期上限不写死。
+	$地址已公布 = $false
+	# 上次汇报时刻由进度行与中断行共同推进；必须用现实时刻初始化，绝不能用 [datetime]::MinValue（否则 catch 里算「本轮已耗」时 [int] 转换会抛异常，异常从 catch 逸出会穿透重试循环、整条下载当场中止；实测缺陷已由 _probe\download-log-selftest.ps1 拦下）
+	$上次汇报时刻 = Get-Date
+	$等待秒数 = 1
 	while ($true) {
 		$重试次数++
 		$已存在字节数 = 0
+		# 本轮落地字节数在 try 外先归零：catch 里要靠它判「本轮是否毫无进展」（连接秒失败时 try 内根本没走到赋值）
+		$已写入字节数 = 0
 		if (Test-Path $目标路径) {
 			$已存在字节数 = (Get-Item $目标路径).Length
 		}
@@ -389,11 +438,15 @@ function 通过HTTP断点续传下载 {
 			$Web请求 = [System.Net.HttpWebRequest]::Create($下载地址)
 			$Web请求.Timeout = 60000
 			$Web请求.ReadWriteTimeout = 60000
-			if ($已存在字节数 -gt 0) {
-				$Web请求.AddRange($已存在字节数)
-				Write-Host ('[{0}] 从 {1} 字节处断点续传（第 {2} 次尝试）: {3}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $已存在字节数, $重试次数, $下载地址)
-			} else {
-				Write-Host ('[{0}] 开始下载（第 {1} 次尝试）: {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $重试次数, $下载地址)
+			if ($已存在字节数 -gt 0) { $Web请求.AddRange($已存在字节数) }
+			# 起始行只在首次打一次（含下载地址与续传起点）；其后每轮不再回显，中断与真实续传点由 catch 里受节的出口一并报出
+			if (-not $地址已公布) {
+				$地址已公布 = $true
+				if ($已存在字节数 -gt 0) {
+					Write-Host ('[{0}] 从 {1} 字节处断点续传: {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $已存在字节数, $下载地址)
+				} else {
+					Write-Host ('[{0}] 开始下载: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $下载地址)
+				}
 			}
 
 			$响应 = $Web请求.GetResponse()
@@ -420,9 +473,7 @@ function 通过HTTP断点续传下载 {
 
 				$响应流 = $响应.GetResponseStream()
 				$缓冲区 = New-Object byte[] 65536
-				$已写入字节数 = 0
-				$上次报告时间 = [datetime]::MinValue
-				# 报告周期沿用外层变量且断点续传不重置；疏密由 下次汇报间隔 按预计剩余时间自动决定，下限 1 秒
+				# 汇报时刻沿用外层变量（进度行与中断行共用一个时钟），断点续传不重置；疏密由 下次汇报间隔 按预计剩余时间自动决定，下限 1 秒
 				while ($true) {
 					$读取字节数 = $响应流.Read($缓冲区, 0, $缓冲区.Length)
 					if ($读取字节数 -le 0) { break }
@@ -430,8 +481,8 @@ function 通过HTTP断点续传下载 {
 					$文件流.Write($缓冲区, 0, $读取字节数)
 					$已写入字节数 += $读取字节数
 					$当前时间 = Get-Date
-					if (($当前时间 - $上次报告时间).TotalSeconds -ge $报告周期秒数) {
-						$上次报告时间 = $当前时间
+					if (($当前时间 - $上次汇报时刻).TotalSeconds -ge $报告周期秒数) {
+						$上次汇报时刻 = $当前时间
 						$已传总字节数 = $已存在字节数 + $已写入字节数
 						# 进度行只有远程/本地两种句式且不带内嵌时间戳：批量补刷后外层显示时刻与实际发生时刻一致，内嵌远端时钟只会与外层本地时钟打架
 						if ($内容总长度 -gt 0) {
@@ -493,11 +544,21 @@ function 通过HTTP断点续传下载 {
 				Write-Host ('[{0}] 服务器返回 416：文件 {1} 字节已完整，无需续传。' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $已存在字节数)
 				return
 			}
-			Write-Host ('[{0}] 第 {1} 次下载中断: {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $重试次数, $_.Exception.Message)
+			$中断原因 = $_.Exception.Message
+			# 续传点 = 失败瞬间的本地文件长度（本轮已写入的部分已在上面的 finally 里 dispose 落盘），比「本轮起点字节数」更能反映真实进度
+			$续传点字节数 = 0
+			if (Test-Path $目标路径) { $续传点字节数 = (Get-Item $目标路径).Length }
+			$此刻 = Get-Date
+			# 本轮一个字节都没落地（连接被拒/DNS 失败等瞬时错误）：周期放宽一档，与「总量未知只增不减」同规则；本轮有进度时周期不动——它已由 下次汇报间隔 按真实速度自适应，失败不该额外拖慢恢复
+			if ($已写入字节数 -le 0) { $报告周期秒数++ }
+			# 重试对齐到下个汇报周期：扣掉本轮在上次汇报（进度行或上一次中断行）之后已耗掉的秒数，下限 1 秒
+			$等待秒数 = [Math]::Max(1, [int][Math]::Ceiling($报告周期秒数 - ($此刻 - $上次汇报时刻).TotalSeconds))
+			$上次汇报时刻 = $此刻
+			Write-Host ('[{0}] 第 {1} 次下载中断（续传点 {2} 字节）: {3}，下个汇报周期（{4} 秒后）重试' -f $此刻.ToString('yyyy-MM-dd HH:mm:ss'), $重试次数, $续传点字节数, $中断原因, $等待秒数)
 		}
 
-		# 保留已下载的部分文件，等待递增秒数后自动续传重试（1秒、2秒、3秒……）
-		Start-Sleep -Seconds $重试次数
+		# 保留已下载的部分文件，等到下个汇报周期再自动续传（周期由 下次汇报间隔 自适应 + 无进展时逐轮放宽，不再写死秒数）
+		Start-Sleep -Seconds $等待秒数
 	}
 }
 
@@ -666,9 +727,8 @@ $获胜包路径 = $下载压缩包路径
 if ($启用竞速) {
 	# ===== 竞速模式：每个缺失产物各竞速一次（本地下载+上传 vs 远程自下载，先完成者获胜），CLI 与服务端独立判胜、互不拖累 =====
 	# 单边断网时由另一边补上：远端连不上下载服务器就等本地供给，本地下载失败就等远程自下载
-		# 清建暂存目录：上一轮的残包与标记必须清掉（残留的完成标记会让本轮误判本地供给已获胜、残留半成品会被误当完整包）；本地供给听到下方标记才启动，不会误删它的在途文件。
-		Remove-Item -LiteralPath $暂存目录 -Recurse -Force -ErrorAction SilentlyContinue
-		New-Item -ItemType Directory -Force $暂存目录 | Out-Null
+		# 清建暂存目录：只清会让本轮误判的标记与残留完成包，**绝不整删目录**（并发连接的在途上传会被毁掉，详见 清理-竞速暂存目录）；本地供给听到下方标记才启动
+		清理-竞速暂存目录 -暂存目录 $暂存目录
 		# 供给触发标记：本地模块听到此行才启动本地供给子进程（顺序保证：清建先于任何上传），只报真正待装的产物。
 		$待装产物名 = @()
 		if (-not $CLI已就位) { $待装产物名 += 'CLI' }
@@ -762,9 +822,9 @@ if ($可用包路径 -eq '') {
 Write-Host '下载完成，开始解压。'
 展开-服务器压缩包 -压缩包路径 $可用包路径 -目标目录 $最终安装目录
 
-# 竞速暂存目录用完即清（本地模块收尾时也会再清一次，双保险）
+# 竞速暂存目录用完即清（本地模块收尾时也会再清一次，双保险）：同样不碰并发连接正在传的在途文件
 if (-not [string]::IsNullOrWhiteSpace($暂存目录)) {
-	Remove-Item -LiteralPath $暂存目录 -Recurse -Force -ErrorAction SilentlyContinue
+	清理-竞速暂存目录 -暂存目录 $暂存目录
 }
 
 Write-Host '安装完成，当前目录内容如下。'

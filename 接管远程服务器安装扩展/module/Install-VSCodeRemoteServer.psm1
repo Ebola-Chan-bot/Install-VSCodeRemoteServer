@@ -856,6 +856,8 @@ function 安装-VSCode远程服务 {
 				分隔符 = $竞速上下文.分隔符
 				提交号 = $竞速上下文.提交号
 				架构标识 = $竞速上下文.架构标识
+				# 父进程（本模块宿主）ID：子进程靠它做「父死即自终止」看护。主模块可能被 VS Code 直接杀掉（连接超时/用户取消），此时根本走不到下方的 等待-供给进程并回收日志，子进程会变成孤儿继续把 190MB 下完并死握共用缓存文件（实测堵死下一个连接八分钟）。0 = 不启用看护。
+				父进程ID = $PID
 			} | Export-Clixml -LiteralPath $参数文件
 
 			$供给脚本 = Join-Path $script:模块根目录 'private\local-supply.ps1'
@@ -1737,6 +1739,21 @@ function 安装-VSCode远程服务 {
 			Write-Output ('已清理本地孤儿连接进程 {0} 个（断线残留，仍持有远程会话）。' -f $孤儿数)
 		}
 	} catch { }
+	# ===== 孤儿本地供给进程清理：连接被取消/超时时主模块直接死，走不到 taskkill 收尾，本地供给子进程就成了孤儿（实测存活 34 分钟）。它会把整个包下完并死握共用缓存文件：实测同时连接的新供给进程被堵八分钟、刷六条「文件被占用」中断。判据与上下两段清理同纪律：命令行带 local-supply.ps1 特征 + 直系父进程已死 + 仅限本 Windows 登录会话，父进程在侧（活的供给进程）与其它会话一概不碰。子进程自带的「父死即自终止」是第一道防线，这里清掉的是升级前就已遗留的旧孤儿（它们不知道看护规则）。
+	try {
+		$供给孤儿数 = 0
+		foreach ($候 in @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue)) {
+			if ($候.CommandLine -notmatch 'local-supply\.ps1') { continue }
+			if ($null -ne $候.SessionId -and [int]$候.SessionId -ne $本会话ID) { continue }
+			if ($候.ProcessId -eq $PID) { continue }
+			if ($null -ne (Get-Process -Id $候.ParentProcessId -ErrorAction SilentlyContinue)) { continue }
+			& taskkill /PID $候.ProcessId /T /F 2>&1 | Out-Null
+			$供给孤儿数++
+		}
+		if ($供给孤儿数 -gt 0) {
+			Write-Output ('已清理孤儿本地供给进程 {0} 个（断线连接遗留，正占用共用缓存文件并白吃带宽）。' -f $供给孤儿数)
+		}
+	} catch { }
 	# ===== 死安装终端清理：Remote-SSH 在隐藏终端里跑安装脚本，连接超时放弃/窗口异常后终端的 pty 宿主先死，cmd（连带内层 cmd 与 ssh 子树）成为孤儿挂在死管道上——仍占控制台会话、仍握着已放弃的远程会话隧道，残留累积会拖垮后续连接的输出投递（实测同窗口残留累积后新连接的安装命令根本不被执行、终端一个字节都不上屏）。判据三重全满足才杀：①命令行带安装终端特征（vscode-linux-multi-line-command）；②仅限本 Windows 会话内的候选；③直系父进程已死且向上 8 代祖先链找不到任何存活终端宿主。宿主名单必须含 VS Code 窗口/pty 宿主进程（^Code/VSCodium）：实测存活终端的进程链是 cmd ← Code(pty宿主) ← Code(窗口)，conhost/OpenConsole 是旁挂兄弟而非祖先，旧判据只认 conhost 会把一切存活安装终端（含其它窗口正在跑的）误判成孤儿整树杀掉、对方窗口弹“终端进程已终止”；现在凡有存活宿主或存活父进程在侧的一概不碰，只有窗口已亡的无主孤儿才清。
 	try {
 		$进程快照 = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
@@ -1768,9 +1785,10 @@ function 安装-VSCode远程服务 {
 	$远程附加压缩包文件名 = $null
 
 	# 认证与环境试探合并：免密主机一次连接拿到全部环境信息；需密码主机在密码注入后的第一次连接拿到
-	# 竞速暂存的预清理+预建随环境探测同一条连接完成（残包/取消标记清掉、目录建好）：必须早于本地供给启动（防残包被误当完整包），又不值得独占一条连接。sh -c 包装让命令只在 POSIX 端生效（cmd/PowerShell 下是无害噪声），~ 即登录目录，单引号避开 PS 5.1 传参剥双引号的坑
+	# 竞速暂存的预清理+预建随环境探测同一条连接完成（残留标记与完整包清掉、目录建好）：必须早于本地供给启动（防残包被误当完整包），又不值得独占一条连接。sh -c 包装让命令只在 POSIX 端生效（cmd/PowerShell 下是无害噪声），$HOME 即登录目录，单引号避开 PS 5.1 传参剥双引号的坑。
+	# **绝不 rm -rf 整目录**：暂存目录名只按提交号、不带连接唯一性，另一条并发连接可能正在往同一目录上传 <包名>.uploading，整删会让它的改名步骤报「在途文件不在」而白白失去本地供给（Windows 侧实测已发生）。只清非 .uploading 项，在途文件留给收尾清理按 6 小时龄回收。
 	$竞速数据目录名 = if ($本地信息.发布通道 -eq 'insider') { '.vscode-server-insiders' } else { '.vscode-server' }
-	$竞速预备命令 = "sh -c 'rm -rf ~/{0}/race-{1}; mkdir -p ~/{0}/race-{1}'" -f $竞速数据目录名, $本地信息.提交号
+	$竞速预备命令 = "sh -c 'D=`$HOME/{0}/race-{1}; mkdir -p `$D; for f in `$D/*; do [ -e `$f ] || continue; case `$f in *.uploading) continue;; esac; rm -rf `$f; done; exit 0'" -f $竞速数据目录名, $本地信息.提交号
 	# 非交互（preconnect）优先走单会话：探测/上传/执行一条连接全包（实测慢速主机每条独立连接 25s 会话开销）；Linux用 sh 引导，Windows 用 powershell -EncodedCommand 引导（脚本经 stdin）；建不起来或探测取不到结果时自然回退离散流程（交互式手动调用恒走离散，保留密码收集能力）
 	$接管会话 = $null
 	$平台提示 = ''

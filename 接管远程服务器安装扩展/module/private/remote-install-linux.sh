@@ -84,6 +84,49 @@ log() {
 	echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
 
+# 事件行输出（下载失败/重试等中断提示）：与 Windows 侧同一个「单一时钟」规则——汇报周期既是打印节奏也是重试节奏。一次中断恒为一条消息（每轮只调一次，各源的细节由调用方并进同一条正文，不另起行），打印即重启汇报时钟；同时把「到下个汇报点还差多少秒」写进 EVENT_SLEEP_NEXT 供调用方 sleep（下限 1 秒），于是重试就在下个汇报周期：一次耗时几十秒的尝试本身已消耗一个周期（差值为负则立即重试），不在其上再叠一段固定等待；周期上限不写死（无固定 30 秒），只由调用方在「本轮毫无进展」时 EVENT_INTERVAL++ 放宽一档（与 Windows 侧的 周期++ 同规则）。
+# POSIX sh 无局部变量，门控状态一律用 EVENT_ 前缀的独特全局名，避免与调用方变量互相覆盖（教训：循环变量曾覆盖同名配置变量）。
+EVENT_REPORT_AT=0
+EVENT_INTERVAL=1
+EVENT_SLEEP_NEXT=1
+log_event() {
+	EVENT_NOW=$(date +%s)
+	EVENT_ELAPSED=$EVENT_NOW
+	if [ "$EVENT_REPORT_AT" -gt 0 ]; then
+		EVENT_ELAPSED=$((EVENT_NOW - EVENT_REPORT_AT))
+	fi
+	# 本轮在上次汇报之后已耗掉的时间算进周期，故差值即「到下个汇报点的剩余等待」
+	EVENT_SLEEP_NEXT=$((EVENT_INTERVAL - EVENT_ELAPSED))
+	if [ "$EVENT_SLEEP_NEXT" -lt 1 ]; then
+		EVENT_SLEEP_NEXT=1
+	fi
+	log "$1，下个汇报周期（$EVENT_SLEEP_NEXT 秒后）重试"
+	EVENT_REPORT_AT=$EVENT_NOW
+}
+
+# 竞速暂存目录清理（并发安全）：绝不 rm -rf 整目录——另一条并发连接（同主机同提交号，staging 名相同）可能正在传 <包名>.uploading，整删会让它的改名步骤报「在途文件不在」而失去本地供给。只清非 .uploading 项（残留完成/取消标记会让本轮误判胜负，完整包本轮要重新竞速），在途文件超过 6 小时未动（死连接遗留）才顺手清掉防堆积。
+cleanup_staging() {
+	if [ -z "$STAGING" ]; then
+		return 0
+	fi
+	if [ ! -d "$STAGING" ]; then
+		mkdir -p "$STAGING" 2>/dev/null || true
+		return 0
+	fi
+	for F in "$STAGING"/* "$STAGING"/.[!.]*; do
+		[ -e "$F" ] || continue
+		case "$F" in
+			*.uploading)
+				continue
+				;;
+		esac
+		rm -rf "$F" 2>/dev/null || true
+	done
+	if command -v find >/dev/null 2>&1; then
+		find "$STAGING" -name '*.uploading' -mmin +360 -exec rm -f '{}' ';' 2>/dev/null || true
+	fi
+}
+
 # ===== 下载原语（sh 逐行解释执行，函数必须定义在所有调用点之前：install_cli 在下方即会调用）=====
 download_file() {
 	url="$1"
@@ -128,29 +171,38 @@ run_remote_download() {
 	PKG_OUT="$1"
 	DONE_MARK="$2"
 	CLI_ATTEMPT=0
-	WAIT_SECONDS=0
-	# 无限重试：第 1 次失败后等 1 秒，第 2 次失败后等 2 秒，依此类推，每多重试一次多等 1 秒
+	SRC_TOTAL=2
+	# 源清单只公布一次：无限重试下每轮都重刷整条 URL 会淹掉日志；每源一行的「开始下载」同样只在首轮报，其后由受节流的事件行带回次数与源序号（序号回指本清单）
+	log "下载源（按序轮试）：1) $URL_PRIMARY  2) $URL_FALLBACK"
+	# 无限重试，重试时刻对齐到下个汇报周期（见 log_event），不再写死递增秒数
 	while true; do
 		CLI_ATTEMPT=$((CLI_ATTEMPT + 1))
-		if [ "$CLI_ATTEMPT" -gt 1 ]; then
-			WAIT_SECONDS=$((CLI_ATTEMPT - 1))
-			log "上次下载失败，等待 $WAIT_SECONDS 秒后开始第 $CLI_ATTEMPT 次重试..."
-			sleep "$WAIT_SECONDS"
-		fi
+		SRC_IDX=0
+		ROUND_GOT=0
+		ROUND_NOTE=''
 		for URL in "$URL_PRIMARY" "$URL_FALLBACK"; do
-			log "开始下载: $URL"
+			SRC_IDX=$((SRC_IDX + 1))
+			if [ "$CLI_ATTEMPT" -eq 1 ]; then
+				log "开始下载（源 $SRC_IDX/$SRC_TOTAL）"
+			fi
 			if download_file "$URL" "$PKG_OUT" && [ -s "$PKG_OUT" ]; then
+				ROUND_GOT=1
 				# gzip 完整性校验：流式下载读到底不等于传完整，截断包解压只会报晦涩错误，坏包弃用换源重下
 				if gzip -t "$PKG_OUT" 2>/dev/null; then
 					touch "$DONE_MARK"
 					return 0
 				fi
-				log '压缩包完整性校验未通过（疑似截断），弃用重下。'
-				rm -f "$PKG_OUT"
+				# 截断原因并进本轮唯一一条事件行，不另起一行（一次失败多条消息就是冗余汇报点）
+				ROUND_NOTE="${ROUND_NOTE}源 $SRC_IDX 的包完整性校验未通过已弃用；"
 			fi
+			rm -f "$PKG_OUT"
 		done
-		log '本次下载失败，清理残留文件。'
-		rm -f "$PKG_OUT"
+		# 本轮毫无进展（一个字节都没落地）才放宽周期；拿到过字节时周期不动，失败不额外拖慢恢复
+		if [ "$ROUND_GOT" -eq 0 ]; then
+			EVENT_INTERVAL=$((EVENT_INTERVAL + 1))
+		fi
+		log_event "第 $CLI_ATTEMPT 次下载失败（$SRC_TOTAL 个源均未取到，${ROUND_NOTE}残留已清理）"
+		sleep "$EVENT_SLEEP_NEXT"
 	done
 }
 
@@ -161,22 +213,28 @@ run_remote_cli_download() {
 	CLI_ATTEMPT=0
 	while true; do
 		CLI_ATTEMPT=$((CLI_ATTEMPT + 1))
-		if [ "$CLI_ATTEMPT" -gt 1 ]; then
-			WAIT_SECONDS=$((CLI_ATTEMPT - 1))
-			log "CLI 上次下载失败，等待 $WAIT_SECONDS 秒后开始第 $CLI_ATTEMPT 次重试..."
-			sleep "$WAIT_SECONDS"
+		# CLI 地址只在首次尝试时公布，重试轮不再回显（脚本开头已另有一行 CLI 下载地址）
+		if [ "$CLI_ATTEMPT" -eq 1 ]; then
+			log "开始下载远程 CLI: $CLI_URL"
 		fi
-		log "开始下载远程 CLI: $CLI_URL"
+		ROUND_GOT=0
+		ROUND_NOTE=''
 		if download_file "$CLI_URL" "$PKG_OUT" && [ -s "$PKG_OUT" ]; then
+			ROUND_GOT=1
 			if gzip -t "$PKG_OUT" 2>/dev/null; then
 				touch "$DONE_MARK"
 				return 0
 			fi
-			log 'CLI 压缩包完整性校验未通过（疑似截断），弃用重下。'
-			rm -f "$PKG_OUT"
+			ROUND_NOTE='包完整性校验未通过已弃用，'
 		fi
-		log '本次 CLI 下载失败，清理残留文件。'
 		rm -f "$PKG_OUT"
+		# 本轮毫无进展才放宽周期（与 run_remote_download 同规则）
+		if [ "$ROUND_GOT" -eq 0 ]; then
+			EVENT_INTERVAL=$((EVENT_INTERVAL + 1))
+		fi
+		# 失败与重试合并为一条事件行（旧写法每轮刷「清理残留」+「等待重试」+「第 N 次尝试」共 3 行）
+		log_event "第 $CLI_ATTEMPT 次 CLI 下载失败（${ROUND_NOTE}残留已清理）"
+		sleep "$EVENT_SLEEP_NEXT"
 	done
 }
 
@@ -284,12 +342,22 @@ install_cli() {
 			log "CLI 已就位（并行安装完成），跳过安装: $CLI_ON_DISK"
 			return 0
 		fi
-		if log "开始下载远程 CLI（第 $CLI_ATTEMPT 次尝试）: $CLI_URL" && download_file "$CLI_URL" "$CLI_TAR" && [ -s "$CLI_TAR" ]; then
-			unpack_cli_package "$CLI_TAR" && return 0
-		else
-			rm -f "$CLI_TAR"
+		# CLI 地址只在首次尝试时公布，重试轮不再回显（脚本开头已有一行 CLI 下载地址可回指）
+		if [ "$CLI_ATTEMPT" -eq 1 ]; then
+			log "开始下载远程 CLI: $CLI_URL"
 		fi
-		sleep "$CLI_ATTEMPT"
+		ROUND_GOT=0
+		if download_file "$CLI_URL" "$CLI_TAR" && [ -s "$CLI_TAR" ]; then
+			ROUND_GOT=1
+			unpack_cli_package "$CLI_TAR" && return 0
+		fi
+		rm -f "$CLI_TAR"
+		# 前台补装同样是单一时钟：本轮毫无进展才放宽周期，重试等到下个汇报周期
+		if [ "$ROUND_GOT" -eq 0 ]; then
+			EVENT_INTERVAL=$((EVENT_INTERVAL + 1))
+		fi
+		log_event "第 $CLI_ATTEMPT 次 CLI 补装下载失败（残留已清理）"
+		sleep "$EVENT_SLEEP_NEXT"
 	done
 }
 
@@ -524,9 +592,9 @@ fi
 # 旧 glibc 系统：验证 sysroot 可支撑 node 运行（patch 由 Remote-SSH 连接时自行完成）
 verify_sysroot
 
-# 竞速暂存目录用完即清（双保险：本地模块收尾时还会再清一次）
+# 竞速暂存目录用完即清（双保险：本地模块收尾时还会再清一次）；不碰并发连接正在传的在途文件，详见 cleanup_staging
 if [ -n "$STAGING" ]; then
-	rm -rf "$STAGING" 2>/dev/null || true
+	cleanup_staging
 fi
 
 echo '安装完成，当前目录内容如下。'

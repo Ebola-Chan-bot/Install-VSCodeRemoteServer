@@ -35,7 +35,23 @@ if [ -f "$HOME/vsi-stage-keepalive.sh" ]; then
 	sh "$HOME/vsi-stage-keepalive.sh" || { echo '[接管安装-编排] 错误: 服务保活检修失败' >&2; exit 21; }
 fi
 echo '[接管安装-编排] 阶段: 收尾清理'
-rm -rf '__暂存目录__' 2>/dev/null
+# 暂存目录绝不整删：并发连接可能正往同一 staging 传 <包名>.uploading（目录名只按提交号），整删会让它的改名步骤报「在途文件不在」。
+# 只清非 .uploading 项（残留标记会让下一轮误判胜负），超过 6 小时未动的在途文件（死连接遗留）顺手清掉。
+STAGE_DIR='__暂存目录__'
+if [ -n "$STAGE_DIR" ] && [ -d "$STAGE_DIR" ]; then
+	for STAGE_ITEM in "$STAGE_DIR"/* "$STAGE_DIR"/.[!.]*; do
+		[ -e "$STAGE_ITEM" ] || continue
+		case "$STAGE_ITEM" in
+			*.uploading)
+				continue
+				;;
+		esac
+		rm -rf "$STAGE_ITEM" 2>/dev/null || true
+	done
+	if command -v find >/dev/null 2>&1; then
+		find "$STAGE_DIR" -name '*.uploading' -mmin +360 -exec rm -f '{}' ';' 2>/dev/null || true
+	fi
+fi
 rm -f "$HOME"/vsi-stage-* 2>/dev/null
 echo '[接管安装-编排] 编排完成'
 exit 0
