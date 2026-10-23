@@ -10,10 +10,10 @@ $目标 = @(
 	(Join-Path $repo 'module\private\local-supply.ps1')
 )
 $样本 = @('甲', '乙', '丙', '丁', '戊', '己', '庚', '辛', '壬', '癸')
-$script:问题 = 0
-function 断言([bool]$条件, [string]$说明) {
-	if ($条件) { Write-Output ("OK  " + $说明) } else { Write-Output ("FAIL " + $说明); $script:问题++ }
-}
+. (Join-Path $PSScriptRoot 'lib\探针公共库.ps1')
+Initialize-断言 -通过前缀 'OK  ' -失败前缀 'FAIL '
+# 断言台账统一放公共库；本地只留薄转发，调用点一行不改
+function 断言 { param([Parameter(Position = 0)]$甲, [Parameter(Position = 1)]$乙, [Parameter(Position = 2)]$丙 = '') ; 写-断言 $甲 $乙 ([string]$丙) }
 
 function 取-发射点 {
 	param($命令节点)
@@ -80,5 +80,5 @@ foreach ($全路径 in $目标) {
 }
 
 Write-Output ''
-Write-Output ("审计问题总数: $($script:问题) (0 = 通过)")
-exit $(if ($script:问题 -eq 0) { 0 } else { 1 })
+Write-Output ("审计问题总数: " + (取-断言计数).失败 + " (0 = 通过)")
+exit $(if ((取-断言计数).失败 -eq 0) { 0 } else { 1 })

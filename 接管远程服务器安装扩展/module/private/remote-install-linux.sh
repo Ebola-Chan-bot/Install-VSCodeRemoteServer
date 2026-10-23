@@ -104,7 +104,7 @@ log_event() {
 	EVENT_REPORT_AT=$EVENT_NOW
 }
 
-# 竞速暂存目录清理（并发安全）：绝不 rm -rf 整目录——另一条并发连接（同主机同提交号，staging 名相同）可能正在传 <包名>.uploading，整删会让它的改名步骤报「在途文件不在」而失去本地供给。只清非 .uploading 项（残留完成/取消标记会让本轮误判胜负，完整包本轮要重新竞速），在途文件超过 6 小时未动（死连接遗留）才顺手清掉防堆积。
+# 竞速暂存目录清理（并发安全）：绝不 rm -rf 整目录——另一条并发连接（同主机同提交号，staging 名相同）可能正在传 <包名>.uploading，或在写 <包名>.downloading-<PID>（本端自下载的私有在途名），整删会让它的改名步骤报「在途文件不在」而失去供给。只清非在途项（残留完成/取消标记会让本轮误判胜负，完整包本轮要重新竞速），在途文件超过 6 小时未动（死连接遗留）才顺手清掉防堆积。
 cleanup_staging() {
 	if [ -z "$STAGING" ]; then
 		return 0
@@ -119,11 +119,15 @@ cleanup_staging() {
 			*.uploading)
 				continue
 				;;
+			*.downloading-*)
+				continue
+				;;
 		esac
 		rm -rf "$F" 2>/dev/null || true
 	done
 	if command -v find >/dev/null 2>&1; then
 		find "$STAGING" -name '*.uploading' -mmin +360 -exec rm -f '{}' ';' 2>/dev/null || true
+		find "$STAGING" -name '*.downloading-*' -mmin +360 -exec rm -f '{}' ';' 2>/dev/null || true
 	fi
 }
 
@@ -170,10 +174,13 @@ echo "CLI 下载地址: $CLI_URL"
 run_remote_download() {
 	PKG_OUT="$1"
 	DONE_MARK="$2"
+	# 私有在途名（<成品名>.downloading-<PID>）：与 Windows 侧、本地供给同一纪律。此前所有会话都直接往同一个成品名写，Remote-SSH超时重试造成两条会话重叠时两个 curl 必抢同一文件：字节交织后 gzip -t 不过，两边各自 rm -f 重来 → 永不收敛的互相毁包。download_file不带 Range（curl -o / wget -O 总从头写），在途文件无续传价值，此处只做会话隔离 + 完成才发布
+	IN_FLIGHT="${PKG_OUT}.downloading-$$"
 	CLI_ATTEMPT=0
 	SRC_TOTAL=2
-	# 源清单只公布一次：无限重试下每轮都重刷整条 URL 会淹掉日志；每源一行的「开始下载」同样只在首轮报，其后由受节流的事件行带回次数与源序号（序号回指本清单）
-	log "下载源（按序轮试）：1) $URL_PRIMARY  2) $URL_FALLBACK"
+	# 源清单只公布一次：无限重试下每轮都重刷整条 URL 会洩掉日志；每源一行的「开始下载」同样只在首轮报，其后由受节流的事件行带回次数与源序号（序号回指本清单）
+	# 端标注 [远程自下载-服务端] 与本地侧 [本地供给-服务端] 对称（当前调用方把本函数输出静音，标注是为了日后不再静音时依旧分得清两端）
+	log "[远程自下载-服务端] 下载源（共 $SRC_TOTAL 个，按序轮试）：1) $URL_PRIMARY  2) $URL_FALLBACK"
 	# 无限重试，重试时刻对齐到下个汇报周期（见 log_event），不再写死递增秒数
 	while true; do
 		CLI_ATTEMPT=$((CLI_ATTEMPT + 1))
@@ -183,25 +190,36 @@ run_remote_download() {
 		for URL in "$URL_PRIMARY" "$URL_FALLBACK"; do
 			SRC_IDX=$((SRC_IDX + 1))
 			if [ "$CLI_ATTEMPT" -eq 1 ]; then
-				log "开始下载（源 $SRC_IDX/$SRC_TOTAL）"
+				log "[远程自下载-服务端] 开始下载（源 $SRC_IDX/$SRC_TOTAL）"
 			fi
-			if download_file "$URL" "$PKG_OUT" && [ -s "$PKG_OUT" ]; then
+			if download_file "$URL" "$IN_FLIGHT" && [ -s "$IN_FLIGHT" ]; then
 				ROUND_GOT=1
 				# gzip 完整性校验：流式下载读到底不等于传完整，截断包解压只会报晦涩错误，坏包弃用换源重下
-				if gzip -t "$PKG_OUT" 2>/dev/null; then
+				if gzip -t "$IN_FLIGHT" 2>/dev/null; then
+					# 发布：先改名到成品名、再写完成标记 —— 顺序不可颠倒，否则会短暂出现「标记在、包不完整」的窗口骗过竞速判定。成品已被并发会话发布（同提交号内容等价）则丢自己的副本；连改名也做不成就本端退出，交回本地供给接手
+					if [ -s "$PKG_OUT" ] && gzip -t "$PKG_OUT" 2>/dev/null; then
+						rm -f "$IN_FLIGHT"
+						log "[远程自下载-服务端] 并发会话已先发布成品，改用已发布的包。"
+					elif mv -f "$IN_FLIGHT" "$PKG_OUT" 2>/dev/null; then
+						log "[远程自下载-服务端] 下载完成，已改名发布成品（$(wc -c < "$PKG_OUT" 2>/dev/null | tr -d ' ') 字节）。"
+					else
+						rm -f "$IN_FLIGHT"
+						log "[远程自下载-服务端] 成品名改写失败（被并发会话占用），本端退出下载，由本地供给接手。"
+						return 1
+					fi
 					touch "$DONE_MARK"
 					return 0
 				fi
 				# 截断原因并进本轮唯一一条事件行，不另起一行（一次失败多条消息就是冗余汇报点）
 				ROUND_NOTE="${ROUND_NOTE}源 $SRC_IDX 的包完整性校验未通过已弃用；"
 			fi
-			rm -f "$PKG_OUT"
+			rm -f "$IN_FLIGHT"
 		done
 		# 本轮毫无进展（一个字节都没落地）才放宽周期；拿到过字节时周期不动，失败不额外拖慢恢复
 		if [ "$ROUND_GOT" -eq 0 ]; then
 			EVENT_INTERVAL=$((EVENT_INTERVAL + 1))
 		fi
-		log_event "第 $CLI_ATTEMPT 次下载失败（$SRC_TOTAL 个源均未取到，${ROUND_NOTE}残留已清理）"
+		log_event "[远程自下载-服务端] 第 $CLI_ATTEMPT 次下载失败（$SRC_TOTAL 个源均未取到，${ROUND_NOTE}残留已清理）"
 		sleep "$EVENT_SLEEP_NEXT"
 	done
 }
@@ -210,30 +228,42 @@ run_remote_download() {
 run_remote_cli_download() {
 	PKG_OUT="$1"
 	DONE_MARK="$2"
+	IN_FLIGHT="${PKG_OUT}.downloading-$$"
 	CLI_ATTEMPT=0
 	while true; do
 		CLI_ATTEMPT=$((CLI_ATTEMPT + 1))
 		# CLI 地址只在首次尝试时公布，重试轮不再回显（脚本开头已另有一行 CLI 下载地址）
 		if [ "$CLI_ATTEMPT" -eq 1 ]; then
-			log "开始下载远程 CLI: $CLI_URL"
+			log "[远程自下载-CLI] 开始下载远程 CLI: $CLI_URL"
 		fi
 		ROUND_GOT=0
 		ROUND_NOTE=''
-		if download_file "$CLI_URL" "$PKG_OUT" && [ -s "$PKG_OUT" ]; then
+		if download_file "$CLI_URL" "$IN_FLIGHT" && [ -s "$IN_FLIGHT" ]; then
 			ROUND_GOT=1
-			if gzip -t "$PKG_OUT" 2>/dev/null; then
+			if gzip -t "$IN_FLIGHT" 2>/dev/null; then
+				# 发布：先改名到成品名、再写完成标记（与 run_remote_download 同纪律）
+				if [ -s "$PKG_OUT" ] && gzip -t "$PKG_OUT" 2>/dev/null; then
+					rm -f "$IN_FLIGHT"
+					log "[远程自下载-CLI] 并发会话已先发布成品，改用已发布的包。"
+				elif mv -f "$IN_FLIGHT" "$PKG_OUT" 2>/dev/null; then
+					log "[远程自下载-CLI] 下载完成，已改名发布成品（$(wc -c < "$PKG_OUT" 2>/dev/null | tr -d ' ') 字节）。"
+				else
+					rm -f "$IN_FLIGHT"
+					log "[远程自下载-CLI] 成品名改写失败（被并发会话占用），本端退出下载，由本地供给接手。"
+					return 1
+				fi
 				touch "$DONE_MARK"
 				return 0
 			fi
 			ROUND_NOTE='包完整性校验未通过已弃用，'
 		fi
-		rm -f "$PKG_OUT"
+		rm -f "$IN_FLIGHT"
 		# 本轮毫无进展才放宽周期（与 run_remote_download 同规则）
 		if [ "$ROUND_GOT" -eq 0 ]; then
 			EVENT_INTERVAL=$((EVENT_INTERVAL + 1))
 		fi
 		# 失败与重试合并为一条事件行（旧写法每轮刷「清理残留」+「等待重试」+「第 N 次尝试」共 3 行）
-		log_event "第 $CLI_ATTEMPT 次 CLI 下载失败（${ROUND_NOTE}残留已清理）"
+		log_event "[远程自下载-CLI] 第 $CLI_ATTEMPT 次 CLI 下载失败（${ROUND_NOTE}残留已清理）"
 		sleep "$EVENT_SLEEP_NEXT"
 	done
 }
@@ -243,15 +273,25 @@ run_remote_cli_download() {
 race_artifact() {
 	RACE_WINNER_SIDE=''
 	RACE_WINNER_PKG=''
-	# 清理本端上一轮残留；本地包与本地标记由本地供给任务管理，不在此处删（可能已先于本脚本完成）
-	rm -f "$2" "$3" "$6"
+	# 清理本端上一轮残留：只删标记（残留标记 = 假获胜）与不完整的成品；本地包与本地标记由本地供给任务管理，不在此处删（可能已先于本脚本完成）
+	rm -f "$3" "$6"
+	# 成品已完整则直接获胜（存在即视为完成）：staging 按提交号命名，同名即同版本，而成品如今只由「校验通过后才改名发布」产生。实测 190MB 包在慢网下两边各下一遍纯属浪费带宽；旧版直接写成品名留下的截断半成品会在这里被 gzip -t 判为不完整而重下
+	if [ -s "$2" ] && gzip -t "$2" 2>/dev/null; then
+		touch "$3"
+		touch "$6"
+		RACE_WINNER_SIDE='remote'
+		RACE_WINNER_PKG="$2"
+		log "[远程自下载-$1] 远端已有完整自下载成品（$(wc -c < "$2" 2>/dev/null | tr -d ' ') 字节），直接判远程自下载获胜，跳过重复下载。"
+		return 0
+	fi
+	rm -f "$2"
 	log "$1 竞速：远程自下载与本地下载+上传并行，先完成者用于安装。"
 	DL_PID=''
 	if [ -n "$7" ]; then
 		"$7" "$2" "$3" >/dev/null 2>&1 &
 		DL_PID=$!
 	else
-		log "$1：远程缺少 curl/wget，本端不参与下载，只等待本地供给。"
+		log "[远程自下载-$1] 本端缺少 curl/wget 不参与下载，只等本地供给。"
 	fi
 
 	ELAPSED=0
@@ -272,13 +312,19 @@ race_artifact() {
 		if [ "$ELAPSED" -ge "$NEXT_REPORT" ]; then
 			if [ -n "$7" ]; then
 				RSIZE=0
-				if [ -f "$2" ]; then
-					RSIZE=$(wc -c < "$2" 2>/dev/null | tr -d ' ')
-				fi
-				# 该平台远程自下载的输出被静音（curl 进度条是英文噪声），本心跳是唯一的远端进度来源：用统一句式的总量未知形态，不带竞速等待后缀；进度行不带内嵌时间戳，故不经 log 前缀
-				echo "远程下载进度：已传 ${RSIZE} 字节"
+				# 成品名只在下载完成的那一瞬才出现，进度必须看本会话的私有在途名（并取同产物各在途副本的最大值，避免报 0）
+				for RF in "$2" "$2".downloading-*; do
+					[ -e "$RF" ] || continue
+					RSZ=$(wc -c < "$RF" 2>/dev/null | tr -d ' ')
+					case "$RSZ" in ''|*[!0-9]*) RSZ=0 ;; esac
+					if [ "$RSZ" -gt "$RSIZE" ]; then
+						RSIZE=$RSZ
+					fi
+				done
+				# 该平台远程自下载的输出被静音（curl 进度条是英文噪声），本心跳是唯一的远端进度来源：用统一句式的总量未知形态，不带竞速等待后缀；进度行不带内嵌时间戳，故不经 log 前缀；[远程自下载-产物名] 端标注与本地侧 [本地供给-产物名] 对称
+				echo "[远程自下载-$1] 远程下载进度：已传 ${RSIZE} 字节"
 			else
-				log "$1 竞速等待 ${ELAPSED}s：远程侧不参与下载，等待本地供给。"
+				log "[远程自下载-$1] 竞速等待 ${ELAPSED}s：本端不参与下载，只等本地供给。"
 			fi
 			REPORT_PERIOD=$((REPORT_PERIOD + 1))
 			NEXT_REPORT=$((ELAPSED + REPORT_PERIOD))
@@ -333,7 +379,12 @@ install_cli() {
 		return 0
 	fi
 
-	CLI_TAR="$DATA_DIR/vscode-cli-$COMMIT.tar.gz"
+	# 私有在途名：与竞速侧同一纪律，避免两条并发会话抢同一个固定名的 CLI 包（unpack_cli_package 会把它删掉，不残留）
+	CLI_TAR="$DATA_DIR/vscode-cli-$COMMIT.tar.gz.downloading-$$"
+	# 顺手扫旧版固定名留下的孤儿包（只清 6 小时未动的；新在途名不匹配该过滤）
+	if command -v find >/dev/null 2>&1; then
+		find "$DATA_DIR" -maxdepth 1 -name 'vscode-cli-*.tar.gz' -not -name '*.downloading-*' -mmin +360 -exec rm -f '{}' ';' 2>/dev/null || true
+	fi
 	CLI_ATTEMPT=0
 	while true; do
 		CLI_ATTEMPT=$((CLI_ATTEMPT + 1))
@@ -344,7 +395,7 @@ install_cli() {
 		fi
 		# CLI 地址只在首次尝试时公布，重试轮不再回显（脚本开头已有一行 CLI 下载地址可回指）
 		if [ "$CLI_ATTEMPT" -eq 1 ]; then
-			log "开始下载远程 CLI: $CLI_URL"
+			log "[远程自下载-CLI] 开始下载远程 CLI: $CLI_URL"
 		fi
 		ROUND_GOT=0
 		if download_file "$CLI_URL" "$CLI_TAR" && [ -s "$CLI_TAR" ]; then
@@ -356,7 +407,7 @@ install_cli() {
 		if [ "$ROUND_GOT" -eq 0 ]; then
 			EVENT_INTERVAL=$((EVENT_INTERVAL + 1))
 		fi
-		log_event "第 $CLI_ATTEMPT 次 CLI 补装下载失败（残留已清理）"
+		log_event "[远程自下载-CLI] 第 $CLI_ATTEMPT 次 CLI 补装下载失败（残留已清理）"
 		sleep "$EVENT_SLEEP_NEXT"
 	done
 }

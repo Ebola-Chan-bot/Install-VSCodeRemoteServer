@@ -85,6 +85,27 @@ try {
 		}
 	}
 
+	function 测-属主存活([string]$路径) {
+		# 纯谓词：函数体内绝不 Write-Output/Write-Host（同 测-父进程仍在 的纪律，一旦发射内容，调用处的 if 会收到数组，真值判定恒为真）。
+		# 在途名自带属主 PID（<成品名>.downloading-<PID>）。写句柄只在真正传数据的那几秒被持有，而属主进程在两次重试之间（等下个汇报周期）并不持有任何句柄 —— 只按「是否被占用」判归属，会把一个活着的属主的半成品当成「无人遗留」抢走改名（认领即改名，等于把对方的续传点搬走），于是两边各自从同一字节数重新下载同一个 ~190MB 产物（2026-10-23 实测：本进程在 42,121,870 字节处被接管，随后双方各自续传，几十 MB 白下一遍）。
+		# PID 复用风险：文件名里只有 PID，无启动时刻，理论上可能把复用后的无关进程当活属主 —— 代价是多等一会儿（对方无进展 60 轮即判僵死转自下），比抢走活属主的文件安全得多。
+		$名 = Split-Path $路径 -Leaf
+		if ($名 -notmatch '\.downloading-(\d+)') { return $false }
+		$属主ID = 0
+		if (-not [int]::TryParse($Matches[1], [ref]$属主ID)) { return $false }
+		if ($属主ID -le 4) { return $false }
+		return [bool](Get-Process -Id $属主ID -ErrorAction SilentlyContinue)
+	}
+
+	function 取-属主PID([string]$路径) {
+		# 纯谓词：从在途名里取出属主 PID（取不到返回 0），供消息如实标注「属主 PID N（存活/已消失）」
+		$名 = Split-Path $路径 -Leaf
+		if ($名 -notmatch '\.downloading-(\d+)') { return 0 }
+		$属主ID = 0
+		if (-not [int]::TryParse($Matches[1], [ref]$属主ID)) { return 0 }
+		return $属主ID
+	}
+
 	function 测-父进程仍在 {
 		# 纯谓词：函数体内绝不 Write-Output/Write-Host。一旦发射任何内容，调用处 if (-not (测-父进程仍在)) 收到的就是@('说明文字', $false) 这样的数组，而数组按真值判定恒为真 → -not 恒为假 → 看门狗永不生效（实测缺陷：父进程被杀后供给子进程照样无限重试，正是 34 分钟孤儿供给进程的成因）。要说的话一律由调用处说。
 		if ($父进程ID -le 0) { return $true }
@@ -218,12 +239,16 @@ try {
 		if (测-文件被占用 $成品路径) { $他方持有 += $成品路径 }
 		foreach ($候 in @(Get-ChildItem -LiteralPath $在途目录 -Filter $在途过滤 -ErrorAction SilentlyContinue | Sort-Object Length -Descending)) {
 			if ($候.FullName -eq $在途路径 -or $候.FullName -eq $下载目标路径) { continue }
-			if (测-文件被占用 $候.FullName) { $他方持有 += $候.FullName }
+			# 归属判据 = 写句柄被持有 **或** 属主 PID 存活；只看句柄会把「活属主正在等下个汇报周期」的瞬间误判成无人遗留
+			if ((测-文件被占用 $候.FullName) -or (测-属主存活 $候.FullName)) { $他方持有 += $候.FullName }
 		}
 		if ($他方持有.Count -gt 0 -and $下载目标路径 -ne ($在途路径 + '.solo')) {
 			$他方 = $他方持有[0]
 			$他方尺寸 = 0
 			if (Test-Path -LiteralPath $他方) { $他方尺寸 = (Get-Item -LiteralPath $他方).Length }
+			# 如实报属主身份与判据：等谁、为什么等（句柄占用还是属主存活）都要看得出来，不能让人按字节数猜
+			$他方属主ID = 取-属主PID $他方
+			$他方属主 = if ($他方属主ID -gt 0) { ('PID ' + $他方属主ID + $(if (测-属主存活 $他方) { '，存活' } else { '，句柄占用中' })) } else { '旧版孤儿（直接写成品名）' }
 			if ($他方尺寸 -eq $上次他方尺寸) { $停滞周期数++ } else { $停滞周期数 = 0; $上次他方尺寸 = $他方尺寸 }
 			if ($停滞周期数 -ge 60) {
 				# 对方僵死（连续 60 个轮次尺寸不长 = 至少一分钟无任何进展）：不再干等，改用自己的独立文件从头下载
@@ -235,27 +260,34 @@ try {
 				if (($此刻 - $上次汇报时刻).TotalSeconds -ge $报告周期秒数) {
 					$上次汇报时刻 = $此刻
 					$报告周期秒数++
-					Write-Output ('另一供给进程正在下载同一产物（已传 {0} 字节），等它完成后直接接管上传，不重复下载...' -f $他方尺寸)
+					Write-Output ('另一供给进程正在下载同一产物（属主 {0}，已传 {1} 字节），等它完成后直接接管上传，不重复下载...' -f $他方属主, $他方尺寸)
 				}
 				Start-Sleep -Seconds 1
 				continue
 			}
 		}
 
-		# 认领无人持有的遗留半成品（上一轮进程被杀留下的）：改名接过来续传，避免从头再下；多余的一并清掉防 TEMP 堆积
+		# 认领无人持有的遗留半成品（上一轮进程被杀留下的）：改名接过来续传，避免从头再下；多余的一并清掉防 TEMP 堆积。
+		# 「无人持有」= 没有写句柄 **且** 属主 PID 已消失。少了后半段判据就会把活属主的半成品抢走（见 测-属主存活 的实测教训）。
 		if (-not (Test-Path -LiteralPath $下载目标路径)) {
 			foreach ($候 in @(Get-ChildItem -LiteralPath $在途目录 -Filter $在途过滤 -ErrorAction SilentlyContinue | Sort-Object Length -Descending)) {
 				if ($候.FullName -eq $下载目标路径) { continue }
 				if (测-文件被占用 $候.FullName) { continue }
+				if (测-属主存活 $候.FullName) { continue }
 				if (-not (Test-Path -LiteralPath $下载目标路径)) {
 					try {
+						# 如实报属主身份：为什么认定它无人认领（PID 已消失）也得看得出来，不能让人按字节数猜
+						$遗留属主ID = 取-属主PID $候.FullName
+						$遗留属主 = if ($遗留属主ID -gt 0) { ('属主 PID ' + $遗留属主ID + ' 已消失') } else { '属主不明（旧版命名）' }
+						$认领字节 = $候.Length
+						$认领原名 = $候.Name
 						Move-Item -LiteralPath $候.FullName -Destination $下载目标路径 -Force -ErrorAction Stop
-						Write-Output ('认领遗留半成品续传：{0} 字节（{1}）。' -f $候.Length, $候.Name)
+						Write-Output ('认领遗留半成品续传：{0} 字节（原名 {1}，{2}）。' -f $认领字节, $认领原名, $遗留属主)
 					} catch {
 						Remove-Item -LiteralPath $候.FullName -Force -ErrorAction SilentlyContinue
 					}
 				} else {
-					# 已认领过一份：其余未持有者的遗留半成品都是同一产物的重复副本，删掉（内容一致，留着只吃磁盘）
+					# 已认领过一份：其余未持有且属主已死的遗留半成品都是同一产物的重复副本，删掉（内容一致，留着只吃磁盘）
 					Remove-Item -LiteralPath $候.FullName -Force -ErrorAction SilentlyContinue
 				}
 			}
@@ -264,7 +296,13 @@ try {
 		$重试次数++
 		if (-not $源清单已公布) {
 			$源清单已公布 = $true
-			Write-Output ('本地下载源（共 {0} 个，按序轮试）：{1}' -f $地址列表.Count, ((1..$地址列表.Count | ForEach-Object { '{0}) {1}' -f $_, $地址列表[$_ - 1] }) -join '；'))
+			# 措辞按实际源数说：只有 1 个源时说「按序轮试」是空话（中断行里的「源 1/1」也无处可选），多源才真有轮试语义
+			$源清单 = ((1..$地址列表.Count | ForEach-Object { '{0}) {1}' -f $_, $地址列表[$_ - 1] }) -join '；')
+			if ($地址列表.Count -eq 1) {
+				Write-Output ('本地下载源（唯一，无备源可换）：{0}' -f $源清单)
+			} else {
+				Write-Output ('本地下载源（共 {0} 个，按序轮试）：{1}' -f $地址列表.Count, $源清单)
+			}
 		}
 		# 本轮字节计数归零：catch 里靠「本轮落地 vs 轮起」判是否毫无进展，上一轮的残留值会让瞬时失败轮误判为「有进展」而周期不放宽
 		$已下载 = 0

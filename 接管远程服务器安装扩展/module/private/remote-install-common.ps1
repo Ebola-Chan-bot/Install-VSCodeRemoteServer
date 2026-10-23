@@ -87,7 +87,13 @@ function 安装-远程CLI {
 
 	$数据目录 = Split-Path -Parent $CLI信息.落地路径
 	New-Item -ItemType Directory -Force $数据目录 | Out-Null
-	$cli压缩包路径 = Join-Path $数据目录 ('vscode-cli-{0}.zip' -f [System.IO.Path]::GetFileNameWithoutExtension($CLI信息.落地路径))
+	# 私有在途名（<包名>.downloading-<PID>）：CLI 补装落到数据目录下的固定文件名 vscode-cli-<名>.zip，同样只按提交号、不带会话唯一性——Remote-SSH 超时重试造成两条会话重叠时两边 Invoke-WebRequest 抢同一文件，报 being used by another process 后整轮作废。每会话写自己那份；展开-CLI压缩包 的 finally 会把包删掉，不残留
+	$cli压缩包路径 = Join-Path $数据目录 ('vscode-cli-{0}.zip.downloading-{1}' -f [System.IO.Path]::GetFileNameWithoutExtension($CLI信息.落地路径), $PID)
+	# 顺手扫旧版留下的孤儿包：以前所有会话共写固定名 vscode-cli-<名>.zip，任一会话下载/解包失败退出就把它留在数据目录里（2026-10-23 实测：该目录里躺着 3 个共约 19MB 的旧包，永不会被回收）。只清 6 小时未动且仍是旧命名的，新版私有在途名不匹配此过滤也不会被碰
+	$陈旧下限 = (Get-Date).AddHours(-6)
+	foreach ($遗 in @(Get-ChildItem -LiteralPath $数据目录 -Filter 'vscode-cli-*.zip' -Force -ErrorAction SilentlyContinue)) {
+		if ($遗.LastWriteTime -lt $陈旧下限) { Remove-Item -LiteralPath $遗.FullName -Force -ErrorAction SilentlyContinue }
+	}
 
 	$重试次数 = 0
 	# 下载地址只在首次尝试时公布一次：无限重试下每轮都重刷整条 URL 会把日志淹掉
@@ -109,7 +115,7 @@ function 安装-远程CLI {
 			# 起始行只在首次打一次（含下载地址）；其后每轮不再回显，重试事实由 catch 里受节的出口带出
 			if (-not $地址已公布) {
 				$地址已公布 = $true
-				Write-Host ('[{0}] 开始下载远程 CLI: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $CLI信息.下载地址)
+				Write-Host ('[远程自下载-CLI] [{0}] 开始下载远程 CLI: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $CLI信息.下载地址)
 			}
 			Invoke-WebRequest -Uri $CLI信息.下载地址 -OutFile $cli压缩包路径 -UseBasicParsing
 
@@ -125,7 +131,7 @@ function 安装-远程CLI {
 			# 重试对齐到下个汇报周期：扣掉本轮在上次汇报之后已经耗掉的秒数（一次耗时几十秒的尝试本身就算消耗了一个周期），下限 1 秒
 			$等待秒数 = [Math]::Max(1, [int][Math]::Ceiling($报告周期秒数 - ($此刻 - $上次汇报时刻).TotalSeconds))
 			$上次汇报时刻 = $此刻
-			Write-Host ('[{0}] 第 {1} 次 CLI 下载中断: {2}，下个汇报周期（{3} 秒后）重试' -f $此刻.ToString('yyyy-MM-dd HH:mm:ss'), $重试次数, $中断原因, $等待秒数)
+				Write-Host ('[远程自下载-CLI] [{0}] 第 {1} 次 CLI 下载中断: {2}，下个汇报周期（{3} 秒后）重试' -f $此刻.ToString('yyyy-MM-dd HH:mm:ss'), $重试次数, $中断原因, $等待秒数)
 			# 失败后复查：报"被另一进程占用"通常就是并行引导已把 CLI 装好并在运行，此时安装实际已完成，视为成功收尾而非无限重试
 			if (Test-Path -LiteralPath $CLI信息.落地路径) {
 				Write-Host ('[{0}] CLI 已就位（并行安装完成），视为安装完成: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $CLI信息.落地路径)
@@ -198,27 +204,86 @@ function 竞速-单个产物 {
 
 	# 单个产物的竞速：远程自下载（后台作业）与本地下载+上传（由本地模块负责）并行，先完成者获胜，返回 {获胜方;获胜包路径}。
 	# 逐产物独立竞速：哪边能下载就由哪边供给，单边断网时另一边照样补上，互不拖累。
-	# 清理本端上一轮残留；本地包/本地标记由本地供给任务管理，不在此处删（可能已先于本脚本完成）
-	Remove-Item -LiteralPath $远程包路径, $远程完成标记, $本地取消标记 -Force -ErrorAction SilentlyContinue
+
+	# ===== 成品已完整则直接获胜（存在即视为完成）=====
+	# 竞速目录按提交号命名，目录内的包名同名即同版本；成品只会由「下载完整后改名发布」产生，所以见到完整成品就不必再下载一轮（实测 190MB 包在慢网下两边各下一遍纯属浪费带宽）。完整性用 EOCD 快检（见 测试-压缩包完整），旧版直接写成品名留下的截断半成品会在这里被判为不完整而重下。
+	if ((Test-Path -LiteralPath $远程包路径) -and (测试-压缩包完整 $远程包路径)) {
+		Remove-Item -LiteralPath $远程完成标记, $本地取消标记 -Force -ErrorAction SilentlyContinue
+		New-Item -ItemType File -Force $远程完成标记 | Out-Null
+		Write-Host ('[{0}] [远程自下载-{1}] 远端已有完整自下载成品（{2} 字节），直接判远程自下载获胜，跳过重复下载。' -f (Get-Date -Format 'HH:mm:ss'), $产物名, (Get-Item -LiteralPath $远程包路径).Length)
+		return [pscustomobject]@{ 获胜方 = '远程自下载'; 获胜包路径 = $远程包路径 }
+	}
+
+	# ===== 远端并发隔离：每个会话只写自己的私有在途文件 =====
+	# 与本地供给完全同一纪律（在途名 = <成品名>.downloading-<PID>，完成才改名发布）。此前所有会话都直接写 成品名 REMOTE.zip（包名只按提交号、不带会话唯一性），Remote-SSH 超时重试造成两条会话重叠时必然抢同一个文件句柄：实测刷出 20+ 条 `Exception calling "Open" ... because it is being used by another process`，两边都在同一续传点上反复失败。
+	$远程在途路径 = ($远程包路径 + '.downloading-' + $PID)
+	$远端在途目录 = Split-Path -Parent $远程包路径
+	$远端在途过滤 = ((Split-Path -Leaf $远程包路径) + '.downloading-*')
+	if (-not (Test-Path -LiteralPath $远程在途路径)) {
+		$认领字节 = -1
+		foreach ($候 in @(Get-ChildItem -LiteralPath $远端在途目录 -Filter $远端在途过滤 -Force -ErrorAction SilentlyContinue | Sort-Object Length -Descending)) {
+			if ($候.FullName -eq $远程在途路径) { continue }
+			$属主ID = 0
+			if ($候.Name -match '\.downloading-(\d+)') { [void][int]::TryParse($Matches[1], [ref]$属主ID) }
+			if ($属主ID -gt 4 -and (Get-Process -Id $属主ID -ErrorAction SilentlyContinue)) {
+				# 属主活着就不是遗留：绝对不碰（认领即改名，会把对方的续传点搬走）
+				Write-Host ('[{0}] [远程自下载-{1}] 另一条并发会话也在自下载同一产物（属主 PID {2}，已传 {3} 字节），本会话用自己的私有在途文件，互不干扰。' -f (Get-Date -Format 'HH:mm:ss'), $产物名, $属主ID, $候.Length)
+				continue
+			}
+			if ($认领字节 -lt 0) {
+				# 属主已消失的遗留半成品：认领最大的一份续传（省下一轮完整下载）
+				try {
+					Move-Item -LiteralPath $候.FullName -Destination $远程在途路径 -Force -ErrorAction Stop
+					$认领字节 = $候.Length
+					Write-Host ('[{0}] [远程自下载-{1}] 认领遗留半成品续传：{2} 字节（原名 {3}，属主 PID {4} 已消失）。' -f (Get-Date -Format 'HH:mm:ss'), $产物名, $候.Length, $候.Name, $属主ID)
+				} catch { }
+			} else {
+				# 已认领过一份：其余死属主副本内容一致，留着只吃磁盘
+				Remove-Item -LiteralPath $候.FullName -Force -ErrorAction SilentlyContinue
+			}
+		}
+	}
+
+	# 清理本端上一轮残留：只删标记（残留标记 = 假获胜）与不完整的成品；本地包/本地标记由本地供给任务管理，不在此处删（可能已先于本脚本完成）
+	Remove-Item -LiteralPath $远程完成标记, $本地取消标记 -Force -ErrorAction SilentlyContinue
+	if (Test-Path -LiteralPath $远程包路径) {
+		Remove-Item -LiteralPath $远程包路径 -Force -ErrorAction SilentlyContinue
+	}
 
 	Write-Host ('[{0}] {1} 竞速：远程自下载与本地下载+上传并行，先完成者用于安装。' -f (Get-Date -Format 'HH:mm:ss'), $产物名)
 	# 把断点续传下载函数以文本形式带入后台作业（Start-Job 是独立进程，无法直接调用本脚本函数），保证竞速模式下远程侧仍是断点续传。
 	# 注意：Definition 属性不含花括号（函数体以 param(...) 开头），注入时必须自行包上 { }，否则是非法函数声明
-	$下载作业 = Start-Job -ArgumentList $下载函数文本, $下载地址, $远程包路径, $远程完成标记 -ScriptBlock {
-		param($下载函数文本, $下载地址, $远程包路径, $远程完成标记)
+	$下载作业 = Start-Job -ArgumentList $下载函数文本, $下载地址, $远程在途路径, $远程包路径, $远程完成标记, $产物名 -ScriptBlock {
+		param($下载函数文本, $下载地址, $远程在途路径, $远程包路径, $远程完成标记, $产物名)
 		$ErrorActionPreference = 'Continue'
 		[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 		Invoke-Expression ('function 通过HTTP断点续传下载 { ' + $下载函数文本 + ' }')
+		# 端标注：本作业每一行都带上「哪一端哪个产物」，与本地供给的 [本地供给-产物名] 对称（两端的下载行交织在同一份日志里）
+		$端标注 = '[远程自下载-{0}]' -f $产物名
 		try {
-			通过HTTP断点续传下载 -下载地址 $下载地址 -目标路径 $远程包路径
-			if ((Test-Path $远程包路径) -and ((Get-Item $远程包路径).Length -gt 0)) {
+			通过HTTP断点续传下载 -下载地址 $下载地址 -目标路径 $远程在途路径 -端标注 $端标注
+			if ((Test-Path -LiteralPath $远程在途路径) -and ((Get-Item -LiteralPath $远程在途路径).Length -gt 0)) {
+				# 发布：先改名到成品名、再写完成标记 —— 顺序不可颠倒，否则会短暂出现「标记在、包不完整」的窗口骗过竞速判定
+				try {
+					if (Test-Path -LiteralPath $远程包路径) {
+						# 并发会话已先行发布同一产物（同目录同提交号，内容等价）：丢自己的副本，直接用已发布的那份
+						Remove-Item -LiteralPath $远程在途路径 -Force -ErrorAction SilentlyContinue
+						Write-Output ('{0} 并发会话已先发布成品，改用已发布的包（{1} 字节）。' -f $端标注, (Get-Item -LiteralPath $远程包路径).Length)
+					} else {
+						Move-Item -LiteralPath $远程在途路径 -Destination $远程包路径 -Force -ErrorAction Stop
+						Write-Output ('{0} 下载完成，已改名发布成品（{1} 字节）。' -f $端标注, (Get-Item -LiteralPath $远程包路径).Length)
+					}
+				} catch {
+					Write-Output ('{0} 成品名暂不可写入（{1}），本次不写完成标记，等本地供给。' -f $端标注, $_.Exception.Message)
+					return
+				}
 				New-Item -ItemType File -Force $远程完成标记 | Out-Null
-				Write-Output '远程自下载完成。'
+				Write-Output ('{0} 远程自下载完成。' -f $端标注)
 			} else {
-				Write-Output '远程自下载结束后未发现完整压缩包，等待本地供给。'
+				Write-Output ('{0} 远程自下载结束后未发现完整压缩包，等待本地供给。' -f $端标注)
 			}
 		} catch {
-			Write-Output ('远程自下载异常终止: {0}' -f $_.Exception.Message)
+			Write-Output ('{0} 远程自下载异常终止: {1}' -f $端标注, $_.Exception.Message)
 		}
 	}
 
@@ -226,7 +291,8 @@ function 竞速-单个产物 {
 	while ($true) {
 		if (Test-Path -LiteralPath $远程完成标记) { $获胜方 = '远程自下载'; break }
 		if (Test-Path -LiteralPath $本地完成标记) { $获胜方 = '本地供给'; break }
-		# 流式转发后台作业的输出（下载进度/重试消息）：远端进度只由下载器的「远程下载进度」行负责，监控循环不再重复报同一字节
+		# 流式转发后台作业的输出：行内已自带 [远程自下载-产物名] 端标注（在作业里统一打），此处原样转发不叠加前缀
+		# 远端进度只由下载器的「远程下载进度」行负责，监控循环不再重复报同一字节
 		Receive-Job -Job $下载作业 | ForEach-Object { Write-Host ('{0}' -f $_) }
 		Start-Sleep -Seconds 1
 	}
@@ -238,7 +304,7 @@ function 竞速-单个产物 {
 	Remove-Job -Job $下载作业 -Force -ErrorAction SilentlyContinue
 
 	$获胜包路径 = if ($获胜方 -eq '本地供给') { $本地包路径 } else { $远程包路径 }
-	Write-Host ('[{0}] 竞速决出：{1} 由{2}获胜。' -f (Get-Date -Format 'HH:mm:ss'), $产物名, $获胜方)
+	Write-Host ('[{0}] 竞速决出：{1} 由{2}获胜（用包 {3}）。' -f (Get-Date -Format 'HH:mm:ss'), $产物名, $获胜方, (Split-Path $获胜包路径 -Leaf))
 	if (-not (Test-Path -LiteralPath $获胜包路径)) {
 		throw ('竞速决出的包不存在: {0}' -f $获胜包路径)
 	}
@@ -253,7 +319,8 @@ function 清理-竞速暂存目录 {
 
 	# 竞速暂存目录的清理规则（并发安全）：**绝不整目录删除**——另一窗口/另一条连接（同一主机、同一提交号，暂存目录名也相同）可能正在往本目录上传在途文件，整删会把它的 <包名>.uploading 连目录一起清走，它的改名命令随即报「在途文件不在」并放弃本地供给（实测已发生：远端 race-<提交号> 目录整个消失，本地供给只拿到退出码 1，真因还被 CLIXML 噪声淹没）。
 	# 必清的只有「会让本轮误判」的东西：完成/取消标记（残留标记 = 假获胜）与已完成产物包（本轮要重新竞速）；
-	# 在途 .uploading 按年龄判归属：6 小时内还在动 = 活连接的文件，一概不碰；更旧 = 死连接遗留，顺手清掉免得堆积。
+	# 在途文件按名型与年龄判归属：6 小时内还在动 = 活连接的文件，一概不碰；更旧 = 死连接遗留，顺手清掉免得堆积。
+	# .uploading = 本地供给正在往远端传的那一份；.downloading-<PID> = 远端自下载的私有在途名（可能被下一个会话认领续传，能省一轮 190MB 下载）
 	if ([string]::IsNullOrWhiteSpace($暂存目录)) { return }
 	if (-not (Test-Path -LiteralPath $暂存目录)) {
 		New-Item -ItemType Directory -Force -Path $暂存目录 | Out-Null
@@ -261,7 +328,7 @@ function 清理-竞速暂存目录 {
 	}
 	$在途保留下限 = (Get-Date).AddHours(-6)
 	foreach ($项 in @(Get-ChildItem -LiteralPath $暂存目录 -Force -ErrorAction SilentlyContinue)) {
-		if ($项.Name -like '*.uploading' -and $项.LastWriteTime -gt $在途保留下限) { continue }
+		if (($项.Name -like '*.uploading' -or $项.Name -like '*.downloading-*') -and $项.LastWriteTime -gt $在途保留下限) { continue }
 		Remove-Item -LiteralPath $项.FullName -Recurse -Force -ErrorAction SilentlyContinue
 	}
 }
@@ -396,10 +463,12 @@ function 回放-历史清理报告 {
 function 通过HTTP断点续传下载 {
 	param(
 		[string]$下载地址,
-		[string]$目标路径
+		[string]$目标路径,
+		[string]$端标注 = '[远程自下载-服务端]'
 	)
 
 	# 本函数的函数体会被整段文本化送进后台下载作业重新定义（见 $下载函数文本），故自适应函数必须内嵌在函数体内随行，不能依赖外部定义
+	# $端标注是本函数每一行输出的强制前缀：本地供给的行由主模块转发时带 [本地供给-产物名]，远端这些行则走单会话 stdout，两端交织在同一份 preconnect 日志里。没有端标注时，“第 1 次下载中断”到底是哪一端的只能靠字节数与前缀有无去猜（2026-10-23 实测：两侧各自的“第 1 次”紧挨着出现、等待秒数还不一样，极易误读成同一件事报了两遍）。
 	function 下次汇报间隔($上次汇报间隔, $总计已用秒数, $已下载字节数, $预计总大小) {
 		# 自适应报告节奏：判据等价于「预计剩余时间 < 间隔逐级回落到 1 秒所需的总时长 上次汇报间隔*(上次汇报间隔-1)/2」，其中预计剩余时间 = 剩余字节 /（已下载字节数 / 总计已用秒数）；不足即收紧 1 秒、否则放宽 1 秒，切换点随实际速度浮动而非固定 2/3 进度；判据乘开避免除法，已下载 0 字节时恒判放宽，返回值下限 1 秒
 		if (($预计总大小 - $已下载字节数) * $总计已用秒数 * 2 -lt $上次汇报间隔 * ($上次汇报间隔 - 1) * $已下载字节数) {
@@ -443,9 +512,9 @@ function 通过HTTP断点续传下载 {
 			if (-not $地址已公布) {
 				$地址已公布 = $true
 				if ($已存在字节数 -gt 0) {
-					Write-Host ('[{0}] 从 {1} 字节处断点续传: {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $已存在字节数, $下载地址)
+					Write-Host ('{0} [{1}] 从 {2} 字节处断点续传: {3}' -f $端标注, (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $已存在字节数, $下载地址)
 				} else {
-					Write-Host ('[{0}] 开始下载: {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $下载地址)
+					Write-Host ('{0} [{1}] 开始下载: {2}' -f $端标注, (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $下载地址)
 				}
 			}
 
@@ -487,11 +556,11 @@ function 通过HTTP断点续传下载 {
 						# 进度行只有远程/本地两种句式且不带内嵌时间戳：批量补刷后外层显示时刻与实际发生时刻一致，内嵌远端时钟只会与外层本地时钟打架
 						if ($内容总长度 -gt 0) {
 							$进度 = [math]::Round(($已传总字节数 * 100.0) / $内容总长度, 1)
-							Write-Host ('远程下载进度：{0} / {1} 字节（{2}%）' -f $已传总字节数, $内容总长度, $进度)
+							Write-Host ('{0} 远程下载进度：{1} / {2} 字节（{3}%）' -f $端标注, $已传总字节数, $内容总长度, $进度)
 							# 报告周期自适应（见 下次汇报间隔）：按预计剩余时间决定收紧或放宽
 							$报告周期秒数 = 下次汇报间隔 $报告周期秒数 ($当前时间 - $下载起始时刻).TotalSeconds $已传总字节数 $内容总长度
 						} else {
-							Write-Host ('远程下载进度：已传 {0} 字节' -f $已传总字节数)
+							Write-Host ('{0} 远程下载进度：已传 {1} 字节' -f $端标注, $已传总字节数)
 							# 总大小未知时无法估算剩余时间，只增不减
 							$报告周期秒数++
 						}
@@ -554,7 +623,7 @@ function 通过HTTP断点续传下载 {
 			# 重试对齐到下个汇报周期：扣掉本轮在上次汇报（进度行或上一次中断行）之后已耗掉的秒数，下限 1 秒
 			$等待秒数 = [Math]::Max(1, [int][Math]::Ceiling($报告周期秒数 - ($此刻 - $上次汇报时刻).TotalSeconds))
 			$上次汇报时刻 = $此刻
-			Write-Host ('[{0}] 第 {1} 次下载中断（续传点 {2} 字节）: {3}，下个汇报周期（{4} 秒后）重试' -f $此刻.ToString('yyyy-MM-dd HH:mm:ss'), $重试次数, $续传点字节数, $中断原因, $等待秒数)
+			Write-Host ('{0} [{1}] 第 {2} 次下载中断（续传点 {3} 字节）: {4}，下个汇报周期（{5} 秒后）重试' -f $端标注, $此刻.ToString('yyyy-MM-dd HH:mm:ss'), $重试次数, $续传点字节数, $中断原因, $等待秒数)
 		}
 
 		# 保留已下载的部分文件，等到下个汇报周期再自动续传（周期由 下次汇报间隔 自适应 + 无进展时逐轮放宽，不再写死秒数）
@@ -687,6 +756,64 @@ foreach ($候 in $全进程表.Values) {
 }
 if ($僵尸数 -gt 0) {
 	Write-Output ('已清理僵尸会话 {0} 个，后续连接的输出投递不再被拖慢。' -f $僵尸数)
+}
+
+# ===== 僵尸 sshd 会话清理（上一段够不着的另一半）：客户端早已消失，Windows 的 sshd 会话进程却不自行退出，实测有存活 17.5 小时的（客户端本地早已没有对应 ssh 进程）。它们的 powershell/cmd 后代祖先链里**有** sshd，所以上一段的判据一条也杀不到。
+# 判据三全才杀，宁可漏杀不可误杀（杀错一条会当场掐断别人正在用的远程窗口）：
+#   ① 树根是 sshd.exe 且命令行带 -R（会话侧进程），其父进程也是 sshd（主监听进程）；
+#   ② 整棵树（-R 根、-z 子进程、以及其下 powershell/cmd/conhost 全部后代）当前没有任何 ESTABLISHED 的 TCP 连接；
+#   ③ 树龄超过 60 分钟（避开刚建立、连接尚未登记的会话）。
+# 必须按整棵树看连接：ESTABLISHED 挂在 -z 子进程名下而非 -R 父进程（实测同一条活会话 -R 0 条、其 -z 1 条），逐进程判会把活会话的 -R 误判成僵尸杀掉。取不到 TCP 连接表（老系统无 Get-NetTCPConnection、权限不足）时整段跳过——没有连接证据就绝不动任何 sshd 会话。
+$僵尸会话数 = 0
+$连接持有者 = @{}
+$能取连接表 = $true
+try {
+	foreach ($连 in @(Get-NetTCPConnection -State Established -ErrorAction Stop)) {
+		$连接持有者[[int]$连.OwningProcess] = $true
+	}
+} catch { $能取连接表 = $false }
+if ($能取连接表) {
+	# 本次连接自己的会话树先认出来（本脚本就跑在那条会话里）：树里含 $PID 或含本进程任一祖先，一律跳过
+	$自身链 = @{}
+	$自身游标 = $全进程表[[int]$PID]
+	for ($i = 0; $i -lt 12 -and $null -ne $自身游标; $i++) {
+		$自身链[[int]$自身游标.ProcessId] = $true
+		$自身游标 = $全进程表[[int]$自身游标.ParentProcessId]
+	}
+	foreach ($会话根 in $全进程表.Values) {
+		if ($会话根.Name -notlike 'sshd*') { continue }
+		if ($null -eq $会话根.CommandLine -or ($会话根.CommandLine.IndexOf('-R') -lt 0)) { continue }
+		$会话父 = $全进程表[[int]$会话根.ParentProcessId]
+		if ($null -eq $会话父 -or $会话父.Name -notlike 'sshd*') { continue }
+		# 广度收齐整棵树（层数封顶，防 PID 复用形成环）
+		$树 = @([int]$会话根.ProcessId)
+		$待扫 = @([int]$会话根.ProcessId)
+		for ($层 = 0; $层 -lt 8 -and $待扫.Count -gt 0; $层++) {
+			$下一批 = @()
+			foreach ($项2 in $全进程表.Values) {
+				if ($null -eq $项2.ParentProcessId) { continue }
+				if ($待扫 -contains [int]$项2.ParentProcessId) { $树 += [int]$项2.ProcessId; $下一批 += [int]$项2.ProcessId }
+			}
+			$待扫 = $下一批
+		}
+		# 自己的会话绝不碰（树里出现 $PID 或自身祖先即跳过；这是最强的一道保险）
+		$含自身 = $false
+		foreach ($树内 in $树) { if ($自身链[$树内]) { $含自身 = $true; break } }
+		if ($含自身) { continue }
+		if (((Get-Date) - $会话根.CreationDate).TotalMinutes -lt 60) { continue }
+		$树内有连接 = $false
+		foreach ($树内 in $树) { if ($连接持有者[$树内]) { $树内有连接 = $true; break } }
+		if ($树内有连接) { continue }
+		$杀序 = @($树)
+		[Array]::Reverse($杀序)
+		foreach ($树内 in $杀序) {
+			try { Stop-Process -Id $树内 -Force -ErrorAction Stop } catch { }
+		}
+		$僵尸会话数++
+	}
+}
+if ($僵尸会话数 -gt 0) {
+	Write-Output ('已清理僵尸 sshd 会话 {0} 条（客户端早已消失、sshd 不自行退出；有连接的活会话与本次连接的会话一概未碰）。' -f $僵尸会话数)
 }
 
 # 竞速暂存目录：本地模块与远程脚本约定在同一目录交换压缩包与标记文件；空串表示未启用竞速，回退远程单独下载

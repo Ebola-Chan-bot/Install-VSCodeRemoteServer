@@ -1,4 +1,4 @@
-# 本地供给并发自检（真跑子进程）：覆盖本次线上事故的四类并发情形
+﻿# 本地供给并发自检（真跑子进程）：覆盖本次线上事故的四类并发情形
 #   S1 父进程死亡 → 子进程自行终止（不再有孤儿供给进程长期占着缓存与带宽）
 #   S2 认领无人持有的遗留半成品（上一轮被 taskkill 留下的 .downloading-*）并续传
 #   S3 他方进程持锁写同一产物 → 等待/接管，全程不得再出现 "being used by another process" 刷屏
@@ -7,10 +7,10 @@
 $ErrorActionPreference = 'Stop'
 $repo = 'c:\Users\vhtmf\source\repos\Install-VSCodeRemoteServer\接管远程服务器安装扩展'
 $供给脚本 = (Resolve-Path (Join-Path $repo 'module\private\local-supply.ps1')).Path
-$script:失败 = 0
-function 断言([bool]$条件, [string]$说明) {
-	if ($条件) { Write-Output ('OK  ' + $说明) } else { Write-Output ('FAIL ' + $说明); $script:失败++ }
-}
+. (Join-Path $PSScriptRoot 'lib\探针公共库.ps1')
+Initialize-断言 -通过前缀 'OK  ' -失败前缀 'FAIL '
+# 断言台账统一放公共库；本地只留薄转发，调用点一行不改
+function 断言 { param([Parameter(Position = 0)]$甲, [Parameter(Position = 1)]$乙, [Parameter(Position = 2)]$丙 = '') ; 写-断言 $甲 $乙 ([string]$丙) }
 # 32 字节、以 gzip 魔数开头：满足 测试-本地包完整 对 .tar.gz 的最小校验（≥22 字节 + 1F 8B）
 $合法包字节 = [byte[]](0x1F, 0x8B) + (New-Object byte[] 30)
 
@@ -89,6 +89,34 @@ $出2 = 收-输出 $组2
 断言 (@(Get-ChildItem -LiteralPath $env:TEMP -Filter 'CONC-S2-LOCAL.tar.gz.downloading-*' -ErrorAction SilentlyContinue).Count -eq 1) '只剩本进程自己的私有在途文件'
 断言 ($出2 -notmatch 'being used by another process') '无人持锁时不出现占用类报错'
 停-子进程 $p2
+
+# ---------- S2b 活属主的半成品绝不可认领（缺陷B）----------
+# 线上事故（2026-10-23）：认领只按「有没有写句柄」判无人持有 —— 活着的属主在等下个汇报周期时句柄是关着的，
+# 于是它已下好的 42MB（共 84MB）半成品被改名搬走，两边从残缺处续传，日志里冒出两个「另一供给进程」。
+# 修法：归属判据 = 句柄被持有 **或** 文件名里的属主 PID 还活着；活属主一概跳过。
+Write-Output ''
+Write-Output '===== S2b. 活属主（无句柄，仅 PID 名可识别）的半成品不被认领 ====='
+$假属主 = Start-Process powershell -ArgumentList '-NoProfile','-Command','Start-Sleep 240' -NoNewWindow -PassThru
+$组2b = 新建-参数文件 'CONC-S2B-LOCAL.tar.gz' @('http://127.0.0.1:59999/a.tar.gz') 0
+$成品2b = Join-Path $env:TEMP 'CONC-S2B-LOCAL.tar.gz'
+Remove-Item -LiteralPath $成品2b -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath (Join-Path $env:TEMP 'CONC-S2B-LOCAL.tar.gz.downloading-*') -Force -ErrorAction SilentlyContinue
+# 关键：这个文件**没有任何句柄**（复刻“属主正在睡到下个汇报周期”的那个瞬间），只能靠 PID 名看出它还活着
+$活半成品 = $成品2b + '.downloading-' + $假属主.Id
+$活半成品字节 = 1048576
+$活半成品内容 = New-Object byte[] $活半成品字节
+$活半成品内容[0] = 0x1F; $活半成品内容[1] = 0x8B
+[System.IO.File]::WriteAllBytes($活半成品, $活半成品内容)
+$p2b = 跑-子进程 $组2b 12
+$出2b = 收-输出 $组2b
+断言 (Test-Path -LiteralPath $活半成品) '活属主的在途文件仍在原位（没被改名搬走）'
+断言 ((Get-Item -LiteralPath $活半成品 -ErrorAction SilentlyContinue).Length -eq $活半成品字节) ('活属主已下的字节一个不少（实测 ' + $(if (Test-Path -LiteralPath $活半成品) { (Get-Item -LiteralPath $活半成品).Length } else { '文件已没' }) + ' 字节）')
+断言 ($出2b -match ('另一供给进程正在下载同一产物（属主 PID ' + $假属主.Id + '，存活')) '按属主 PID 判出“他方还在下”并写明属主与存活判据（不再靠字节数猜）'
+断言 ($出2b -notmatch '认领遗留半成品') '不把活属主的文件当无人遗留认领'
+断言 (@(Get-ChildItem -LiteralPath $env:TEMP -Filter 'CONC-S2B-LOCAL.tar.gz.downloading-*' -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 1 }).Count -eq 1) '没有多出一份大文件（本进程未抢先下载同一产物）'
+停-子进程 $p2b
+Stop-Process -Id $假属主.Id -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $活半成品, $成品2b -Force -ErrorAction SilentlyContinue
 
 # ---------- S3 他方持锁 → 等待/接管，不刷占用错 ----------
 Write-Output ''
@@ -199,5 +227,5 @@ Get-ChildItem -LiteralPath $env:TEMP -Filter 'vsi-con-*.clixml' -ErrorAction Sil
 }
 
 Write-Output ''
-Write-Output ("并发自检断言失败数累计: $($script:失败)")
-exit $(if ($script:失败 -eq 0) { 0 } else { 1 })
+Write-Output ("并发自检断言失败数累计: " + (取-断言计数).失败)
+exit $(if ((取-断言计数).失败 -eq 0) { 0 } else { 1 })

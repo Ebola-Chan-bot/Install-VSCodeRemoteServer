@@ -615,6 +615,9 @@ const 状态键_终端失灵提示时刻 = '安装命令未执行提示时刻';
 let 终端失灵提示已弹 = false;
 let 救援进行中 = false;
 let 救援日志通道 = null;
+// 「扫描不到任何日志」只提醒一次：这是检测失明的可取证信号（2026-10-22 线上事故当时毫无痕迹，事后只能靠人工翻目录反推）
+let 扫描空已提示 = false;
+let logs根目录缓存 = null;
 
 function 取救援日志通道() {
 	if (!救援日志通道) { 救援日志通道 = vscode.window.createOutputChannel('接管安装·终端救援'); }
@@ -626,7 +629,13 @@ function 检测安装命令未执行(context) {
 	try {
 		const 名单 = [...new Set([...取主机清单设置(接管主机键), ...取主机清单设置(保活主机键)])];
 		if (名单.length === 0) { return; }
-		const 命中 = 找近期安装超时日志(名单);
+		const 日志组 = 列近期RemoteSshLog();
+		const 命中 = 找近期安装超时日志(名单, 日志组);
+		if (日志组.length === 0 && !扫描空已提示) {
+			扫描空已提示 = true;
+			console.warn('[接管远程服务器安装] 终端超时检测近 20 分钟内没扫到任何 Remote-SSH 日志（logs 根=' + (找logs根目录() || '(未定位)')
+				+ '，本会话=' + (找本会话目录名() || '(未知)') + '）：若本窗口正在连远程，说明日志扫描口径又被带偏，检测已失明，需人工复查 列近期RemoteSshLog');
+		}
 		if (!命中) { return; }
 		终端失灵提示已弹 = true;
 		context.globalState.update(状态键_终端失灵提示时刻, Date.now());
@@ -697,9 +706,10 @@ async function 启动终端救援(context, 主机, 手动) {
 }
 
 // 近 20 分钟内被改写的 Remote-SSH 输出日志中找「同名主机 ≥2 次连接超时且无网络/凭据层报错」的窗口
-function 找近期安装超时日志(名单) {
+// 日志文件列表由调用方传入（默认实扫）：解耦后可以用假造的目录树直接回归（_probe/rescue-detection-selftest.js）
+function 找近期安装超时日志(名单, 日志组 = 列近期RemoteSshLog()) {
 	let 最佳 = null;
-	for (const 文件 of 列近期RemoteSshLog()) {
+	for (const 文件 of 日志组) {
 		let 内容 = '';
 		try { 内容 = fs.readFileSync(文件, 'utf8'); } catch (e) { continue; }
 		// 真实网络/凭据故障自带明确报错特征，不属于终端服务异常，排除避免误报
@@ -716,14 +726,18 @@ function 找近期安装超时日志(名单) {
 	return 最佳;
 }
 
-// 所有窗口的扩展输出日志都在 <数据目录>\logs\<会话>\window<N>\exthost\output_logging_*\ 下：由本窗口 logUri 反推到 logs 根，再取最近两个会话目录
-function 列近期RemoteSshLog() {
+// 所有窗口的扩展输出日志都在 <数据目录>\logs\<会话>\window<N>\exthost\output_logging_*\ 下。
+// 会话目录的选取**必须由本窗口 logUri 定位 + 日志自身近期性决定，绝不能只按目录名倒序取前两个**：任何一次 CLI 调用（code-insiders --install-extension / --version，以及 npx vsce 等间接触发的启动器）都会新建一个只含 cli.log 的**空壳会话目录**。实测线上事故（2026-10-22）：一次调试连出 6 个空壳，把真实会话（含 window3 的 Remote-SSH 日志）挤到第 7 位，`.slice(0, 2)` 只扫到两个空壳 → 检测恒不命中 → 当天 12:46 与 14:21 两轮共 18 次 "Connecting with SSH timed out" 全都没触发自动救援，用户只能自己发现「窗口连不上」。空壳目录还会持续产生（每次装扩展都有），所以这条规则是长期约束，不是偶发。
+function 列近期RemoteSshLog(最大会话数 = 12) {
 	const 结果 = [];
 	const 根 = 找logs根目录();
 	if (!根) { return 结果; }
 	const 截点 = Date.now() - 20 * 60 * 1000;
+	const 本会话 = 找本会话目录名();
 	let 会话;
-	try { 会话 = fs.readdirSync(根).filter(名 => /^\d{8}T\d{6}$/.test(名)).sort().reverse().slice(0, 2); } catch (e) { return 结果; }
+	try { 会话 = fs.readdirSync(根).filter(名 => /^\d{8}T\d{6}$/.test(名)).sort().reverse().slice(0, 最大会话数); } catch (e) { return 结果; }
+	// 本窗口所在会话必扫（放最前）：空壳目录再多也挤不掉它
+	if (本会话 && 会话.indexOf(本会话) < 0) { 会话.unshift(本会话); }
 	for (const 会 of 会话) {
 		let 窗口目录;
 		try { 窗口目录 = fs.readdirSync(path.join(根, 会)).filter(名 => /^window\d+$/.test(名)); } catch (e) { continue; }
@@ -745,21 +759,31 @@ function 列近期RemoteSshLog() {
 }
 
 function 找logs根目录() {
-	// 本窗口的 logUri 形如 .../logs/<会话>/window<N>/exthost/<扩展标识>/...，逐级上溯到 logs 目录
+	// 本窗口的 logUri 形如 .../logs/<会话>/window<N>/exthost/<扩展标识>/...，逐级上溯到 logs 目录（顺带记住本会话目录名）
 	const 日志Uri = vscode.env.logUri;
 	if (日志Uri) {
 		let 目录 = 日志Uri.fsPath;
+		let 下级名 = '';
 		while (目录) {
-			if (path.basename(目录) === 'logs') { return 目录; }
+			if (path.basename(目录) === 'logs') { logs根目录缓存 = 目录; 本会话目录名缓存 = 下级名 || null; return 目录; }
+			下级名 = path.basename(目录);
 			const 上级 = path.dirname(目录);
 			if (上级 === 目录) { break; }
 			目录 = 上级;
 		}
 	}
-	// 兜底：按产品名拼常见数据目录
+	// 兜底：按产品名拼常见数据目录（此时拿不到本会话名，只能靠目录名倒序扫）
 	const 产品目录 = { 'Visual Studio Code': 'Code', 'Visual Studio Code - Insiders': 'Code - Insiders', 'Visual Studio Code - Exploration': 'Code - Exploration' }[vscode.env.appName];
-	if (产品目录 && process.env.APPDATA) { return path.join(process.env.APPDATA, 产品目录, 'logs'); }
+	if (产品目录 && process.env.APPDATA) { const p = path.join(process.env.APPDATA, 产品目录, 'logs'); logs根目录缓存 = p; return p; }
 	return null;
+}
+
+// 本窗口所在会话目录名（如 20261022T121929）：列日志时必扫它，以免被 CLI 空壳会话目录挤出取名窗口
+let 本会话目录名缓存 = null;
+function 找本会话目录名() {
+	if (本会话目录名缓存) { return 本会话目录名缓存; }
+	找logs根目录();
+	return 本会话目录名缓存;
 }
 
 async function 在新窗口打开远程(首选主机, 名单) {
@@ -821,4 +845,9 @@ async function 清理全部主机连接状态(context) {
 	}
 }
 
-module.exports = { activate: 激活, deactivate: 停用 };
+// 测试钩子（_probe/rescue-detection-selftest.js 用）：日志扫描与会话目录选取的口径必须可回归，不得只在真实 VS Code 里验证
+module.exports = {
+	activate: 激活,
+	deactivate: 停用,
+	_测试: { 列近期RemoteSshLog, 找近期安装超时日志, 找logs根目录, 找本会话目录名 },
+};

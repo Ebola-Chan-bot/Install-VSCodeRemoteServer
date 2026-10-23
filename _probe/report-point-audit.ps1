@@ -3,10 +3,10 @@
 # 用法：powershell -NoProfile -ExecutionPolicy Bypass -File _probe\report-point-audit.ps1
 $ErrorActionPreference = 'Stop'
 $repo = 'c:\Users\vhtmf\source\repos\Install-VSCodeRemoteServer\接管远程服务器安装扩展'
-$script:问题 = 0
-function 断言([bool]$条件, [string]$说明) {
-	if ($条件) { Write-Output ("OK  " + $说明) } else { Write-Output ("FAIL " + $说明); $script:问题++ }
-}
+. (Join-Path $PSScriptRoot 'lib\探针公共库.ps1')
+Initialize-断言 -通过前缀 'OK  ' -失败前缀 'FAIL '
+# 断言台账统一放公共库；本地只留薄转发，调用点一行不改
+function 断言 { param([Parameter(Position = 0)]$甲, [Parameter(Position = 1)]$乙, [Parameter(Position = 2)]$丙 = '') ; 写-断言 $甲 $乙 ([string]$丙) }
 
 # ============ 全局禁忌：旧机制必须彻底消失（三份源码 + sh 一起查）============
 $三份 = @(
@@ -107,7 +107,7 @@ foreach ($相对 in @('module\private\remote-install-common.ps1', 'module\privat
 	$名 = Split-Path -Leaf $全路径
 	$tokens = $null; $errors = $null
 	$ast = [System.Management.Automation.Language.Parser]::ParseFile($全路径, [ref]$tokens, [ref]$errors)
-	if ($errors.Count -gt 0) { Write-Output ("FAIL parse: $名 -> " + (($errors | ForEach-Object { $_.Message }) -join '; ')); $script:问题++; continue }
+	if ($errors.Count -gt 0) { 写-断言 ("parse: $名") $false (($errors | ForEach-Object { $_.Message }) -join '; '); continue }
 	$命令集 = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)
 	$发射点集 = @($命令集 | ForEach-Object { 取-发射点 $_ } | Where-Object { $_ })
 	$全文 = (Get-Content -LiteralPath $全路径 -Raw)
@@ -214,7 +214,10 @@ foreach ($码 in @(0, 1, 2, 3)) {
 }
 断言 (@([regex]::Matches($供给代码, '__VSI_RC__\\s\*:\\s\*\(\\d\+\)')).Count -ge 1) '本地从 stdout 解析结果码（拿不到标记时退回退出码）'
 断言 ($供给代码.Contains('$改名码 = $改名结果.退出码')) '解析前先以退出码兵底（远端未回标记时仍可判 0/非0）'
-断言 (@([regex]::Matches($供给代码, '__VSI_ERR__:')).Count -ge 3) '失败/幂等路径都带 __VSI_ERR__ 真因标记（实测 ' + ([regex]::Matches($供给代码, '__VSI_ERR__:')).Count + ' 处）'
+# 注意：消息若由 + 拼成，整段必须套括号。裸写在参数位置上时 + / 变量 / 尾串会被当成额外实参，
+# 断言直接抛 PositionalParameterNotFound，脚本却接着往下跑、最后照样报「0 问题」——这条断言
+# 因此曾长期根本没执行过（2026-10-23 迁移公共库台账时被 扫-裸拼接实参 抓出来）。
+断言 (@([regex]::Matches($供给代码, '__VSI_ERR__:')).Count -ge 3) ('失败/幂等路径都带 __VSI_ERR__ 真因标记（实测 ' + ([regex]::Matches($供给代码, '__VSI_ERR__:')).Count + ' 处）')
 
 # 规则 9：供给进程绝不共写同一个文件——下载到本进程私有名，完成后才发布为稳定成品名
 
@@ -236,7 +239,7 @@ foreach ($码 in @(0, 1, 2, 3)) {
 断言 (@([regex]::Matches($共通代码, [regex]::Escape('Remove-Item -LiteralPath $暂存目录 -Recurse'))).Count -eq 0) 'remote-install-common.ps1 已无整目录删除'
 断言 (@([regex]::Matches($sh代码, 'rm -rf "\$STAGING"')).Count -eq 0) 'remote-install-linux.sh 已无整目录删除'
 断言 (@([regex]::Matches($编排代码, [regex]::Escape("rm -rf '__暂存目录__'"))).Count -eq 0) '接管编排脚本模板.sh 已无整目录删除'
-断言 (@([regex]::Matches($共通代码, '清理-竞速暂存目录')).Count -ge 3) '改为逐项清理函数（定义 + 两处调用，实测 ' + ([regex]::Matches($共通代码, '清理-竞速暂存目录')).Count + ' 处）'
+断言 (@([regex]::Matches($共通代码, '清理-竞速暂存目录')).Count -ge 3) ('改为逐项清理函数（定义 + 两处调用，实测 ' + ([regex]::Matches($共通代码, '清理-竞速暂存目录')).Count + ' 处）')
 断言 ($sh代码.Contains('*.uploading')) 'sh 侧清理保留 .uploading 在途文件'
 断言 ($编排代码.Contains('*.uploading')) '编排模板清理保留 .uploading 在途文件'
 断言 ($模块代码.Contains('*.uploading) continue')) '竞速预备命令跳过 .uploading（Linux 侧）'
@@ -274,5 +277,5 @@ foreach ($文件 in $谓词文件) {
 断言 (@([regex]::Matches($供给代码, 'if \(-not \(测-父进程仍在\)\)')).Count -ge 1) '看门狗在真实循环里被调用（谓词无参、说明文字由调用处打印）'
 
 Write-Output ''
-Write-Output ("审计问题总数: $($script:问题) (0 = 通过)")
-exit $(if ($script:问题 -eq 0) { 0 } else { 1 })
+Write-Output ("审计问题总数: " + (取-断言计数).失败 + " (0 = 通过)")
+exit $(if ((取-断言计数).失败 -eq 0) { 0 } else { 1 })

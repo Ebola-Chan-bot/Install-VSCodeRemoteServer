@@ -7,10 +7,10 @@
 $ErrorActionPreference = 'Stop'
 $repo = 'c:\Users\vhtmf\source\repos\Install-VSCodeRemoteServer\接管远程服务器安装扩展'
 $供给脚本 = Join-Path $repo 'module\private\local-supply.ps1'
-$script:失败 = 0
-function 断言([bool]$条件, [string]$说明) {
-	if ($条件) { Write-Output ("OK  " + $说明) } else { Write-Output ("FAIL " + $说明); $script:失败++ }
-}
+. (Join-Path $PSScriptRoot 'lib\探针公共库.ps1')
+Initialize-断言 -通过前缀 'OK  ' -失败前缀 'FAIL '
+# 断言台账统一放公共库；本地只留薄转发，调用点一行不改
+function 断言 { param([Parameter(Position = 0)]$甲, [Parameter(Position = 1)]$乙, [Parameter(Position = 2)]$丙 = '') ; 写-断言 $甲 $乙 ([string]$丙) }
 
 $tokens = $null; $errors = $null
 [void][System.Management.Automation.Language.Parser]::ParseFile($供给脚本, [ref]$tokens, [ref]$errors)
@@ -106,5 +106,5 @@ Write-Output ('    半成品保留供下轮续传: ' + $半成品 + '（存在='
 
 Remove-Item -LiteralPath $半成品, $参数文件, $outPath, $errPath -Force -ErrorAction SilentlyContinue
 Write-Output ''
-Write-Output ("断言失败数: $($script:失败)")
-exit $(if ($script:失败 -eq 0) { 0 } else { 1 })
+Write-Output ("断言失败数: " + (取-断言计数).失败)
+exit $(if ((取-断言计数).失败 -eq 0) { 0 } else { 1 })

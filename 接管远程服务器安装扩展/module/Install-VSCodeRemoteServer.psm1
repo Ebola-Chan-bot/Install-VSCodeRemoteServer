@@ -12,7 +12,9 @@ $script:脚本_服务保活部署 = Get-Content -Path (Join-Path $script:模块�
 $script:脚本_服务保活包装 = Get-Content -Path (Join-Path $script:模块根目录 'private\keepalive-wrapper.sh') -Raw -Encoding UTF8
 $script:脚本_服务保活改名器 = (Get-Content -Path (Join-Path $script:模块根目录 'private\keepalive-renamer.js') -Raw -Encoding UTF8) -replace "`r`n", "`n"
 # 会话引导与编排的脚本正文一律独立成文件（不在 psm1 里内嵌字符串），sh 正文加载时归一 LF 行尾（sh 对 \r 零容忍）
+# stdin 引导是「固定极小」的一层：载荷经标准输入送达、argv 只装本引导的 EncodedCommand，命令行长度与安装脚本大小彻底解耦
 $script:脚本_单会话引导 = Get-Content -Path (Join-Path $script:模块根目录 'private\Windows单会话引导.ps1') -Raw -Encoding UTF8
+$script:脚本_stdin引导 = Get-Content -Path (Join-Path $script:模块根目录 'private\windows-stdin-bootstrap.ps1') -Raw -Encoding UTF8
 $script:脚本_会话帧循环 = (Get-Content -Path (Join-Path $script:模块根目录 'private\会话帧循环.sh') -Raw -Encoding UTF8) -replace "`r`n", "`n"
 $script:脚本_环境探测命令 = (Get-Content -Path (Join-Path $script:模块根目录 'private\环境探测命令.txt') -Raw -Encoding UTF8) -replace "`r`n", "`n"
 $script:脚本_接管编排模板 = (Get-Content -Path (Join-Path $script:模块根目录 'private\接管编排脚本模板.sh') -Raw -Encoding UTF8) -replace "`r`n", "`n"
@@ -589,6 +591,7 @@ function 安装-VSCode远程服务 {
 			[string]$连接目标,
 			[int]$端口,
 			[string]$命令文本,
+			[string]$标准输入,
 			[switch]$TTY,
 			[scriptblock]$每行回调
 		)
@@ -618,13 +621,152 @@ function 安装-VSCode远程服务 {
 				if ($每行回调) { & $每行回调 $文本 }
 				转发-供给日志
 			}
-			& $ssh命令.Source $ssh参数 2>&1 | ForEach-Object $处理行
+			# 大载荷一律走标准输入：argv 只装固定引导，命令行长度不再随安装脚本膨胀。
+			# 实测教训（2026-10-22）：双重 base64 后 argv 达 37,950 字符 > CreateProcess 上限 32,767，本地 ssh.exe 直接拒绝启动（Program 'ssh.exe' failed to run: The filename or extension is too long），退出码 1 冒到 preconnect → Remote-SSH 判 PreconnectScriptFailure，整条连接夭折。管道结束时 PowerShell 会关闭原生进程的标准输入，EOF 确定送达，远端 ReadToEnd 才能返回。
+			if ([string]::IsNullOrEmpty($标准输入)) {
+				& $ssh命令.Source $ssh参数 2>&1 | ForEach-Object $处理行
+			} else {
+				$标准输入 | & $ssh命令.Source $ssh参数 2>&1 | ForEach-Object $处理行
+			}
 			$退出码 = $LASTEXITCODE
 		} finally {
 			$ErrorActionPreference = $原始EAP
 		}
 		if ($退出码 -ne 0) {
 			throw ('SSH 执行失败，退出码: {0}' -f $退出码)
+		}
+	}
+
+	# 走标准输入下发大载荷的 SSH 调用（Windows 单会话引导专用）：自己起 ssh 进程、把载荷一次性写入 StandardInput 后**显式 Close()**，输出异步读并配硬超时看门狗。为什么不用 PowerShell 管道（`$文本 | & ssh …`）：管道收尾不可靠是**偶发真实故障**——实测同一条通道 2KB/40KB/400KB 三档都在约 1 秒内无损送达（长度 + SHA256 双判据一致、退出码 0），但 120KB 那一档**挂死约 66 分钟**（退出码 -1、哈希无法核对）。无声挂死会把 Remote-SSH 的整个连接一起拖死，所以这里改成：EOF 由我们自己关闭（确定性），并加超时看门狗——超时即 taskkill 整树 + 抛类型化错误，让调用方重试而不是干等。
+	function 执行-SSH命令带标准输入 {
+		param(
+			[string]$连接目标,
+			[int]$端口,
+			[string]$命令文本,
+			[string]$标准输入文本,
+			[int]$超时秒 = 240,
+			[scriptblock]$每行回调
+		)
+
+		$ssh命令 = Get-Command ssh -ErrorAction SilentlyContinue | Select-Object -First 1
+		if ($null -eq $ssh命令) {
+			throw '未找到 ssh 命令，无法连接远程服务器。'
+		}
+
+		$参数串 = '-p ' + $端口
+		foreach ($项 in $script:SSH密码选项) { $参数串 = $参数串 + ' "' + $项 + '"' }
+		$参数串 = $参数串 + ' ' + $连接目标 + ' "' + $命令文本 + '"'
+
+		$psi = New-Object System.Diagnostics.ProcessStartInfo
+		# .cmd/.bat 包装的 ssh（某些环境用批处理包装）不能被 CreateProcess 直接启动，包一层 cmd /c
+		if ($ssh命令.Source -match '\.(cmd|bat)$') {
+			$psi.FileName = 'cmd.exe'
+			$psi.Arguments = '/c ""' + $ssh命令.Source + '" ' + $参数串 + '"'
+		} else {
+			$psi.FileName = $ssh命令.Source
+			$psi.Arguments = $参数串
+		}
+		$psi.UseShellExecute = $false
+		$psi.RedirectStandardInput = $true
+		$psi.RedirectStandardOutput = $true
+		$psi.RedirectStandardError = $true
+		$psi.CreateNoWindow = $true
+		try { $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+		try { $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8 } catch { }
+
+		$进程 = [System.Diagnostics.Process]::Start($psi)
+		# stderr 必须异步抽干：只重定向不读取，缓冲区写满（约 4KB）就会把远端进程堵住 → 表现为"挂死"，与被替换掉的管道式写法是同一类故障，这里一并根除（仓库既有的 预热直连 也是这么做的）
+		$错误任务 = $进程.StandardError.ReadToEndAsync()
+		$截止 = (Get-Date).AddSeconds($超时秒)
+		$已超时 = $false
+		$有效行数 = 0
+		# 启动层截止：生产同形态实测健康主机从建连到引导打出「载荷已到达」回执只要 5.8 秒（回执在引导做任何重活之前打，且远端读 stdin 本身有 90 秒界限），故 90 秒内一行有效输出都没有 = 远端引导从未开口，挂点在连接建立/远端启动层，不必白等满 240 秒的安装段超时（2026-10-23 上科大B服务器事故：240 秒全程静默，事后普查远端根本没有本次尝试的引导进程）
+		$启动截止 = (Get-Date).AddSeconds([Math]::Min(90, $超时秒))
+		$启动层挂死 = $false
+		$原EAP = $ErrorActionPreference
+		try {
+			$ErrorActionPreference = 'Continue'
+			# 载荷一次性写入并立刻关闭：EOF 由我们决定，不给通道留"收尾不确定"的空间
+			# 载荷是 base64 分块（纯 ASCII，不含 CR 也容忍被加 CRLF），用 ASCII 写字节即可
+			$载荷字节 = [System.Text.Encoding]::ASCII.GetBytes($标准输入文本)
+			$进程.StandardInput.BaseStream.Write($载荷字节, 0, $载荷字节.Length)
+			$进程.StandardInput.Flush()
+			$进程.StandardInput.Close()
+			# 本地侧检查点：写出+关闭完成说明 EOF 已交给 ssh.exe，此后若再无任何有效输出，挂点必在远端/连接层而非载荷没送出去——事后取证时这行日志就是分界线
+			Write-Host ('[单会话] 载荷已写出 {0} 字节并关闭标准输入，等待远端引导回执…' -f $载荷字节.Length)
+
+			$script:标题序列未闭合 = $false
+			# 注意：本循环以 `& $处理行 $行` 直接调用（不是 ForEach-Object 的管道调用），
+			# 所以行处理器**必须用 param 接收实参**。写成 `[string]$_` 只在管道调用下才取到内容：
+			# 实测那样取值恒为空串，后果是远端每一行都变空行——竞速标记进不了回调、本地供给永不启动（只剩远端独自下载），
+			# 且空行仍算“有进展”把看门狗截止时间一路顺延（实测 448 秒 > 240 秒也没被杀），表现为“远端在跑、本地一片静默”。
+			$处理行 = {
+				param([string]$文本行)
+				$文本 = 剥离-终端控制序列 $文本行
+				# 远端 powershell 在非控制台 stdio 下会把进度记录序列化成 CLIXML 噪声，滤掉不进日志
+				if ($文本 -match '^(#< CLIXML|<Objs|</Objs>)') { return }
+				Write-Host $文本
+				if ($每行回调) { & $每行回调 $文本 }
+				转发-供给日志
+			}
+			$读任务 = $进程.StandardOutput.ReadLineAsync()
+			while ($true) {
+				if ($读任务.Wait(500)) {
+					$行 = $读任务.Result
+					if ($null -eq $行) { break }    # 读到 null = 远端标准输出已关闭
+					& $处理行 $行
+					# 只有“有效行”才算进展：空行与 CLIXML 序列化噪声不得顺延看门狗截止时间
+					# （实测：行处理器取错变量时每一行都变空串，空流一路顺延，448 秒 > 240 秒看门狗也没触发）
+					if ($行.Trim() -ne '' -and $行 -notmatch '^(#< CLIXML|<Objs|</Objs>)') {
+						$有效行数++
+						$截止 = (Get-Date).AddSeconds($超时秒)
+					}
+					$读任务 = $进程.StandardOutput.ReadLineAsync()
+					continue
+				}
+				if ($进程.HasExited) {
+					# 进程已结束：把异步读里已就绪的剩余行取干净再收尾
+					while ($读任务.Wait(0)) {
+						$行 = $读任务.Result
+						if ($null -eq $行) { break }
+						& $处理行 $行
+						$读任务 = $进程.StandardOutput.ReadLineAsync()
+					}
+					break
+				}
+				if ((Get-Date) -gt $截止) { $已超时 = $true; break }
+				# 启动层快速判死：一行有效输出都没收到过且超过启动截止 → 远端引导从未开口，与载荷/分块/安装脚本无关，立即判死重试而非盲等安装段超时
+				if ($有效行数 -eq 0 -and (Get-Date) -gt $启动截止) { $已超时 = $true; $启动层挂死 = $true; break }
+			}
+		} finally {
+			$ErrorActionPreference = $原EAP
+		}
+
+		if ($已超时) {
+			# 看门狗：挂死的会话必须连整棵进程树一起清掉，否则本地 ssh 与远端 powershell 会双双留着占会话
+			try { & taskkill /PID $进程.Id /T /F 2>&1 | Out-Null } catch { }
+			try { if (-not $进程.HasExited) { $进程.Kill() } } catch { }
+			if ($启动层挂死) {
+				# 相位诊断入消息：零有效输出 = ssh.exe 连上了但远端引导从未开口（事后普查远端不存在对应引导进程）。载荷已完整写出并关闭，分块不变式也在下发前校验过，故挂点只能在连接建立/shell 派生/远端启动层，常见根因是该主机僵尸会话堆积拖慢 sshd 对新会话的响应。本相位远端起过进程也会自行退出（引导读 stdin 有 90 秒界限），不留孤儿
+				throw ('[stdin超时] 标准输入通道 {0} 秒内未收到远端任何有效输出（载荷已完整写出并关闭）：挂点在连接建立/远端启动层，远端引导从未开口，与载荷、分块、安装脚本均无关（健康主机实测 {0} 秒内必见「载荷已到达」回执）。常见根因：该主机僵尸会话堆积拖慢 sshd 响应，可用远端体检工具确认后清理。已终止 ssh 进程树（PID {1}）。' -f [Math]::Min(90, $超时秒), $进程.Id)
+			}
+			throw ('[stdin超时] 标准输入通道收到 {0} 行有效输出后 {1} 秒再无进展（安装脚本静默段超过看门狗），已按看门狗终止 ssh 进程树（PID {2}）。远端可能残留 powershell，连接可安全重试。' -f $有效行数, $超时秒, $进程.Id)
+		}
+		if (-not $进程.WaitForExit(30000)) {
+			try { & taskkill /PID $进程.Id /T /F 2>&1 | Out-Null } catch { }
+			throw '[stdin超时] ssh 进程在读完后 30 秒内未退出，已强制终止。'
+		}
+		$退出码 = $进程.ExitCode
+		if ($退出码 -ne 0) {
+			# 远端 stderr 一并带出：否则失败时只剩一个退出码，排障要重新连一次才能看到真实原因
+			$错误摘要 = ''
+			try {
+				if ($错误任务.IsCompleted) {
+					$错误文本 = [string]$错误任务.Result
+					if (-not [string]::IsNullOrWhiteSpace($错误文本)) { $错误摘要 = '；远端 stderr 摘要: ' + $错误文本.Substring(0, [Math]::Min(300, $错误文本.Length)).Trim() }
+				}
+			} catch { }
+			throw ('SSH 执行失败（标准输入通道），退出码: {0}{1}' -f $退出码, $错误摘要)
 		}
 	}
 
@@ -1680,7 +1822,12 @@ function 安装-VSCode远程服务 {
 			[pscustomobject]$竞速上下文
 		)
 
-		# Windows 单会话全流程：探测/预备/安装/竞速监控/暂存收尾一条 ssh 全包。载荷（安装脚本正文去整行注释与空行后 gzip+base64）内嵌进 -EncodedCommand 引导——不走 stdin（实测远端默认 shell 对 stdin 收尾不可靠，挂死率高且远端留僵尸进程）。引导自带 PS2 版本门：命中打 __PS2__ 标记并退出 0，调用方据此回退离散流程。返回 '完成' 或 'PS2'。
+		# Windows 单会话全流程：探测/预备/安装/竞速监控/暂存收尾一条 ssh 全包。载荷（安装脚本正文去整行注释与空行后 gzip+base64）嵌进单会话引导后，整段走 **stdin** 下发；argv里只放固定极小的 stdin 引导（private\windows-stdin-bootstrap.ps1）的 EncodedCommand，命令行长度从此与安装脚本大小解耦。
+		# 旧结论「不走 stdin（实测远端默认 shell 对 stdin 收尾不可靠，挂死率高且远端留僵尸进程）」已被 2026-10-22 真机实测推翻：
+		#   ① 远端 sshd DefaultShell = powershell.exe（不是 cmd.exe，故无 8191 字符命令行上限）；
+		#   ② 远端读全量 stdin → 去掉一切空白 → base64 解码，2KB/40KB/120KB/400KB 四档的长度与 SHA256 双判据全部一致、退出码 0、单程约 1 秒（本地 PowerShell 在管道结束时关闭 ssh 的标准输入，EOF 确定送达，无需赌收尾）。
+		# 而旧做法实测致命：双重 base64 使 argv 达 37,950 字符 > CreateProcess 上限 32,767 → ssh.exe 拒绝启动（Program 'ssh.exe' failed to run: The filename or extension is too long）→ preconnect 退出码 1→Remote-SSH 判 PreconnectScriptFailure（Session Summary「预连接脚本已失败」）→ 整条连接夭折，窗口再也重连不上。
+		# 引导自带 PS2 版本门：命中打 __PS2__ 标记并退出 0，调用方据此回退离散流程。返回 '完成' 或 'PS2'。
 		$精简正文 = (($脚本文本 -split "`r?`n") | Where-Object { $_ -notmatch '^\s*#' -and $_.Trim() -ne '' }) -join "`n"
 		$压缩流 = New-Object System.IO.MemoryStream
 		$压缩器 = New-Object System.IO.Compression.GZipStream($压缩流, [System.IO.Compression.CompressionMode]::Compress)
@@ -1690,6 +1837,24 @@ function 安装-VSCode远程服务 {
 		$载荷 = [Convert]::ToBase64String($压缩流.ToArray())
 		$引导脚本 = $script:脚本_单会话引导.Replace('__载荷__', $载荷)
 		$引导码 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($引导脚本))
+		# ===== 传输通道：载荷走 stdin，argv 只装固定引导 =====
+		$固定引导码 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($script:脚本_stdin引导))
+		if ($固定引导码.Length -gt 8000) {
+			# 守卫：本文件是 argv 里**唯一**随模板增长的部件（载荷已不再进 argv），一旦变胖就可能把整条命令行顶穿上限。
+			throw ('stdin 固定引导过长（EncodedCommand {0} 字符 > 8000），请精简 private\windows-stdin-bootstrap.ps1；它的长度直接决定 argv 占用，必须远小于命令行上限 32767。' -f $固定引导码.Length)
+		}
+		$每块字符 = 4000
+		$块列表 = New-Object System.Collections.ArrayList
+		for ($起 = 0; $起 -lt $引导码.Length; $起 += $每块字符) {
+			[void]$块列表.Add($引导码.Substring($起, [Math]::Min($每块字符, $引导码.Length - $起)))
+		}
+		$载荷标准输入 = (($块列表 -join "`n") + "`n")
+		if ($载荷标准输入.Length -ne ($引导码.Length + $块列表.Count)) {
+			throw ('stdin 分块重组后长度不一致（{0} ≠ {1}），拒绝下发，以免远端解码失败后只拿到模糊报错' -f $载荷标准输入.Length, ($引导码.Length + $块列表.Count))
+		}
+		# 分块不是传输必需：远端 bootstrap 会 ReadToEnd 读完整条 stdin 并剔掉全部空白后才解码，实测 120KB 不分块也能一次传完（旧 argv 通道才卡 32767）。
+		# 分块的两个实际好处：① 把每行行长限定在 $每块字符 以内，避开通道/终端对超长单行的未知处理；② 行数 × 行长 恒等于引导码总长，上面那行不变式能当场校出拼接遗漏，不至于到远端才报模糊的解码失败。
+		Write-Host ('[单会话] 引导码 {0} 字符，分 {1} 块走标准输入下发（每块最长 {2} 字符）；argv 上只剩 {3} 字符的固定引导代码，远低于 Windows 命令行 32767 上限。分块为稳健选择而非传输必需（远端剔空白后整段解码），额外换来一个可当场校验的拼接不变式。' -f $引导码.Length, $块列表.Count, $每块字符, $固定引导码.Length)
 		$回调包 = 新建-供给回调 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $端口 -系统类型 'Windows'
 		$script:单会话PS2标记 = $false
 		$内部回调 = $回调包.回调
@@ -1699,7 +1864,21 @@ function 安装-VSCode远程服务 {
 			& $内部回调 $行
 		}
 		try {
-			执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('powershell -NoProfile -EncodedCommand {0}' -f $引导码) -每行回调 $检测回调
+			$命令行 = 'powershell -NoProfile -EncodedCommand {0}' -f $固定引导码
+			# 通道挂死重试：实测管道式 stdin 会偶发无声挂死（120KB 那一档挂了约 66 分钟），现在改走"显式 Close() + 看门狗"的新函数，挂死会在 240 秒无进展时被判死并清树，这里再重试一次。只对 [stdin超时] 这一类重试；其它错误（含 PS2、认证失败、远端报错）原样抛出，保留真实原因。
+			$尝试上限 = 2
+			for ($轮次 = 1; $轮次 -le $尝试上限; $轮次++) {
+				try {
+					执行-SSH命令带标准输入 -连接目标 $连接目标 -端口 $端口 -命令文本 $命令行 -标准输入文本 $载荷标准输入 -超时秒 240 -每行回调 $检测回调
+					break
+				} catch {
+					if ($_.Exception.Message -notmatch '^\[stdin超时\]') { throw }
+					if ($轮次 -ge $尝试上限) { throw }
+					# 把挂点诊断透进日志：「启动层挂死」与「安装段静默」是两种完全不同的故障（前者查连接/僵尸会话，后者查安装脚本哪段没有输出），只报"挂死"会让每次事故都要重新取证
+					Write-Host ('[单会话] 标准输入通道挂死（第 {0} 次尝试），已按看门狗终止并清理，重试第 {1} 次。挂点诊断：{2}' -f $轮次, ($轮次 + 1), $_.Exception.Message)
+					$script:单会话PS2标记 = $false
+				}
+			}
 		} finally {
 			等待-供给进程并回收日志 -供给 @($回调包.供给容器.ToArray())
 		}
@@ -1786,9 +1965,9 @@ function 安装-VSCode远程服务 {
 
 	# 认证与环境试探合并：免密主机一次连接拿到全部环境信息；需密码主机在密码注入后的第一次连接拿到
 	# 竞速暂存的预清理+预建随环境探测同一条连接完成（残留标记与完整包清掉、目录建好）：必须早于本地供给启动（防残包被误当完整包），又不值得独占一条连接。sh -c 包装让命令只在 POSIX 端生效（cmd/PowerShell 下是无害噪声），$HOME 即登录目录，单引号避开 PS 5.1 传参剥双引号的坑。
-	# **绝不 rm -rf 整目录**：暂存目录名只按提交号、不带连接唯一性，另一条并发连接可能正在往同一目录上传 <包名>.uploading，整删会让它的改名步骤报「在途文件不在」而白白失去本地供给（Windows 侧实测已发生）。只清非 .uploading 项，在途文件留给收尾清理按 6 小时龄回收。
+	# **绝不 rm -rf 整目录**：暂存目录名只按提交号、不带连接唯一性，另一条并发连接可能正在往同一目录上传 <包名>.uploading，或在写 <包名>.downloading-<PID>（远端自下载的私有在途名），整删会让它们的改名发布步骤报「在途文件不在」而白白失去供给（Windows 侧实测已发生）。只清非在途项，在途文件留给收尾清理按 6 小时龄回收。
 	$竞速数据目录名 = if ($本地信息.发布通道 -eq 'insider') { '.vscode-server-insiders' } else { '.vscode-server' }
-	$竞速预备命令 = "sh -c 'D=`$HOME/{0}/race-{1}; mkdir -p `$D; for f in `$D/*; do [ -e `$f ] || continue; case `$f in *.uploading) continue;; esac; rm -rf `$f; done; exit 0'" -f $竞速数据目录名, $本地信息.提交号
+	$竞速预备命令 = "sh -c 'D=`$HOME/{0}/race-{1}; mkdir -p `$D; for f in `$D/*; do [ -e `$f ] || continue; case `$f in *.uploading) continue;; *.downloading-*) continue;; esac; rm -rf `$f; done; exit 0'" -f $竞速数据目录名, $本地信息.提交号
 	# 非交互（preconnect）优先走单会话：探测/上传/执行一条连接全包（实测慢速主机每条独立连接 25s 会话开销）；Linux用 sh 引导，Windows 用 powershell -EncodedCommand 引导（脚本经 stdin）；建不起来或探测取不到结果时自然回退离散流程（交互式手动调用恒走离散，保留密码收集能力）
 	$接管会话 = $null
 	$平台提示 = ''

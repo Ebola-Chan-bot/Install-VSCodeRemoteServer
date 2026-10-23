@@ -2,7 +2,7 @@
 # 「等间隔失败风暴」约 60 秒，核对四条性质：
 #   ① 下载链接只在首次起始行公布一次；
 #   ② 无按轮回显的「（第 N 次尝试）」起始行——那正是一次中断产出两条消息的多余汇报点；
-#   ③ 一次中断恒为一条消息，且每条都带续传点与「下个汇报周期（N 秒后）重试」；
+#   ③ 一次中断恒为一条消息，且每条都带端标注（[远程自下载-产物名] 或 [本地供给-产物名]）、续传点与「下个汇报周期（N 秒后）重试」；
 #   ④ 重试真的对齐汇报周期：相邻两条中断行的实测间隔 == 上一条声明的等待秒数（容差 0.6~2.5 秒），
 #      且声明的等待随轮次递增（不是写死的固定值，也没有 30 秒封顶）。
 # 用法：powershell -NoProfile -ExecutionPolicy Bypass -File _probe\download-log-selftest.ps1
@@ -10,10 +10,10 @@ $ErrorActionPreference = 'Stop'
 $repo = 'c:\Users\vhtmf\source\repos\Install-VSCodeRemoteServer\接管远程服务器安装扩展'
 $源文件 = Join-Path $repo 'module\private\remote-install-common.ps1'
 $本地供给文件 = Join-Path $repo 'module\private\local-supply.ps1'
-$script:失败 = 0
-function 断言([bool]$条件, [string]$说明) {
-	if ($条件) { Write-Output ("OK  " + $说明) } else { Write-Output ("FAIL " + $说明); $script:失败++ }
-}
+. (Join-Path $PSScriptRoot 'lib\探针公共库.ps1')
+Initialize-断言 -通过前缀 'OK  ' -失败前缀 'FAIL '
+# 断言台账统一放公共库（此前每个自检各拄一份计数与打印，同一条纪律改一次要改九处）；本地只留薄转发，调用点一行不改
+function 断言 { param([Parameter(Position = 0)]$甲, [Parameter(Position = 1)]$乙, [Parameter(Position = 2)]$丙 = '') ; 写-断言 $甲 $乙 ([string]$丙) }
 
 foreach ($f in @($源文件, $本地供给文件)) {
 	$tokens = $null; $errors = $null
@@ -73,11 +73,13 @@ if ($urlLines.Count -ge 1) { Write-Output ('    起始行: ' + $urlLines[0]) }
 $旧回显 = @($lines | Where-Object { $_ -match '断点续传（第|开始下载（第' })
 断言 ($旧回显.Count -eq 0) ("按轮回显起始行已消失（实测 " + $旧回显.Count + ' 行，期望 0）')
 
-# ③ 一次中断一条消息 + 信息不缩水
+# ③ 一次中断一条消息 + 信息不缩水 + 逐条带端标注
+# 端标注是必需项（缺陷E）：两端的下载行交织在同一份 preconnect 日志里，不带标注就只能靠续传点字节数猜是哪一端。
+# 正则兼容「有/无端标注」两种形态，再由下面的专项断言卡「必须有」（否则改回去也能蒙混过关）
 $中断行 = @($lines | Where-Object { $_ -like '*下载中断*' })
 $解析 = @()
 foreach ($l in $中断行) {
-	$m = [regex]::Match($l, '^\[(?<t>[\d\-: ]+)\] 第 (?<n>\d+) 次下载中断（续传点 (?<b>\d+) 字节）: (?<r>.*?)，下个汇报周期（(?<w>\d+) 秒后）重试$')
+	$m = [regex]::Match($l, '^(?<标签>\[[^\]]+\] )?\[(?<t>[\d\-: ]+)\] 第 (?<n>\d+) 次下载中断（续传点 (?<b>\d+) 字节）: (?<r>.*?)，下个汇报周期（(?<w>\d+) 秒后）重试$')
 	if ($m.Success) {
 		$解析 += [pscustomobject]@{
 			时刻   = [datetime]::ParseExact($m.Groups['t'].Value, 'yyyy-MM-dd HH:mm:ss', $null)
@@ -85,11 +87,14 @@ foreach ($l in $中断行) {
 			续传点  = [int]$m.Groups['b'].Value
 			原因   = $m.Groups['r'].Value
 			等待秒数 = [int]$m.Groups['w'].Value
+			端标注  = $m.Groups['标签'].Value.Trim()
 		}
 	}
 }
 断言 ($中断行.Count -ge 8) ("中断行条数足够做时序核对（实测 " + $中断行.Count + '）')
 断言 ($解析.Count -eq $中断行.Count) ("每条中断行都带续传点与「下个汇报周期（N 秒后）重试」（不合规 " + ($中断行.Count - $解析.Count) + ' 条）')
+$缺标注行 = @($解析 | Where-Object { $_.端标注 -notmatch '^\[(远程自下载|本地供给)-' })
+断言 ($解析.Count -gt 0 -and $缺标注行.Count -eq 0) ("每条中断行都带端标注（缺标注 " + $缺标注行.Count + ' 条' + $(if ($缺标注行.Count) { '：' + (($缺标注行 | ForEach-Object { $_.端标注 }) -join ',') } elseif ($解析.Count) { '；实测前缀 ' + $解析[0].端标注 } else { '' }) + '）')
 $max轮 = if ($解析.Count) { ($解析 | Measure-Object -Property 轮次 -Maximum).Maximum } else { 0 }
 断言 ($中断行.Count -eq $max轮) ("一次中断一条消息：中断行 " + $中断行.Count + " == 已推进轮数 $max轮")
 
@@ -130,5 +135,5 @@ if ($解析.Count -ge 2) {
 
 Remove-Item -LiteralPath $target, $runnerPath -Force -ErrorAction SilentlyContinue
 Write-Output ''
-Write-Output ("断言失败数: $($script:失败)")
-exit $(if ($script:失败 -eq 0) { 0 } else { 1 })
+Write-Output ("断言失败数: " + (取-断言计数).失败)
+exit $(if ((取-断言计数).失败 -eq 0) { 0 } else { 1 })
