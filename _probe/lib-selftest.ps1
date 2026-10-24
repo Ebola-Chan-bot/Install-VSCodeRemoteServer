@@ -39,7 +39,7 @@ Write-Host '===== C. 载荷构造与生产算法同源（漂移守卫） ====='
 $通用正文 = Get-Content -LiteralPath (Join-Path $私有目录 'remote-install-common.ps1') -Raw -Encoding UTF8
 $构 = 构造-单会话载荷 -安装脚本文本 $通用正文
 写-断言 '库能算出引导码（正向对照）' ($构.引导码.Length -gt 10000) ('引导码 ' + $构.引导码.Length + ' 字符')
-写-断言 '分块拼接不变式成立（行数×行长 == 引导码总长）' $构.拼接不变式通过 ('载荷标准输入 ' + $构.载荷标准输入.Length + ' vs 引导码+块数 ' + ($构.引导码.Length + $构.块列表.Count))
+写-断言 '载荷整段写入且不含空白（分块已删；base64 无空白是远端剔空白后无损的前提）' (($构.载荷不含空白) -and ($构.载荷标准输入 -ceq $构.引导码)) ('载荷标准输入 ' + $构.载荷标准输入.Length + ' 字符 == 引导码 ' + $构.引导码.Length + ' 字符，含空白=' + (-not $构.载荷不含空白))
 写-断言 '载荷标准输入不含 CR（CRLF 会把 \r 混进远端命令）' (-not $构.载荷标准输入.Contains("`r")) ''
 # 漂移守卫①：库必须与 psm1 的算法逐字同源（照 psm1 现写的四步在本地**独立**复算一遍，比对结果）
 function 本地复算引导码 {
@@ -60,8 +60,8 @@ function 本地复算引导码 {
 # 若手误叠成双反斜杠，字面量就与 psm1 里的单反斜杠不匹配、断言恒红（初版就踩了这个）。
 $去注释特征 = ("-notmatch '^\s*#'")
 写-断言 'psm1 仍按「去注释去空行 → gzip → base64 → 塞模板 → UTF-16 base64」构造' (($psm1正文.Contains($去注释特征)) -and ($psm1正文.Contains('GZipStream')) -and ($psm1正文.Contains(".Replace('__载荷__', `$载荷)")) -and ($psm1正文.Contains('[System.Text.Encoding]::Unicode.GetBytes($引导脚本)'))) '四步任一变形都必须同步改库，否则库算出来的载荷与生产不同源'
-写-断言 'psm1 分块大小与库默认值一致（4000）' (($psm1正文 -match '\$每块字符 = (\d+)') -and ([int]$Matches[1] -eq 4000)) ('psm1 每块 ' + $(if ($psm1正文 -match '\$每块字符 = (\d+)') { $Matches[1] } else { '?' }))
-写-断言 'psm1 也带同样的拼接长度不变式' ($psm1正文.Contains('$载荷标准输入.Length -ne')) ''
+写-断言 'psm1 也把载荷整段写入 stdin（与库同源，分块已删）' ($psm1正文 -match '\$载荷标准输入 = \$引导码') ''
+写-断言 'psm1 不得回退到分块（无 $每块字符、无拼接长度自校验）' ((($psm1正文 -match '\$每块字符') -eq $false) -and (($psm1正文 -match '分块重组后长度不一致') -eq $false)) ''
 
 Write-Host ''
 Write-Host '===== D. 固定引导码：argv 占用必须远小于上限 ====='
@@ -154,7 +154,7 @@ foreach ($要 in @(
 	# 实测把 '\.cmd\|bat' 当模式时永远不中，因为代码里的字面量是 '\.(cmd|bat)$'）
 	写-断言 ('库与生产都有 ' + $要[1]) (($送源码2.Contains($要[0])) -and ($生产体.Contains($要[0]))) ('生产: ' + $生产体.Contains($要[0]) + ' / 库: ' + $送源码2.Contains($要[0]))
 }
-写-断言 '库按 ASCII 写字节（分块载荷是纯 ASCII base64）' ($送源码2.Contains('[System.Text.Encoding]::ASCII.GetBytes($标准输入文本)')) ''
+写-断言 '库按 ASCII 写字节（载荷是纯 ASCII base64）' ($送源码2.Contains('[System.Text.Encoding]::ASCII.GetBytes($标准输入文本)')) ''
 写-断言 '库逐行记录到达时刻（判定输出是否被缓冲到退出才 flush 只能靠它）' (($送源码2.Contains('到达.Add')) -and ($送源码2.Contains('耗时秒'))) ''
 写-断言 '库到点必杀本地 ssh 树（探针自身不留孤儿）' (($送源码2.Contains('if (-not $进程.HasExited)')) -and ($送源码2.Contains('taskkill'))) ''
 

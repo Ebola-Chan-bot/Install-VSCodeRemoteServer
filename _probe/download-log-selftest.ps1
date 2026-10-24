@@ -2,9 +2,10 @@
 # 「等间隔失败风暴」约 60 秒，核对四条性质：
 #   ① 下载链接只在首次起始行公布一次；
 #   ② 无按轮回显的「（第 N 次尝试）」起始行——那正是一次中断产出两条消息的多余汇报点；
-#   ③ 一次中断恒为一条消息，且每条都带端标注（[远程自下载-产物名] 或 [本地供给-产物名]）、续传点与「下个汇报周期（N 秒后）重试」；
+#   ③ 一次中断恒为一条消息，且每条都带端标注（[远程自下载-产物名] 或 [本地供给-产物名]）、续传点与「N 秒后续传重试」；
 #   ④ 重试真的对齐汇报周期：相邻两条中断行的实测间隔 == 上一条声明的等待秒数（容差 0.6~2.5 秒），
 #      且声明的等待随轮次递增（不是写死的固定值，也没有 30 秒封顶）。
+# 行内时钟由**本自检**打（在子进程里用同名函数遮盖 Write-Host，落盘时前置 [HH:mm:ss.fff]）：被测代码已按纪律不再内嵌远端时钟（两端时钟相差数分钟会与外层本地时钟打架），故时序核对改取自自检侧的行到达时刻。
 # 用法：powershell -NoProfile -ExecutionPolicy Bypass -File _probe\download-log-selftest.ps1
 $ErrorActionPreference = 'Stop'
 $repo = 'c:\Users\vhtmf\source\repos\Install-VSCodeRemoteServer\接管远程服务器安装扩展'
@@ -34,7 +35,10 @@ Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
 # 预置半成品：首轮就走断点续传分支（与真实截断风暴现场一致，也是最容易冒出回显行的分支）
 Set-Content -LiteralPath $target -Value 'partial' -Encoding Ascii
 
-$runner = $func.Extent.Text + "`n" + '&' + ' ' + $func.Name + ' ' + "'$url' '$target'"
+# 行内时钟改由自检侧打：在子进程里定义同名 Write-Host **函数**（PowerShell 命令解析里函数优先于 cmdlet），落盘时给每行前置到达时刻。
+# 被测代码本身已按纪律不再内嵌时钟，而时序核对（④）必须有逐行时刻，故由自检补上——补的是子进程本地时钟，与生产日志的外层本地时钟同一时间轴，不会重现"两端时钟相差数分钟"的混排问题。
+$时钟包装 = 'function Write-Host { param([Parameter(ValueFromRemainingArguments = $true)]$参数) [Console]::Out.WriteLine(("[{0}] " -f (Get-Date).ToString("HH:mm:ss.fff")) + ($参数 -join " ")) }'
+$runner = $func.Extent.Text + "`n" + $时钟包装 + "`n" + '&' + ' ' + $func.Name + ' ' + "'$url' '$target'"
 $runnerPath = Join-Path $env:TEMP 'dl-log-selftest-runner.ps1'
 # UTF-8 BOM 是硬要求：PS 5.1 读无 BOM 的 .ps1 按 ANSI 解，中文标识符会被读坏
 Set-Content -LiteralPath $runnerPath -Value $runner -Encoding UTF8
@@ -79,10 +83,10 @@ $旧回显 = @($lines | Where-Object { $_ -match '断点续传（第|开始下�
 $中断行 = @($lines | Where-Object { $_ -like '*下载中断*' })
 $解析 = @()
 foreach ($l in $中断行) {
-	$m = [regex]::Match($l, '^(?<标签>\[[^\]]+\] )?\[(?<t>[\d\-: ]+)\] 第 (?<n>\d+) 次下载中断（续传点 (?<b>\d+) 字节）: (?<r>.*?)，下个汇报周期（(?<w>\d+) 秒后）重试$')
+	$m = [regex]::Match($l, '^\[(?<t>[\d:\.]+)\] (?<标签>\[[^\]]+\] )?第 (?<n>\d+) 次下载中断（续传点 (?<b>\d+) 字节）：(?<r>.*?)。(?<w>\d+) 秒后续传重试$')
 	if ($m.Success) {
 		$解析 += [pscustomobject]@{
-			时刻   = [datetime]::ParseExact($m.Groups['t'].Value, 'yyyy-MM-dd HH:mm:ss', $null)
+			时刻   = [datetime]::ParseExact($m.Groups['t'].Value, 'HH:mm:ss.fff', $null)
 			轮次   = [int]$m.Groups['n'].Value
 			续传点  = [int]$m.Groups['b'].Value
 			原因   = $m.Groups['r'].Value
@@ -92,7 +96,7 @@ foreach ($l in $中断行) {
 	}
 }
 断言 ($中断行.Count -ge 8) ("中断行条数足够做时序核对（实测 " + $中断行.Count + '）')
-断言 ($解析.Count -eq $中断行.Count) ("每条中断行都带续传点与「下个汇报周期（N 秒后）重试」（不合规 " + ($中断行.Count - $解析.Count) + ' 条）')
+断言 ($解析.Count -eq $中断行.Count) ("每条中断行都带续传点与「N 秒后续传重试」（不合规 " + ($中断行.Count - $解析.Count) + ' 条）')
 $缺标注行 = @($解析 | Where-Object { $_.端标注 -notmatch '^\[(远程自下载|本地供给)-' })
 断言 ($解析.Count -gt 0 -and $缺标注行.Count -eq 0) ("每条中断行都带端标注（缺标注 " + $缺标注行.Count + ' 条' + $(if ($缺标注行.Count) { '：' + (($缺标注行 | ForEach-Object { $_.端标注 }) -join ',') } elseif ($解析.Count) { '；实测前缀 ' + $解析[0].端标注 } else { '' }) + '）')
 $max轮 = if ($解析.Count) { ($解析 | Measure-Object -Property 轮次 -Maximum).Maximum } else { 0 }

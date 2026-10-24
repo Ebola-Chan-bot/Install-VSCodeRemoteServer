@@ -55,8 +55,8 @@ $lines | ForEach-Object { Write-Output $_ }
 Write-Output '----- 断言 -----'
 
 # ① 源清单只公布一次，且序号与地址顺序一致
-$清单行 = @($lines | Where-Object { $_ -like '*本地下载源*' })
-断言 ($清单行.Count -eq 1) ("源清单只公布一次（实测 " + $清单行.Count + ' 行，期望 1）')
+$清单行 = @($lines | Where-Object { $_ -like '*本地下载备源*' })
+断言 ($清单行.Count -eq 1) ("备源清单只公布一次（实测 " + $清单行.Count + ' 行，期望 1；单源时已改为不打，本用例故意给两个源）')
 if ($清单行.Count -eq 1) { Write-Output ('    ' + $清单行[0]) }
 断言 ($清单行.Count -eq 0 -or ($清单行[0] -like '*1) https://127.0.0.1:9*' -and $清单行[0] -like '*2) https://127.0.0.1:8*')) '清单里两个源按序编号且与地址列表同序'
 
@@ -64,14 +64,14 @@ if ($清单行.Count -eq 1) { Write-Output ('    ' + $清单行[0]) }
 $中断行 = @($lines | Where-Object { $_ -like '*下载中断*' })
 $解析 = @()
 foreach ($l in $中断行) {
-	$m = [regex]::Match($l, '^下载中断（第 (?<n>\d+) 次，(?<r>.*?)，源 (?<s>\d+)/(?<tot>\d+)(?<省略>.*?)，续传点 (?<b>\d+) 字节），下个汇报周期（(?<w>\d+) 秒后）重试\.\.\.$')
+	$m = [regex]::Match($l, '^下载中断（第 (?<n>\d+) 次，源 (?<s>\d+)/(?<tot>\d+)(?<省略>.*?)，续传点 (?<b>\d+) 字节）：(?<r>.*?)。(?<w>\d+) 秒后续传重试$')
 	if ($m.Success) {
 		$解析 += [pscustomobject]@{ 轮次 = [int]$m.Groups['n'].Value; 原因 = $m.Groups['r'].Value; 源 = [int]$m.Groups['s'].Value; 总数 = [int]$m.Groups['tot'].Value; 等待 = [int]$m.Groups['w'].Value }
 	}
 }
 $max轮 = if ($解析.Count -gt 0) { ($解析 | Measure-Object -Property 轮次 -Maximum).Maximum } else { 0 }
 断言 ($中断行.Count -ge 4) ("中断行条数足够核对（实测 " + $中断行.Count + '）')
-断言 ($解析.Count -eq $中断行.Count) ("每条中断行都带源序号/续传点/「下个汇报周期（N 秒后）重试」（不合规 " + ($中断行.Count - $解析.Count) + ' 条）')
+断言 ($解析.Count -eq $中断行.Count) ("每条中断行都带源序号/续传点/「N 秒后续传重试」（不合规 " + ($中断行.Count - $解析.Count) + ' 条）')
 断言 ($中断行.Count -eq $max轮) ("一次中断一条消息：中断行 " + $中断行.Count + " == 已推进轮数 $max轮")
 
 # ③ 多源轮转与列表取下标严格同源

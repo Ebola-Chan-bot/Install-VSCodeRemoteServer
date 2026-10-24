@@ -155,17 +155,94 @@ foreach ($相对 in @('module\private\remote-install-common.ps1', 'module\privat
 	# 规则 6：周期放宽只在「毫无进展 / 总量未知」时发生
 	$放宽点 = @(Select-String -LiteralPath $全路径 -SimpleMatch -Pattern '$报告周期秒数++')
 	断言 ($放宽点.Count -eq $期望[$名].放宽) ("周期放宽点数量 = 期望值 $($期望[$名].放宽)（实测 " + $放宽点.Count + ' 处：' + (($放宽点 | ForEach-Object { $_.LineNumber }) -join ',') + '）')
-$翻倍点 = @(Select-String -LiteralPath $全路径 -SimpleMatch -Pattern '$报告周期秒数 * 2')
-断言 ($翻倍点.Count -eq 0) ("周期绝不翻倍（停滞重建也只 +1；曾一度误改成翻倍，已撑回，实测 $($翻倍点.Count) 处：行 " + (($翻倍点 | ForEach-Object { $_.LineNumber }) -join ',') + '）')
+	$翻倍点 = @(Select-String -LiteralPath $全路径 -SimpleMatch -Pattern '$报告周期秒数 * 2')
+	断言 ($翻倍点.Count -eq 0) ("周期绝不翻倍（停滞重建也只 +1；曾一度误改成翻倍，已撤销改回，实测 $($翻倍点.Count) 处：行 " + (($翻倍点 | ForEach-Object { $_.LineNumber }) -join ',') + '）')
 	foreach ($判据 in $进展判据[$名]) {
 		$次数 = @([regex]::Matches($代码文本表[$全路径], [regex]::Escape($判据[0]))).Count
 		断言 ($次数 -eq $判据[1]) ("$($判据[2])：'$($判据[0])' 代码行命中 $次数 处（期望 $($判据[1])）")
 	}
 
-	# 规则 7：中断行措辞必须点名「下个汇报周期」并给出续传点/等待秒数
-	$措辞不全 = @($中断发射 | Where-Object { $_.模板 -notmatch '下个汇报周期' })
-	断言 ($措辞不全.Count -eq 0) ("中断行都措辞为「下个汇报周期（N 秒后）重试」（不合规 " + $措辞不全.Count + ' 条）')
+	# 规则 7：中断行措辞必须给出续传点与实际等待秒数（「N 秒后续传重试」）；不得再用「下个汇报周期」这种内部术语——中断行自己就是本轮的汇报，再说“下次汇报”会让人以为 N 秒是已过时的旧值
+	$措辞不全 = @($中断发射 | Where-Object { $_.模板 -notmatch '秒后(续传)?重试' -or $_.模板 -match '下个汇报周期' })
+	断言 ($措辞不全.Count -eq 0) ("中断行都措辞为「…N 秒后续传重试」（不合规 " + $措辞不全.Count + ' 条）')
 }
+
+# ============ 时钟纪律：安装流全量不自己打时间 ============
+# 边界规则（2026-10-24 用户定调）：凡是会进入 Remote-SSH 日志流的输出，**两端一律不得自己打时间**——外层会自动给每个数据块标
+#   [HH:mm:ss.fff] [preconnect]，而远端钟表未必同步（同批测试机实测：A 机 ≈0.2 秒、B 机 ≈226 秒且仍在漂），
+#   两套时间轴混排会让人完全无法排序（已把「21 秒」误读成「4 分钟」）。取值一律依靠外层唯一时钟。
+# 例外：**不进该日志流、外层没有标签**的自有输出面必须保留时间戳，否则永久失去可诊断性：
+#   ① keepalive-wrapper.sh → $PERSIST_DIR/wrapper.log（远端本地文件）与 CLI 自己的 .cli.<提交号>.log（VS Code 重定向，不是 preconnect 流）；
+#   ② extension.js / terminalRescue.js → 扩展自己的 OutputChannel（VS Code 不给它加时间标签）。
+# 下面的“例外正向对照”断言就是守这条：如果例外清单变成“干脆把文件全排除”的借口，这两条会先红。
+Write-Output ''
+Write-Output '===== 时钟纪律（安装流全量） ====='
+
+function 查-ps1内嵌时钟 {
+	param([string]$文本)
+	# 两种“把当前时间打进输出”的写法合成一个交替正则：Get-Date -Format、ToString('…HH:mm…')。返回违规**处数**（整数），不返回数组，免得调用侧误把元素个数当个数
+	return @([regex]::Matches($文本, "Get-Date\s*-Format|ToString\('[^']*(HH|hh):mm")).Count
+}
+
+function 查-sh输出带时间 {
+	param([string[]]$行集)
+	# 违规 = 输出语句（echo/log/printf）+ $(date 同时出现**人类可读的时间格式**（+%F / +%T / %H:%M / %Y）。
+	# 三个条件缺一不可：`date +%s`（纪元秒）是计算用途——版本目录按 mtime 排序的键（redirect 进临时文件，从不上屏）、
+	# 补丁包的变更指纹（比对用）；同理 `|| echo 0` 这种兼容回退也不属于日志输出。只看“行里有 echo 且有 $(date”会把它们全误报（实测误报 4 处）。
+	$命中 = @()
+	for ($i = 0; $i -lt $行集.Count; $i++) {
+		$是输出行 = ($行集[$i] -match '(^|[\s;&|(|{])(echo|log|printf)\b')
+		$有时间输出 = ($行集[$i] -match '\$\(date') -and ($行集[$i] -match '\+%[FTY]|%H:%M|%T')
+		if ($是输出行 -and $有时间输出) { $命中 += ($i + 1) }
+	}
+	return $命中
+}
+
+# 正向对照：先把违规样本喂给检查器，确认真能抓到（否则下面所有的 0 都是空集假通过）
+断言 ((查-ps1内嵌时钟 "Write-Host ('[{0}] 下载完成。' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))") -eq 1) '时钟检查器正向对照：ps1 违规样本被抓出（实测处数 = 1）'
+断言 ((查-ps1内嵌时钟 "Write-Host ('完成')") -eq 0) '时钟检查器不误报：无时钟的输出行为 0 处'
+断言 (@(查-sh输出带时间 @('log "[$(date "+%F %T")] 开始"')).Count -eq 1) '时钟检查器正向对照：sh 输出行带时间戳被抓出'
+断言 (@(查-sh输出带时间 @('EVENT_NOW=$(date +%s)')).Count -eq 0) '时钟检查器不误报：纯计算用途的 date +%s 不算违规'
+断言 (@(查-sh输出带时间 @('echo "$(date -r "$DIR" +%s 2>/dev/null || echo 0) $DIR" >> "$LIST_TMP"')).Count -eq 0) '时钟检查器不误报：排序键（纪元秒 + || echo 0 回退 + 重定向到临时文件）不算违规'
+
+$ps1清单 = @(
+	'module\Install-VSCodeRemoteServer.psm1',
+	'module\private\remote-install-common.ps1',
+	'module\private\local-supply.ps1',
+	'module\private\remote-install-win7.ps1',
+	'module\private\windows-stdin-bootstrap.ps1',
+	'module\private\Windows单会话引导.ps1',
+	'接管安装实现.ps1'
+)
+foreach ($相对 in $ps1清单) {
+	$全路径 = Join-Path $repo $相对
+	if (-not (Test-Path -LiteralPath $全路径)) { 断言 $false ("时钟纪律：待查文件不存在 $相对"); continue }
+	$命中 = 查-ps1内嵌时钟 ((Get-Content -LiteralPath $全路径 -Raw -Encoding UTF8))
+	断言 ($命中 -eq 0) ("$([IO.Path]::GetFileName($相对)) 不自己打时间（交外层唯一时钟）：违规 $命中 处")
+}
+$sh清单 = @(
+	'module\private\remote-install-linux.sh',
+	'module\private\接管编排脚本模板.sh',
+	'module\private\会话帧循环.sh',
+	'module\private\native-patch.sh',
+	'module\private\sysroot-deploy.sh',
+	'module\private\keepalive-deploy.sh'
+)
+foreach ($相对 in $sh清单) {
+	$全路径 = Join-Path $repo $相对
+	if (-not (Test-Path -LiteralPath $全路径)) { 断言 $false ("时钟纪律：待查文件不存在 $相对"); continue }
+	$行集 = @(Get-Content -LiteralPath $全路径 -Encoding UTF8)
+	$命中 = @(查-sh输出带时间 $行集)
+	断言 ($命中.Count -eq 0) ("$([IO.Path]::GetFileName($相对)) 不自己打时间（交外层唯一时钟）：违规 $($命中.Count) 处" + $(if ($命中.Count) { '，行 ' + (($命中) -join ',') } else { '' }))
+}
+# Linux 侧 log() 本体不得再加时间戳（回归守卫：曾为 `echo "[$(date …)] $*"`）
+$sh正文 = Get-Content -LiteralPath (Join-Path $repo 'module\private\remote-install-linux.sh') -Raw -Encoding UTF8
+断言 ($sh正文 -match 'log\(\)\s*\{\s*\r?\n\s*echo "\$\*"') 'Linux 侧 log() 就是裸 echo "$*"（不再拼时间戳）'
+# 例外正向对照：两个自有输出面确实保留了时间戳
+$包装正文 = Get-Content -LiteralPath (Join-Path $repo 'module\private\keepalive-wrapper.sh') -Raw -Encoding UTF8
+断言 ($包装正文 -match '\$\(date') '例外① 保活包装脚本仍带时间戳（输出去远端本地 wrapper.log / CLI log，外层根本没标签；删了就永久无法定位事件先后）'
+$扩展正文 = Get-Content -LiteralPath (Join-Path $repo 'extension.js') -Raw -Encoding UTF8
+断言 ($扩展正文 -match 'toLocaleTimeString') '例外② 扩展终端救援 OutputChannel 仍带时间标签（VS Code 不给 OutputChannel 加标签）'
 
 # ============ Linux sh ============
 Write-Output ''

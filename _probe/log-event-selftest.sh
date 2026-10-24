@@ -85,10 +85,10 @@ check $((GAP_BAD == 0)) "消息间隔 == 声明的等待秒数（偏差 $GAP_BAD
 check $((EVENT_INTERVAL > 30)) "周期无固定上限：$ROUNDS 轮毫无进展后 EVENT_INTERVAL=$EVENT_INTERVAL > 30"
 check $((EVENT_SLEEP_NEXT > 30)) "重试等待跟随周期：末轮睡眠 ${EVENT_SLEEP_NEXT}s > 30（既不再封顶 30 秒，也没被任何上限压住）"
 if grep -q '另有 .* 次同类中断已省略' "$OUT"; then check 0 '不应再出现省略计数'; else check 1 '不再出现省略计数（每轮一条消息，无需省略）'; fi
-if grep -q '，下个汇报周期（' "$OUT"; then
-	check 1 '事件行自带「下个汇报周期（N 秒后）重试」措辞'
+if grep -q '秒后续传重试' "$OUT"; then
+	check 1 '事件行自带「N 秒后续传重试」措辞'
 else
-	check 0 '事件行应自带「下个汇报周期」措辞（实测缺失）'
+	check 0 '事件行应自带「N 秒后续传重试」措辞（实测缺失）'
 fi
 echo "  末条事件行: $(tail -1 "$OUT")"
 

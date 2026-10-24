@@ -104,11 +104,8 @@ foreach ($KB in @(2, 40, 120, 400)) {
 	while ($sb.Length -lt $目标长度) { [void]$sb.Append($字母) }
 	$净 = $sb.ToString(0, $目标长度)
 	$本地哈希 = (([Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::ASCII.GetBytes($净))) | ForEach-Object { $_.ToString('x2') }) -join ''
-	# 按 4000 字符分块成多行喂 stdin（每块单独成行，远端 -replace '\s','' 会还原成连续串）
-	$块 = 4000
-	$行 = @()
-	for ($i = 0; $i -lt $净.Length; $i += $块) { $行 += $净.Substring($i, [Math]::Min($块, $净.Length - $i)) }
-	$文本 = (($行 -join "`n") + "`n")
+	# 整段喂 stdin（与生产一致：载荷已不再分块）。注意：早先四档均通过的实测结果是**分块版**跑出来的，改整段后需连真机复跑一次才能沿用结论（整段才能真测出单次写入的容量上限，分块反而会把长行问题掩盖）
+	$文本 = $净
 	$r = 送-载荷经stdin -主机 $连接目标 -命令文本 $小命令行 -标准输入文本 $文本 -端口 $端口 -超时秒 150
 	$远长度 = ($r.行 | Where-Object { $_ -match 'STDINLEN=' } | Select-Object -First 1)
 	$远哈希行 = ($r.行 | Where-Object { $_ -match 'STDINSHA=' } | Select-Object -First 1)

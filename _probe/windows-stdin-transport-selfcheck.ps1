@@ -52,7 +52,7 @@ Write-Host '===== A. 静态守卫：载荷必须走 stdin，argv 只装固定引
 $回执位 = $stdin模板.IndexOf('载荷已到达')
 $执行位 = $stdin模板.IndexOf('[scriptblock]::Create')
 断言 '回执早于执行安装脚本' (($回执位 -ge 0) -and ($执行位 -gt $回执位)) '回执必须早于任何耗时步骤才有意义'
-断言 'stdin 引导去空白后再解码' ($stdin模板.Contains([char]39 + '\s' + [char]39) -and $stdin模板 -match [regex]::Escape('-replace')) '分块换行/回车必须被清洗掉才能 base64 解码（-match 会把正则 \s 当空白类，故用 Contains 比字面量）'
+断言 'stdin 引导去空白后再解码' ($stdin模板.Contains([char]39 + '\s' + [char]39) -and $stdin模板 -match [regex]::Escape('-replace')) '传输中被塞入的换行/回车（如 PS 管道把行尾换成 CRLF）必须被清洗掉才能 base64 解码（-match 会把正则 \s 当空白类，故用 Contains 卡字面量）'
 断言 'stdin 引导对空输入显式失败' ($stdin模板 -match 'exit 1' -and $stdin模板 -match '标准输入为空') '载荷没送达要给出直白报错，不能静默成功'
 断言 'stdin 引导不含载荷占位符' (-not ($stdin模板 -match '__载荷__')) '它必须与载荷大小无关（否则 argv 又会膨胀）'
 
@@ -62,7 +62,7 @@ $执行位 = $stdin模板.IndexOf('[scriptblock]::Create')
 断言 '单会话 argv 只装固定引导' ($psm1正文.Contains("-EncodedCommand {0}' -f `$固定引导码")) ''
 断言 '旧写法已根除：整段引导码不得再进 argv' (-not $psm1正文.Contains("-EncodedCommand {0}' -f `$引导码)")) '这一行正是撞 32767 上限的元凶'
 断言 '有固定引导长度守卫' ($psm1正文.Contains('$固定引导码.Length -gt 8000')) 'argv 里唯一随模板增长的部分必须有上限守卫'
-断言 '有分块重组一致性断言' ($psm1正文.Contains('$载荷标准输入.Length -ne')) '分块出错要在本端就拦下，别等远端解码失败'
+断言 '载荷整段写入（分块与其长度自校验已删，不得回归）' (($psm1正文.Contains('$载荷标准输入 = $引导码')) -and (($psm1正文 -match '\$每块字符') -eq $false)) '分块对传输毫无意义：远端读全量后剔掉所有空白再解码（旧写法还拿一道「自己切自己拼自己校」的长度断言当稳健措辞，已删）'
 断言 '注释已记录通道变更与实测依据' (($psm1正文 -match '32,767') -and ($psm1正文 -match 'DefaultShell')) '把"为什么不再禁 stdin"的实测结论留在代码里'
 断言 '模板头部旧结论已更新' (-not ($引导模板 -match '不走 stdin')) 'Windows单会话引导.ps1 的头部注释不得继续留已被推翻的结论'
 # --- 硬化通道：实测管道式 stdin 会在 120KB 那一档偶发挂死约 66 分钟，故改为自起进程 + 显式 EOF + 看门狗 ---
@@ -135,15 +135,13 @@ Write-Host ('  旧 argv = ' + $旧argv + ' 字符（上限 32767）；新 argv =
 断言 '旧写法在当前模板下确实会炸（缺陷可复现，守卫有意义）' ($旧argv -gt 32767) ('旧 argv ' + $旧argv + ' > 32767 → ssh.exe 会拒绝启动')
 
 Write-Host ''
-Write-Host '===== D. 分块可逆（与 psm1 同一分块规则） ====='
-$每块字符 = 4000
+Write-Host '===== D. 整段下发无损（剔空白是远端唯一的清洗步骤） ====='
 $原文 = 'A' * 123456 + ([char]0x4E2D) + 'z' * 50000   # 混入非 ASCII，确认我们传的是 base64（纯 ASCII）而非脚本正文
-$块列表 = New-Object System.Collections.ArrayList
-for ($起 = 0; $起 -lt $原文.Length; $起 += $每块字符) { [void]$块列表.Add($原文.Substring($起, [Math]::Min($每块字符, $原文.Length - $起))) }
-$重组 = ($块列表 -join "`n") + "`n"
-$还原 = ($重组 -replace '\s', '')
-断言 '分块去空白后可无损还原' ($还原 -eq $原文) ('块数 ' + $块列表.Count + '，还原 ' + $还原.Length + '/' + $原文.Length + ' 字符')
-断言 '重组文本不含回车（CR 会混进远端命令）' (-not ($重组 -match "`r")) 'PS 管道喂原生程序会把行尾换成 CRLF，故载荷必须是不含 CR 也能还原的 base64 分块'
+# 载荷不再分块：整段就是引导码本身。真正要验的是「传输中被塞入空白也能无损还原」——PS 管道喂原生程序时会把行尾换成 CRLF，远端靠 `-replace '\s',''` 剔净；这也正是 base64 载荷必须不含空白字符的理由。
+$注入空白 = ($原文 -replace '(....)', "`$1`r`n")
+$还原 = ($注入空白 -replace '\s', '')
+断言 '整段载荷不含空白（剔空白能无损的前提）' (-not ($原文 -match '\s')) ''
+断言 '传输中被塞入 CRLF 后剔空白仍可无损还原' ($还原 -ceq $原文) ('注入后 ' + $注入空白.Length + ' 字符 → 剔净 ' + $还原.Length + '/' + $原文.Length + ' 字符')
 
 if (-not $跑真机) {
 	Write-Host ''
@@ -178,9 +176,8 @@ if (-not $跑真机) {
 		$本地长度 = $生产引导码.Length
 		$本地哈希 = (([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::ASCII.GetBytes($生产引导码))) | ForEach-Object { $_.ToString('x2') }) -join ''
 		$内层2 = '$raw=[Console]::In.ReadToEnd(); $c=($raw -replace ''\s'',''''); $h=[System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::ASCII.GetBytes($c)); Write-Output (''__VSI_SELFCHECK__ LEN='' + $c.Length); Write-Output (''__VSI_SELFCHECK__ SHA='' + (($h | ForEach-Object { $_.ToString(''x2'') }) -join '''')); exit 0'
-		$块列表2 = New-Object System.Collections.ArrayList
-		for ($起 = 0; $起 -lt $生产引导码.Length; $起 += $每块字符) { [void]$块列表2.Add($生产引导码.Substring($起, [Math]::Min($每块字符, $生产引导码.Length - $起))) }
-		$标准输入2 = (($块列表2 -join "`n") + "`n")
+		# 整段写入（与生产同）：不再分块，远端剔空白后解码
+		$标准输入2 = $生产引导码
 		$内层2码 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($内层2))
 		$输出2 = $null; $码2 = 0
 		try {
@@ -259,8 +256,8 @@ if (-not $跑全链路) {
 		Write-Host ('  退出码=' + $F码 + '  耗时=' + [Math]::Round($计时F.Elapsed.TotalSeconds, 1) + ' 秒  输出行数=' + $F输出.Count + '  全量日志: ' + $F日)
 		$F行 | ForEach-Object { $t = [string]$_; if ($t.Length -gt 200) { $t = $t.Substring(0, 200) + '…' }; Write-Host ('    ' + $t) }
 		断言 'F preconnect 退出码 0（旧缺陷下恒为 1，Remote-SSH 会判 PreconnectScriptFailure）' ($F码 -eq 0) ('退出码 ' + $F码)
-		断言 'F 走了新的 stdin 通道（日志里有分块下发那行）' ($F文本 -match '\[单会话\] 引导码 \d+ 字符，分 \d+ 块走标准输入下发') ''
-		断言 'F 分块措辞说清了「非传输必需」（不许再把稳健选择说成硬限制）' ($F文本 -match '分块为稳健选择而非传输必需') ''
+		断言 'F 走了新的 stdin 通道（日志里有整段下发那行）' ($F文本 -match '\[单会话\] 引导码 \d+ 字符整段走标准输入下发') ''
+		断言 'F 只报事实，不得再现分块与其「稳健选择」措辞' ((($F文本 -match '分 \d+ 块') -eq $false) -and (($F文本 -match '稳健选择') -eq $false)) '分块已删：远端读全量后剔所有空白再解码，行长与拼接不变式都无意义'
 		断言 'F argv 仍远小于上限' ($F文本 -match 'argv 上只剩 \d+ 字符的固定引导代码') ''
 		断言 'F 不再出现 argv 超长错误' (-not ($F文本 -match 'filename or extension is too long')) '旧缺陷的原话不得再出现'
 		# 功能性断言（能抓住“行处理器拿到空串”这类缺陷）：必须看到**远端产生的**行

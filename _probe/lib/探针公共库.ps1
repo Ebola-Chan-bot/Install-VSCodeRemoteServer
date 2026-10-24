@@ -187,13 +187,12 @@ function 扫-裸拼接实参 {
 function 构造-单会话载荷 {
 	param(
 		[Parameter(Mandatory = $true)][string]$安装脚本文本,
-		[string]$引导模板路径 = '',
-		[int]$每块字符 = 4000
+		[string]$引导模板路径 = ''
 	)
 	# 还原生产的四步：去整行注释与空行 → gzip → base64 = 载荷；载荷塞进引导模板 = 引导脚本；
 	# 引导脚本按 UTF-16 再 base64 = 引导码（这一步让体积膨胀约 2.67 倍，正是当年撞 argv 上限的原因）；
-	# 引导码按 $每块字符 分块、以 LF 连接 = 经 stdin 下发的载荷标准输入。
-	# 分块的唯一实际价值：行长限界 + 「载荷标准输入长度 == 引导码长度 + 块数」这个可当场校验的拼接不变式。
+	# 引导码**整段**直接作为经 stdin 下发的载荷标准输入。不分块：远端 windows-stdin-bootstrap.ps1 是 ReadToEndAsync 读全量后 `-replace '\s',''` 剔掉全部空白再解码，行结构对传输没有任何意义（旧写法的 4000 字符分块 + 「长度 == 引导码长度 + 块数」自校验已删：那是自己切自己拼自己校，拦不下传输层问题）。
+	# 真正要守的前提改由 `载荷不含空白` 字段表达：base64 不含空白 → 传输中被塞入任何空白（如 PS 管道把行尾换成 CRLF）都会在远端被剔净，因而无损。
 	if ($引导模板路径 -eq '') { $引导模板路径 = Join-Path (取-私有目录) 'Windows单会话引导.ps1' }
 	$引导模板 = Get-Content -LiteralPath $引导模板路径 -Raw -Encoding UTF8
 
@@ -208,22 +207,16 @@ function 构造-单会话载荷 {
 	$引导脚本 = $引导模板.Replace('__载荷__', $载荷)
 	$引导码 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($引导脚本))
 
-	$块列表 = New-Object System.Collections.Generic.List[string]
-	for ($起 = 0; $起 -lt $引导码.Length; $起 += $每块字符) {
-		$块列表.Add($引导码.Substring($起, [Math]::Min($每块字符, $引导码.Length - $起)))
-	}
-	$载荷标准输入 = (($块列表 -join "`n") + "`n")
+	$载荷标准输入 = $引导码
 
 	return [pscustomobject]@{
-		精简正文字符   = $精简正文.Length
-		gzip字节       = $压缩流.ToArray().Length
-		载荷           = $载荷
-		引导脚本       = $引导脚本
-		引导码         = $引导码
-		块列表         = $块列表
-		每块字符       = $每块字符
-		载荷标准输入   = $载荷标准输入
-		拼接不变式通过 = ($载荷标准输入.Length -eq ($引导码.Length + $块列表.Count))
+		精简正文字符 = $精简正文.Length
+		gzip字节     = $压缩流.ToArray().Length
+		载荷         = $载荷
+		引导脚本     = $引导脚本
+		引导码       = $引导码
+		载荷标准输入 = $载荷标准输入
+		载荷不含空白 = (-not ($载荷标准输入 -match '\s'))
 	}
 }
 
