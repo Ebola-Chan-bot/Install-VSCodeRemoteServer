@@ -4,7 +4,7 @@
 #   ① 一次中断恒为一条消息：每轮 log_event 恰好输出 1 行，且不再有「省略计数」这种会静默吃掉信息的门控；
 #   ② 重试就在下个汇报周期：瞬时失败时睡眠 == 当时的周期（不忙轮询）；一次耗时远超周期的尝试之后睡眠回落到 1 秒
 #      （长尝试本身算作已消耗一个周期，不在其上再叠固定等待）；
-#   ③ 周期不写死上限：连续毫无进展的重试把 EVENT_INTERVAL 一路推过 30（旧的「翻倍 + 封顶 30 秒」已删除）。
+#   ③ 周期无固定上限：连续毫无进展的重试把 EVENT_INTERVAL 一路推过 30（旧的「翻倍 + 封顶 30 秒」已删除；任何形式的固定上限都重新引入了该病根）。进度行改时钟驱动后，间隔再大也不会出现「有字节到却整段无输出」。
 # 用法：'C:\Program Files\Git\bin\bash.exe' _probe/log-event-selftest.sh
 SRC=$(find . -name 'remote-install-linux.sh' -not -path './.git/*' 2>/dev/null | head -1)
 if [ -z "$SRC" ]; then
@@ -62,7 +62,7 @@ for i in $(seq 1 $ROUNDS); do
 		ELAPSED=$((FAKE_NOW - EVENT_REPORT_AT))
 	fi
 	ROUND_START=$FAKE_NOW
-	# 调用方规则：本轮毫无进展 → 先放宽周期，再报事件（与 Windows 侧 catch 里的 周期++ 同序）
+	# 调用方规则：本轮毫无进展 → 先放宽周期，再报事件（与 Windows 侧 catch 里的 周期++ 同序，均不设上限）
 	EVENT_INTERVAL=$((EVENT_INTERVAL + 1))
 	log_event "第 $i 次下载失败（2 个源均未取到，残留已清理）" >>"$OUT"
 	GOT=$(( $(out_lines) - BEFORE ))
@@ -83,7 +83,7 @@ check $((PRINTED == ROUNDS)) "每轮恰好一条消息：放行 $PRINTED == 轮�
 check $((ALIGN_BAD == 0)) "睡眠秒数 == 周期 − 本轮已耗（对齐偏差 $ALIGN_BAD 轮）"
 check $((GAP_BAD == 0)) "消息间隔 == 声明的等待秒数（偏差 $GAP_BAD 轮）"
 check $((EVENT_INTERVAL > 30)) "周期无固定上限：$ROUNDS 轮毫无进展后 EVENT_INTERVAL=$EVENT_INTERVAL > 30"
-check $((EVENT_SLEEP_NEXT > 30)) "重试等待跟随周期：末轮睡眠 ${EVENT_SLEEP_NEXT}s > 30（不再封顶 30 秒）"
+check $((EVENT_SLEEP_NEXT > 30)) "重试等待跟随周期：末轮睡眠 ${EVENT_SLEEP_NEXT}s > 30（既不再封顶 30 秒，也没被任何上限压住）"
 if grep -q '另有 .* 次同类中断已省略' "$OUT"; then check 0 '不应再出现省略计数'; else check 1 '不再出现省略计数（每轮一条消息，无需省略）'; fi
 if grep -q '，下个汇报周期（' "$OUT"; then
 	check 1 '事件行自带「下个汇报周期（N 秒后）重试」措辞'
@@ -127,6 +127,9 @@ SLEEP_OK=$(grep -c 'sleep "$EVENT_SLEEP_NEXT"' "$SRC")
 check $((SLEEP_OK == 3)) "三个下载循环都按 EVENT_SLEEP_NEXT 睡（实测 $SLEEP_OK 处，期望 3）"
 WIDEN_OK=$(grep -c 'EVENT_INTERVAL=$((EVENT_INTERVAL + 1))' "$SRC")
 check $((WIDEN_OK == 3)) "三处「本轮毫无进展才放宽周期」（实测 $WIDEN_OK 处，期望 3）"
+# 封顶守卫要打到真实源码（上面的 BAD 循环只扫抽出的 log/log_event 定义，抓不到调用点）：任何形式的固定上限都是重新引入「固定周期必刷一行」那个病根
+CAP_OK=$(grep -c -- '-lt 10' "$SRC")
+check $((CAP_OK == 0)) "周期放宽无封顶：生产源码里没有给 EVENT_INTERVAL / REPORT_PERIOD 加 -lt 10 类上限（实测命中 $CAP_OK 处）"
 OLD_SLEEP=$(grep -c 'sleep "$WAIT_SECONDS"\|sleep "$CLI_ATTEMPT"\|sleep "$WAIT_SEC"' "$SRC")
 check $((OLD_SLEEP == 0)) "已无写死秒数的旧 sleep（实测 $OLD_SLEEP 处，期望 0）"
 EVENT_CALLS=$(grep -c 'log_event "' "$SRC")

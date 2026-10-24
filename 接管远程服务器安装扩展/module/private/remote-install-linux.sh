@@ -84,7 +84,7 @@ log() {
 	echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
 
-# 事件行输出（下载失败/重试等中断提示）：与 Windows 侧同一个「单一时钟」规则——汇报周期既是打印节奏也是重试节奏。一次中断恒为一条消息（每轮只调一次，各源的细节由调用方并进同一条正文，不另起行），打印即重启汇报时钟；同时把「到下个汇报点还差多少秒」写进 EVENT_SLEEP_NEXT 供调用方 sleep（下限 1 秒），于是重试就在下个汇报周期：一次耗时几十秒的尝试本身已消耗一个周期（差值为负则立即重试），不在其上再叠一段固定等待；周期上限不写死（无固定 30 秒），只由调用方在「本轮毫无进展」时 EVENT_INTERVAL++ 放宽一档（与 Windows 侧的 周期++ 同规则）。
+# 事件行输出（下载失败/重试等中断提示）：与 Windows 侧同一个「单一时钟」规则——汇报周期既是打印节奏也是重试节奏。一次中断恒为一条消息（每轮只调一次，各源的细节由调用方并进同一条正文，不另起行），打印即重启汇报时钟；同时把「到下个汇报点还差多少秒」写进 EVENT_SLEEP_NEXT 供调用方 sleep（下限 1 秒），于是重试就在下个汇报周期：一次耗时几十秒的尝试本身已消耗一个周期（差值为负则立即重试），不在其上再叠一段固定等待；只由调用方在「本轮毫无进展」时 EVENT_INTERVAL 放宽一档，放宽不设上限（中途越糟间隔越长；仍禁止旧的「翻倍 + 封顶 30 秒」与任何形式的固定上限）。心跳行（race_artifact）与时钟无关地按周期报已传字节数，故源端爬行期报 0 字节也不会死寂。
 # POSIX sh 无局部变量，门控状态一律用 EVENT_ 前缀的独特全局名，避免与调用方变量互相覆盖（教训：循环变量曾覆盖同名配置变量）。
 EVENT_REPORT_AT=0
 EVENT_INTERVAL=1
@@ -215,7 +215,7 @@ run_remote_download() {
 			fi
 			rm -f "$IN_FLIGHT"
 		done
-		# 本轮毫无进展（一个字节都没落地）才放宽周期；拿到过字节时周期不动，失败不额外拖慢恢复
+		# 本轮毫无进展（一个字节都没落地）才放宽周期（无上限）；拿到过字节时周期不动，失败不额外拖慢恢复
 		if [ "$ROUND_GOT" -eq 0 ]; then
 			EVENT_INTERVAL=$((EVENT_INTERVAL + 1))
 		fi
@@ -258,7 +258,7 @@ run_remote_cli_download() {
 			ROUND_NOTE='包完整性校验未通过已弃用，'
 		fi
 		rm -f "$IN_FLIGHT"
-		# 本轮毫无进展才放宽周期（与 run_remote_download 同规则）
+		# 本轮毫无进展才放宽周期（与 run_remote_download 同规则，无上限）
 		if [ "$ROUND_GOT" -eq 0 ]; then
 			EVENT_INTERVAL=$((EVENT_INTERVAL + 1))
 		fi
@@ -295,7 +295,7 @@ race_artifact() {
 	fi
 
 	ELAPSED=0
-	# 远端进度心跳无产物总大小可比对（只报已传字节数），报告周期只增不减（每次报告后加 1 秒）
+	# 远端进度心跳无产物总大小可比对（只报已传字节数），报告周期只增不减（每次报告后加 1 秒，不设上限）；心跳与时钟无关地报当下字节数，一个字节都没落地时就报 0，故爬行期不死寂
 	REPORT_PERIOD=1
 	NEXT_REPORT=$REPORT_PERIOD
 	while true; do
@@ -403,7 +403,7 @@ install_cli() {
 			unpack_cli_package "$CLI_TAR" && return 0
 		fi
 		rm -f "$CLI_TAR"
-		# 前台补装同样是单一时钟：本轮毫无进展才放宽周期，重试等到下个汇报周期
+		# 前台补装同样是单一时钟：本轮毫无进展才放宽周期（无上限），重试等到下个汇报周期
 		if [ "$ROUND_GOT" -eq 0 ]; then
 			EVENT_INTERVAL=$((EVENT_INTERVAL + 1))
 		fi
