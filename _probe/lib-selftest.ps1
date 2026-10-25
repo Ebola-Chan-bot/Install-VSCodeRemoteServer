@@ -71,7 +71,8 @@ $argv = 'powershell -NoProfile -EncodedCommand ' + $固
 写-断言 '由此构成的 argv 远离 CreateProcess 上限 32767' ($argv.Length -lt 8192) ('argv ' + $argv.Length + ' 字符')
 写-断言 '引导码与载荷体积无关（解耦有效）' ($固.Length * 4 -lt $构.引导码.Length) ('固定 ' + $固.Length + ' vs 载荷引导码 ' + $构.引导码.Length)
 $引导文 = Get-Content -LiteralPath (Join-Path $私有目录 'windows-stdin-bootstrap.ps1') -Raw -Encoding UTF8
-写-断言 '引导是有界异步读（等不到 EOF 自退，不留孤儿）' (($引导文 -match '\[Console\]::In\.ReadToEndAsync\(\)') -and ($引导文 -match '\.Wait\(')) ''
+写-断言 '引导使用原始 stdin 的 StreamReader 有界异步读（等不到 EOF 自退）' (($引导文.Contains('[Console]::OpenStandardInput()')) -and ($引导文.Contains('New-Object System.IO.StreamReader')) -and ($引导文.Contains('.ReadToEndAsync()')) -and ($引导文.Contains('.Wait('))) ''
+写-断言 '引导不再使用会在大载荷时同步卡住的 Console.In.ReadToEndAsync' (-not $引导文.Contains('[Console]::In.ReadToEndAsync()')) 'B 服务器实测旧读取器在返回 Task 前就卡住，Wait(90000) 无法执行；新读取器已用 154KB 载荷验证'
 
 Write-Host ''
 Write-Host '===== E. 远端下发原语：argv 通道必须无噪声、不挂起 ====='

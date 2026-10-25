@@ -45,7 +45,8 @@ function 断言 { param([Parameter(Position = 0)]$甲, [Parameter(Position = 1)]
 
 Write-Host '===== A. 静态守卫：载荷必须走 stdin，argv 只装固定引导 ====='
 断言 'stdin 引导模板存在' ($stdin模板.Length -gt 200) ((Join-Path $私有目录 'windows-stdin-bootstrap.ps1') + ' 共 ' + [string]$stdin模板.Length + ' 字符')
-断言 'stdin 引导用有界异步读（绝不无期限挂起）' (($stdin模板 -match '\[Console\]::In\.ReadToEndAsync\(\)') -and ($stdin模板 -match '\.Wait\(')) '无期限 ReadToEnd 会让远端在本地被 taskkill 后永远卡在读取里成孤儿、堆满 sshd 会话拖垮后续连接（2026-10-23 上科大B服务器死亡螺旋）'
+断言 'stdin 引导用原始 stdin 的 StreamReader 有界异步读（绝不无期限挂起）' (($stdin模板.Contains('[Console]::OpenStandardInput()')) -and ($stdin模板.Contains('New-Object System.IO.StreamReader')) -and ($stdin模板.Contains('.ReadToEndAsync()')) -and ($stdin模板.Contains('.Wait('))) 'B 服务器实测旧 Console.In 在大载荷时连 Task 都不返回，导致 90 秒等待失效；新读取器必须保持在场'
+断言 'stdin 引导不再使用 Console.In.ReadToEndAsync（大载荷会卡在调用本身）' (-not $stdin模板.Contains('[Console]::In.ReadToEndAsync()')) '这条是 2026-10-24 线上卡死的根因守卫，不允许为了“简化”改回旧读取器'
 断言 'stdin 引导再无裸的无期限 ReadToEnd' (-not ($stdin模板 -match '\[Console\]::In\.ReadToEnd\(\)')) '旧写法正是孤儿堆积的根源'
 断言 'stdin 引导等不到 EOF 会自行退出' (($stdin模板 -match '远端主动退出') -and ($stdin模板 -match 'exit 1')) '有界超时后必须自杀，绝不留孤儿会话放大饱和'
 断言 'stdin 引导执行安装脚本前先回到达回执' ($stdin模板 -match '载荷已到达') '回执让本地看门狗尽早拿到首字节，把「慢启动」与「真挂死」区分开（安装脚本首个输出要等僵尸清理跑完才打）'
@@ -71,6 +72,8 @@ $执行位 = $stdin模板.IndexOf('[scriptblock]::Create')
 断言 '载荷写完后显式关闭标准输入（EOF 确定）' ($psm1正文.Contains('$进程.StandardInput.Close()')) '依赖管道收尾就是当年挂死的根源'
 断言 'stderr 已异步抽干' ($psm1正文.Contains('StandardError.ReadToEndAsync()')) '只重定向不读，缓冲区写满会把远端堵住→同样表现为挂死'
 断言 '有硬超时看门狗并杀进程树' (($psm1正文.Contains('taskkill /PID $进程.Id /T /F')) -and ($psm1正文.Contains('[stdin超时]'))) '挂死必须变成可诊断的快速失败，不能无声干等'
+断言 '零回执诊断不再武断声称远端从未开口' (-not $psm1正文.Contains('远端引导从未开口')) 'B 实测远端已启动却卡在读取调用，诊断必须保留读取与回传两种可能'
+断言 '零回执诊断提示检查远端进程与读取状态' (($psm1正文.Contains('远端可能尚未启动')) -and ($psm1正文.Contains('标准输入读取或输出回传'))) '只能报告本地未收到回执，不能把未收到回执等同于未启动'
 断言 '看门狗超时会顺延（有输出就算进展）' ($psm1正文.Contains('$截止 = (Get-Date).AddSeconds($超时秒)')) '长安装流程不能被固定超时误杀'
 断言 '只有有效行才顺延看门狗（空行/CLIXML 不算进展）' ($psm1正文.Contains("if (`$行.Trim() -ne '' -and `$行 -notmatch '^(#< CLIXML|<Objs|</Objs>)')")) '缺陷复现：旧写法下空行流会一路顺延，实测 448 秒 > 240 秒看门狗也没触发'
 # 行处理器的参数绑定：本循环是 `& $处理行 $行` 直接调用，写成 [string]$_ 则只在管道调用（ForEach-Object）下有值，
@@ -175,22 +178,26 @@ if (-not $跑真机) {
 		$生产引导码 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($引导模板.Replace('__载荷__', ('A' * $体.载荷))))
 		$本地长度 = $生产引导码.Length
 		$本地哈希 = (([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::ASCII.GetBytes($生产引导码))) | ForEach-Object { $_.ToString('x2') }) -join ''
-		$内层2 = '$raw=[Console]::In.ReadToEnd(); $c=($raw -replace ''\s'',''''); $h=[System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::ASCII.GetBytes($c)); Write-Output (''__VSI_SELFCHECK__ LEN='' + $c.Length); Write-Output (''__VSI_SELFCHECK__ SHA='' + (($h | ForEach-Object { $_.ToString(''x2'') }) -join '''')); exit 0'
-		# 整段写入（与生产同）：不再分块，远端剔空白后解码
+		$内层2 = '$sr=New-Object System.IO.StreamReader -ArgumentList ([Console]::OpenStandardInput());$task=$sr.ReadToEndAsync();if(-not $task.Wait(90000)){Write-Output ''__VSI_SELFCHECK__ READ_TIMEOUT'';exit 2};$raw=$task.Result; $c=($raw -replace ''\s'',''''); $h=[System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::ASCII.GetBytes($c)); Write-Output (''__VSI_SELFCHECK__ LEN='' + $c.Length); Write-Output (''__VSI_SELFCHECK__ SHA='' + (($h | ForEach-Object { $_.ToString(''x2'') }) -join '''')); exit 0'
+		# 整段写入，并使用与生产相同的 ProcessStartInfo + 显式 Close + 看门狗；不能再用管道喂大载荷，否则测到的是另一条通道
 		$标准输入2 = $生产引导码
 		$内层2码 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($内层2))
-		$输出2 = $null; $码2 = 0
+		$结果2 = $null
 		try {
 			$ErrorActionPreference = 'Continue'
-			$输出2 = @($标准输入2 | & $ssh.Source -p $端口 $主机 ('powershell -NoProfile -EncodedCommand {0}' -f $内层2码) 2>&1)
-			$码2 = $LASTEXITCODE
+			$结果2 = 送-载荷经stdin -主机 $主机 -命令文本 ('powershell -NoProfile -EncodedCommand {0}' -f $内层2码) -标准输入文本 $标准输入2 -端口 $端口 -超时秒 120
 		} finally { $ErrorActionPreference = $原EAP }
+		$输出2 = @($结果2.行)
+		$码2 = $结果2.退出码
 		$文本2 = ($输出2 -join ' | ')
 		$远长度 = [regex]::Match($文本2, '__VSI_SELFCHECK__ LEN=(\d+)').Groups[1].Value
 		$远哈希 = [regex]::Match($文本2, '__VSI_SELFCHECK__ SHA=([0-9a-f]{64})').Groups[1].Value
 		Write-Host ('  生产体积载荷 ' + $本地长度 + ' 字符 → 远端解得 ' + $远长度 + ' 字符；退出码 ' + $码2)
 		断言 'E2 生产体积载荷长度一致' ($远长度 -eq [string]$本地长度) ('本地 ' + $本地长度 + ' vs 远端 ' + $远长度)
-		断言 'E2 生产体积载荷 SHA256 一致' ($远哈希 -eq $本地哈希) ('远端 ' + $远哈希.Substring(0, 16) + '… vs 本地 ' + $本地哈希.Substring(0, 16) + '…')
+		$远哈希摘要 = $(if ($远哈希.Length -ge 16) { $远哈希.Substring(0, 16) } else { $远哈希 })
+		$本地哈希摘要 = $(if ($本地哈希.Length -ge 16) { $本地哈希.Substring(0, 16) } else { $本地哈希 })
+		断言 'E2 生产体积载荷 SHA256 一致' ($远哈希 -eq $本地哈希) ('远端 ' + $远哈希摘要 + '… vs 本地 ' + $本地哈希摘要 + '…')
+		断言 'E2 通道未触发看门狗' (-not $结果2.超时) ('看门狗超时=' + $结果2.超时)
 		断言 'E2 远端退出码为 0' ($码2 -eq 0) ('退出码 ' + $码2)
 	}
 }

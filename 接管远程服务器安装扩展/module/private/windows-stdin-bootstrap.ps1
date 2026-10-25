@@ -8,7 +8,9 @@
 #
 # ===== 有界读取（2026-10-23 上科大B服务器死亡螺旋事故后加固）=====
 # 绝不能无期限地阻塞等 EOF（旧写法直接同步读全量输入）：本地看门狗 taskkill 杀掉的是**本地** ssh.exe，Windows 不向远端传播信号，于是远端这个引导进程会永远卡在 ReadToEnd 里成为孤儿。每失败一次尝试就多留一个，实测 B 上堆到 8 个卡死引导 + 52 条 sshd 会话，会话饱和后新连接的首字节延迟被拖过看门狗（240 秒）→ 看门狗又杀（安装脚本首个输出在僵尸清理之后才打，冷启动/饱和时首字节更晚）→又留一个孤儿 → 彻底瘫痪。改为有界异步读：90 秒拿不到 EOF 就自己退出，绝不留孤儿、绝不放大饱和。
-$读任务 = [Console]::In.ReadToEndAsync()
+# 读取器必须是 OpenStandardInput 上的 StreamReader：B 服务器实测旧的 Console.In 异步全量读取在大载荷时连 Task 都不返回，下面的 Wait(90000) 根本没机会执行；改用原始标准输入后，同一 154KB 载荷可完整读完并回执（2026-10-24 实测）。
+$读器 = New-Object System.IO.StreamReader -ArgumentList ([Console]::OpenStandardInput())
+$读任务 = $读器.ReadToEndAsync()
 if (-not $读任务.Wait(90000)) {
 	Write-Host '[stdin引导] 等待标准输入 90 秒仍无 EOF，远端主动退出（不再无期限挂起，避免留下孤儿会话拖垮后续连接）。'
 	exit 1

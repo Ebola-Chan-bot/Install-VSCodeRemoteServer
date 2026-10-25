@@ -58,8 +58,8 @@ function 激活(context) {
 	// 手动命令：探测/诊断/救援本窗口终端通道（探测正常时只报平安；死亡时走完整救援阶梯且逃逸不受冷却限制）
 	context.subscriptions.push(vscode.commands.registerCommand(命令_诊断终端通道, () => 启动终端救援(context, null, true)));
 
-	// 启动时静默对齐一次：修补丢失的脚本与钩子，不打扰用户（需要决策的事项只留通知）
-	串行对齐(context, false);
+	// 启动时静默对齐一次：修补丢失的脚本与钩子，不打扰用户（需要决策的事项只留通知）。onResolveRemoteAuthority 激活时必须把 Promise 返回给 VS Code，确保 Remote-SSH 在调 resolver 前等到文件与钩子真正写完，而不是只排队就开始连接。
+	const 启动对齐 = 串行对齐(context, false);
 
 	// 安装命令未执行（窗口终端通道死亡）自动检测：启动后立查一次，此后每 5 分钟复查；命中即自动走救援阶梯（探测→restartPtyHost→CDP 深诊断→新窗口逃逸）
 	检测安装命令未执行(context);
@@ -70,6 +70,7 @@ function 激活(context) {
 	if (process.env.VSI_RESCUE_SELFTEST === '1') {
 		setTimeout(() => 启动终端救援(context, null, true), 4000);
 	}
+	return 启动对齐;
 }
 
 function 停用() { }
@@ -310,6 +311,51 @@ async function 执行还原(context, 交互) {
 	}
 }
 
+// Remote-SSH 会用 untildify 展开 ~；设置同步到另一台机器后，绝对路径里的旧用户名不能跟着过去，否则必然指向不存在的目录。内部比较统一先展开，写入设置则尽量使用 ~ 形式。
+function 展开钩子路径(值) {
+	if (typeof 值 !== 'string') {
+		return '';
+	}
+	const 文本 = 值.trim();
+	if (文本 === '~') {
+		return os.homedir();
+	}
+	if (/^~[\\/]/.test(文本)) {
+		return path.join(os.homedir(), 文本.slice(2));
+	}
+	return 文本;
+}
+
+// 取得可写入 remote.SSH.preconnect 的路径：在用户目录下时用 ~/...，Remote-SSH 会在每台机器本地展开；不在用户目录下时保留绝对路径（自定义 user-data-dir 不能靠猜）。
+function 取用户目录相对路径(文件路径) {
+	const 相对 = path.relative(os.homedir(), 文件路径);
+	if (!相对 || 相对 === '..' || 相对.startsWith('..' + path.sep) || path.isAbsolute(相对)) {
+		return '';
+	}
+	return 相对;
+}
+
+function 生成钩子路径(保存目录, 主机) {
+	const 文件路径 = path.join(保存目录, 薄脚本文件名(主机));
+	const 相对 = 取用户目录相对路径(文件路径);
+	return 相对 ? '~/' + 相对.replace(/\\/g, '/') : 文件路径;
+}
+
+// 识别本扩展在**任意用户目录**下生成的薄脚本：Settings Sync 可能把旧机器的绝对路径带过来，不能因为它不属于当前 保存目录 就误判为用户的外部原脚本。只认 globalStorage/<本扩展目录>/<接管安装-...>.ps1 这一完整后缀，普通外部脚本不会被吞并。
+function 是我方生成路径(值, 保存目录) {
+	if (typeof 值 !== 'string' || 值.trim() === '') {
+		return false;
+	}
+	const 目录段 = String(保存目录).split(/[\\/]/).filter(Boolean);
+	if (目录段.length === 0) {
+		return false;
+	}
+	const 存储名 = 目录段[目录段.length - 1].toLowerCase();
+	const 规范值 = 值.replace(/\\/g, '/').toLowerCase();
+	const 后缀 = '/globalstorage/' + 存储名 + '/' + 生成脚本前缀.toLowerCase();
+	return 规范值.includes(后缀) && 规范值.endsWith('.ps1');
+}
+
 // 钩子值是否指向本扩展生成的脚本（薄脚本都在 globalStorage 目录下、统一前缀；路径大小写不敏感）。这同时是防自引用守卫：绝不能把我方脚本当“外部原脚本”去调用（会自我递归），也不能拿它当用户资产去“还原”。
 function 是我方脚本(值, 保存目录) {
 	if (typeof 值 !== 'string' || 值.trim() === '') {
@@ -317,10 +363,13 @@ function 是我方脚本(值, 保存目录) {
 	}
 	const 自家前缀 = path.join(path.resolve(保存目录), 生成脚本前缀).toLowerCase();
 	try {
-		return path.resolve(值).toLowerCase().startsWith(自家前缀);
+		if (path.resolve(展开钩子路径(值)).toLowerCase().startsWith(自家前缀)) {
+			return true;
+		}
 	} catch {
-		return false;
+		// 继续按历史路径后缀识别，不能让一个坏路径遮蔽迁移判断
 	}
+	return 是我方生成路径(值, 保存目录);
 }
 
 // 该主机接管前配置的外部（非本扩展生成）preconnect 脚本：先看现行钩子，再查旧版本遗留的记录；没有则返回 ''
@@ -367,10 +416,14 @@ async function 询问原脚本处理(项, 当前钩子, 保存目录) {
 	return null; // 「跳过」、ESC、关窗都视为不接管
 }
 
-// 给用户粘进原脚本的一行调用代码：接管失败时同样以非零退出码中止连接，与直接覆盖的语义一致
+// 给用户粘进原脚本的一行调用代码：用 $HOME 拼接用户目录，避免这行代码随设置同步到另一台机器后继续引用旧用户名；接管失败时同样以非零退出码中止连接，与直接覆盖的语义一致
 function 生成自调行(保存目录, 主机) {
-	const 薄路径 = path.join(保存目录, 薄脚本文件名(主机)).replace(/'/g, "''");
-	return "& '" + 薄路径 + "'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }";
+	const 文件路径 = path.join(保存目录, 薄脚本文件名(主机));
+	const 相对 = 取用户目录相对路径(文件路径);
+	const 调用路径 = 相对
+		? "(Join-Path $HOME '" + 相对.replace(/'/g, "''") + "')"
+		: "'" + 文件路径.replace(/'/g, "''") + "'";
+	return '& ' + 调用路径 + '; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }';
 }
 
 // 无记录即视为覆盖方式：没问过意味着该主机没有外部原脚本，直接接管即可
@@ -434,7 +487,8 @@ function 生成接管脚本(保存目录, 主机) {
 	const 文件路径 = path.join(保存目录, 薄脚本文件名(主机));
 	fs.mkdirSync(保存目录, { recursive: true });
 	写入如不同(文件路径, 加BOM(生成薄脚本内容(主机)));
-	return 文件路径;
+	// 文件写入用绝对路径，写进 remote.SSH.preconnect 的则是可随用户目录迁移的 ~ 路径
+	return 生成钩子路径(保存目录, 主机);
 }
 
 // 薄脚本：只把主机名交给同目录的公共实现。这里刻意不含模块路径、发布通道等易变信息——
@@ -520,13 +574,11 @@ function 清理生成脚本(保存目录, 自调主机) {
 }
 
 function 判断是否本扩展的钩子(值, 保存目录) {
-	const 本扩展前缀 = path.join(保存目录, 生成脚本前缀).toLowerCase();
-	const 是本扩展脚本 = 取值 => typeof 取值 === 'string' && 取值.toLowerCase().startsWith(本扩展前缀);
-	if (是本扩展脚本(值)) {
+	if (是我方脚本(值, 保存目录)) {
 		return true;
 	}
 	if (值 && typeof 值 === 'object') {
-		return Object.keys(值).some(键 => 是本扩展脚本(值[键]));
+		return Object.keys(值).some(键 => 是我方脚本(值[键], 保存目录));
 	}
 	return false;
 }
@@ -849,5 +901,5 @@ async function 清理全部主机连接状态(context) {
 module.exports = {
 	activate: 激活,
 	deactivate: 停用,
-	_测试: { 列近期RemoteSshLog, 找近期安装超时日志, 找logs根目录, 找本会话目录名 },
+	_测试: { 列近期RemoteSshLog, 找近期安装超时日志, 找logs根目录, 找本会话目录名, 展开钩子路径, 生成钩子路径, 是我方脚本, 是我方生成路径, 取外部原脚本, 重建钩子, 生成自调行 },
 };

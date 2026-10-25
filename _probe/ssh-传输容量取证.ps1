@@ -93,7 +93,7 @@ Write-Host '===== ④ stdin 通道可靠性（生产同款序列：显式 Close 
 #   所以此处量的是**现行生产通道**的容量，不再重复测已废弃的管道写法。
 # 远端固定小引导：读全量 stdin → 去空白 → 报长度与 SHA256（全 ASCII 源码，不含中文，避免管道编码问题）
 # 它的读取也是有界的（等不到 EOF 就报 STDINTIMEOUT 并退出）：探针自身绝不得在远端留孤儿
-$远端脚本 = '$b=[Console]::In.ReadToEndAsync();if(-not $b.Wait(90000)){Write-Output "STDINTIMEOUT";exit 1};$s=$b.Result;$c=($s -replace "\s","");$h=[Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::ASCII.GetBytes($c));Write-Output ("STDINLEN=" + $c.Length);Write-Output ("STDINSHA=" + (($h | ForEach-Object { $_.ToString("x2") }) -join ""));exit 0'
+$远端脚本 = '$sr=New-Object System.IO.StreamReader -ArgumentList ([Console]::OpenStandardInput());$b=$sr.ReadToEndAsync();if(-not $b.Wait(90000)){Write-Output "STDINTIMEOUT";exit 1};$s=$b.Result;$c=($s -replace "\s","");$h=[Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::ASCII.GetBytes($c));Write-Output ("STDINLEN=" + $c.Length);Write-Output ("STDINSHA=" + (($h | ForEach-Object { $_.ToString("x2") }) -join ""));exit 0'
 $小引导码 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($远端脚本))
 $小命令行 = 'powershell -NoProfile -EncodedCommand ' + $小引导码
 Write-Host ('  固定小引导 EncodedCommand 长度 = {0} 字符（永远进 argv，与载荷大小无关）' -f $小引导码.Length)

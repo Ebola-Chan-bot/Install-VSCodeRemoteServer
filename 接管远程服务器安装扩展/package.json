@@ -29,6 +29,7 @@
 		"ui"
 	],
 	"activationEvents": [
+		"onResolveRemoteAuthority:ssh-remote",
 		"onStartupFinished"
 	],
 	"main": "./extension.js",
