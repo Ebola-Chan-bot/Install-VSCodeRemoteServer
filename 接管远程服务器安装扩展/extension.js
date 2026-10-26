@@ -30,6 +30,8 @@ const 命令_选择主机 = 设置节 + '.选择接管主机';
 const 命令_诊断终端通道 = 设置节 + '.诊断终端通道';
 const 状态键_接管方式 = '接管方式'; // 主机 → { 方式: '覆盖'|'自调', 原脚本 }；只对有过外部原脚本的主机记录
 const 状态键_接管前设置 = '接管前的remote.SSH.preconnect'; // 旧版遗留记录，只读取用于追溯原脚本，用完即清
+const 同步忽略设置键 = 'settingsSync.ignoredSettings';
+const 状态键_同步忽略原始清单 = '同步忽略原始清单';
 
 // 对齐串行化：勾选写回设置会再次触发对齐，链式排队避免两个对齐任务并发读写同一批文件
 let 对齐队列 = Promise.resolve();
@@ -58,8 +60,8 @@ function 激活(context) {
 	// 手动命令：探测/诊断/救援本窗口终端通道（探测正常时只报平安；死亡时走完整救援阶梯且逃逸不受冷却限制）
 	context.subscriptions.push(vscode.commands.registerCommand(命令_诊断终端通道, () => 启动终端救援(context, null, true)));
 
-	// 启动时静默对齐一次：修补丢失的脚本与钩子，不打扰用户（需要决策的事项只留通知）。onResolveRemoteAuthority 激活时必须把 Promise 返回给 VS Code，确保 Remote-SSH 在调 resolver 前等到文件与钩子真正写完，而不是只排队就开始连接。
-	const 启动对齐 = 串行对齐(context, false);
+	// 启动时静默对齐一次：修补丢失的脚本与钩子，不打扰用户（需要决策的事项只留通知）。onResolveRemoteAuthority 激活时绝不能 await 这个 Promise：配置写入可能等待远程窗口初始化，而远程窗口又在等本扩展激活结束，直接 await 会形成等待环；异步对齐与配置迁移照常进行。
+	void 串行对齐(context, false);
 
 	// 安装命令未执行（窗口终端通道死亡）自动检测：启动后立查一次，此后每 5 分钟复查；命中即自动走救援阶梯（探测→restartPtyHost→CDP 深诊断→新窗口逃逸）
 	检测安装命令未执行(context);
@@ -70,7 +72,6 @@ function 激活(context) {
 	if (process.env.VSI_RESCUE_SELFTEST === '1') {
 		setTimeout(() => 启动终端救援(context, null, true), 4000);
 	}
-	return 启动对齐;
 }
 
 function 停用() { }
@@ -136,6 +137,42 @@ async function 写钩子全局值(值) {
 	await vscode.workspace.getConfiguration().update(钩子设置键, 值, vscode.ConfigurationTarget.Global);
 }
 
+// 薄脚本和授权记录都属于本机资产：保护 preconnect 不被 Settings Sync 带到另一台机器，避免旧用户目录覆盖本机路径。
+async function 确保钩子不参与同步(context) {
+	const 配置 = vscode.workspace.getConfiguration();
+	const 当前值 = 配置.get(同步忽略设置键);
+	if (当前值 !== undefined && !Array.isArray(当前值)) {
+		throw new Error('settingsSync.ignoredSettings 不是数组，无法安全保护本机 preconnect 路径。');
+	}
+	const 当前清单 = 当前值 || [];
+	if (当前清单.includes(钩子设置键)) {
+		return;
+	}
+	if (context.globalState.get(状态键_同步忽略原始清单) === undefined) {
+		await context.globalState.update(状态键_同步忽略原始清单, 当前清单);
+	}
+	await 配置.update(同步忽略设置键, [...当前清单, 钩子设置键], vscode.ConfigurationTarget.Global);
+}
+
+// 还原时只撤销“原清单 + 本扩展这一项”的未改动状态；用户后来加入的其它忽略项会使保护保留。
+async function 恢复钩子同步保护(context) {
+	const 原始清单 = context.globalState.get(状态键_同步忽略原始清单);
+	if (原始清单 === undefined) {
+		return;
+	}
+	const 配置 = vscode.workspace.getConfiguration();
+	const 当前值 = 配置.get(同步忽略设置键);
+	const 当前清单 = Array.isArray(当前值) ? 当前值 : [];
+	const 原始集合 = new Set(原始清单);
+	const 仅是本扩展添加 = !原始集合.has(钩子设置键)
+		&& 当前清单.length === 原始清单.length + 1
+		&& 当前清单.every(项 => 项 === 钩子设置键 || 原始集合.has(项));
+	if (仅是本扩展添加) {
+		await 配置.update(同步忽略设置键, 原始清单.length > 0 ? 原始清单 : undefined, vscode.ConfigurationTarget.Global);
+	}
+	await context.globalState.update(状态键_同步忽略原始清单, undefined);
+}
+
 // 执行接管：为勾选的主机生成薄脚本并让 remote.SSH.preconnect 指向它们，替换 Remote-SSH 自带安装；两份清单都为空时整体还原
 async function 执行接管(context, 交互) {
 	// 取代的对象是 Remote-SSH 的安装步骤，Remote-SSH 不在场时其设置项未注册，VS Code 会拒绝写入 remote.SSH.preconnect
@@ -178,6 +215,8 @@ async function 执行接管(context, 交互) {
 		await 执行还原(context, 交互);
 		return;
 	}
+
+	await 确保钩子不参与同步(context);
 
 	// 有外部原脚本且尚未决策的主机：交互时逐个弹窗询问；启动静默对齐时不打扰，只留通知并跳过这些主机
 	const 待决策 = [];
@@ -247,7 +286,6 @@ async function 执行接管(context, 交互) {
 		// 平台提示取自 Remote-SSH 自己的 remotePlatform 设置：Windows 主机上单会话（sh/base64）必失败，提前告知模块跳过那次徒劳尝试
 		平台提示映射: (vscode.workspace.getConfiguration('remote.SSH').get('remotePlatform') || {})
 	});
-
 	const 新钩子 = 重建钩子(当前钩子, 方式记录, 我方条目, 保存目录);
 	if (JSON.stringify(取钩子全局值()) !== JSON.stringify(新钩子)) {
 		await 写钩子全局值(新钩子);
@@ -298,6 +336,7 @@ async function 执行还原(context, 交互) {
 	}
 	// 自调主机的薄脚本、公共实现与配置都要保留：用户脚本里粘贴的那行可能还在，删文件会让它的连接直接报错
 	const 清理数量 = 清理生成脚本(保存目录, 自调主机);
+	await 恢复钩子同步保护(context);
 	await context.globalState.update(状态键_接管方式, undefined);
 	await context.globalState.update(状态键_接管前设置, undefined);
 
@@ -311,7 +350,7 @@ async function 执行还原(context, 交互) {
 	}
 }
 
-// Remote-SSH 会用 untildify 展开 ~；设置同步到另一台机器后，绝对路径里的旧用户名不能跟着过去，否则必然指向不存在的目录。内部比较统一先展开，写入设置则尽量使用 ~ 形式。
+// 兼容旧版曾经写入的 ~/... 路径：内部比较先展开；新生成的钩子使用本机绝对路径，并由 settingsSync.ignoredSettings 防止跨机器覆盖。
 function 展开钩子路径(值) {
 	if (typeof 值 !== 'string') {
 		return '';
@@ -326,7 +365,7 @@ function 展开钩子路径(值) {
 	return 文本;
 }
 
-// 取得可写入 remote.SSH.preconnect 的路径：在用户目录下时用 ~/...，Remote-SSH 会在每台机器本地展开；不在用户目录下时保留绝对路径（自定义 user-data-dir 不能靠猜）。
+// 自调行仍需适应用户自行粘贴到其它机器的场景：能放在用户目录下的薄脚本用 $HOME 拼接；自定义 user-data-dir 不在用户目录下时保留绝对路径。
 function 取用户目录相对路径(文件路径) {
 	const 相对 = path.relative(os.homedir(), 文件路径);
 	if (!相对 || 相对 === '..' || 相对.startsWith('..' + path.sep) || path.isAbsolute(相对)) {
@@ -336,9 +375,7 @@ function 取用户目录相对路径(文件路径) {
 }
 
 function 生成钩子路径(保存目录, 主机) {
-	const 文件路径 = path.join(保存目录, 薄脚本文件名(主机));
-	const 相对 = 取用户目录相对路径(文件路径);
-	return 相对 ? '~/' + 相对.replace(/\\/g, '/') : 文件路径;
+	return path.join(保存目录, 薄脚本文件名(主机));
 }
 
 // 识别本扩展在**任意用户目录**下生成的薄脚本：Settings Sync 可能把旧机器的绝对路径带过来，不能因为它不属于当前 保存目录 就误判为用户的外部原脚本。只认 globalStorage/<本扩展目录>/<接管安装-...>.ps1 这一完整后缀，普通外部脚本不会被吞并。
@@ -487,7 +524,7 @@ function 生成接管脚本(保存目录, 主机) {
 	const 文件路径 = path.join(保存目录, 薄脚本文件名(主机));
 	fs.mkdirSync(保存目录, { recursive: true });
 	写入如不同(文件路径, 加BOM(生成薄脚本内容(主机)));
-	// 文件写入用绝对路径，写进 remote.SSH.preconnect 的则是可随用户目录迁移的 ~ 路径
+	// 文件写入与钩子都使用本机绝对路径；同步保护由 确保钩子不参与同步 负责。
 	return 生成钩子路径(保存目录, 主机);
 }
 
