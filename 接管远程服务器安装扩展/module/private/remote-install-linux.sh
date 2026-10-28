@@ -516,6 +516,17 @@ if [ -n "$STAGING" ]; then
 	# ===== 竞速模式：每个缺失产物各竞速一次（本地下载+上传 vs 远程自下载，先完成者获胜），CLI 与服务端独立判胜、互不拖累 =====
 	# 单边断网时由另一边补上：远端连不上下载服务器就等本地供给，本地下载失败就等远程自下载
 	mkdir -p "$STAGING"
+	# 与 Windows 同一供给协议：本地模块先启动第一个待装产物，收到该产物的决出行再启动下一个，避免本地并行而远端串行。
+	RACE_PENDING=''
+	if [ "$NEED_CLI" = '1' ]; then
+		RACE_PENDING='CLI'
+	fi
+	if [ "$NEED_SERVER" = '1' ]; then
+		RACE_PENDING="${RACE_PENDING}${RACE_PENDING:+ }服务端"
+	fi
+	if [ -n "$RACE_PENDING" ]; then
+		echo "__接管预备完成__$RACE_PENDING"
+	fi
 	RACE_CLI_DL_FN=''
 	RACE_SERVER_DL_FN=''
 	if [ -n "$DOWNLOADER" ]; then
