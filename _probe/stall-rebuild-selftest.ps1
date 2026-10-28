@@ -8,7 +8,7 @@
 # 用法：powershell -NoProfile -ExecutionPolicy Bypass -File _probe\stall-rebuild-selftest.ps1
 $ErrorActionPreference = 'Stop'
 $repo = 'c:\Users\vhtmf\source\repos\Install-VSCodeRemoteServer\接管远程服务器安装扩展'
-$源文件 = Join-Path $repo 'module\private\remote-install-common.ps1'
+$源文件 = Join-Path $repo 'scripts\private\remote-install-common.ps1'
 . (Join-Path $PSScriptRoot 'lib\探针公共库.ps1')
 Initialize-断言 -通过前缀 'OK  ' -失败前缀 'FAIL '
 # 断言台账统一放公共库；本地只留薄转发

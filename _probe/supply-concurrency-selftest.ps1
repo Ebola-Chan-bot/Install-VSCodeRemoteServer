@@ -6,7 +6,7 @@
 # 依据：Windows 端实测 OpenSSH sshd 把非零退出码压平成 1；PS 5.1 传含双引号的命令行会被剥引号 → 子进程参数一律 Clixml 落盘
 $ErrorActionPreference = 'Stop'
 $repo = 'c:\Users\vhtmf\source\repos\Install-VSCodeRemoteServer\接管远程服务器安装扩展'
-$供给脚本 = (Resolve-Path (Join-Path $repo 'module\private\local-supply.ps1')).Path
+$供给脚本 = (Resolve-Path (Join-Path $repo 'scripts\private\local-supply.ps1')).Path
 . (Join-Path $PSScriptRoot 'lib\探针公共库.ps1')
 Initialize-断言 -通过前缀 'OK  ' -失败前缀 'FAIL '
 # 断言台账统一放公共库；本地只留薄转发，调用点一行不改

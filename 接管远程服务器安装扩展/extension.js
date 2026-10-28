@@ -1,13 +1,13 @@
-// 接管远程服务器安装 扩展入口：把 Install-VSCodeRemoteServer 模块接入 Remote-SSH 的远程服务器安装步骤。
+// 接管远程服务器安装 扩展入口：用扩展内部安装脚本接管 Remote-SSH 的远程服务器安装步骤。
 // 设置项：「安装VSCode远程服务.接管的主机」「安装VSCode远程服务.启用保活的主机」两份用户勾选的主机清单（命令「选择接管与保活的主机…」弹多选列表、实时扫描 ~/.ssh/config，勾选后写回设置；直接在设置页编辑也行，保存即生效）。没有总开关：勾选哪些主机就接管/保活哪些主机，两份清单都为空即整体还原。
-// 勾选的主机：Remote-SSH 每次连接前先由本模块安装远程服务器（竞速供给 + 旧 glibc 自动部署官方 sysroot + CLI 引导预装），自带的安装步骤检测到服务端已就位便直接复用；未勾选的主机完全不动，保持自带安装——逐主机选择性隔离。
+// 勾选的主机：Remote-SSH 每次连接前先由本扩展安装远程服务器（竞速供给 + 旧 glibc 自动部署官方 sysroot + CLI 引导预装），自带的安装步骤检测到服务端已就位便直接复用；未勾选的主机完全不动，保持自带安装——逐主机选择性隔离。
 // 取消勾选全部主机（两份清单都为空）：摘掉指向本扩展的钩子、删除生成的脚本——即「还原」（覆盖方式已把原脚本引用丢弃不可恢复，故还原不回填任何值）。
 //
 // 机制依据（Remote-SSH 0.128 源码实测：out/extension.js 的 preconnectScript）：remote.SSH.preconnect 取字符串时对全部主机生效、取对象时按主机映射；Windows 上必须是 .ps1，以 spawn('powershell.exe', ['-NoProfile','-ExecutionPolicy','Bypass','-File', 脚本路径],
 // { stdio: ['ignore','pipe','pipe'] }) 调用——参数硬编码、不注入环境变量、不设工作目录、标准输入为 ignore，脚本运行时对自己被哪台主机触发一无所知（主机名只被用来挑路径，不传下来），故唯一能携带主机名的途径就是每主机一个薄脚本。非零退出会中止连接；脚本内容 sha256 参与一次性授权确认（内容变化即重新弹窗）。
 //
 // 因此本扩展把职责拆成三个文件（都在 globalStorage 目录）：
-//   接管安装-<主机>.ps1  薄脚本，内容只有主机名 + 一行调用，逐字节稳定，是被授权哈希的那个文件；`接管安装实现.ps1`公共实现，从扩展目录原样复制（不在这里拼字符串），Remote-SSH 不读它，改逻辑不会重新弹窗；`接管安装配置.json`模块路径、发布通道与各主机启用的能力（接管安装 / 服务保活）——易变信息集中在此，同样不参与授权。薄脚本用 $PSScriptRoot 找同目录的实现文件，所以扩展升级换目录也不会改薄脚本内容。启用保活的主机同样生成薄脚本挂 preconnect，连接时幂等检修保活包装（部署/升级/自愈），VS Code 更新到新提交号后下一次连接即自动补上。
+//   接管安装-<主机>.ps1  薄脚本，内容只有主机名 + 一行调用，逐字节稳定，是被授权哈希的那个文件；`接管安装实现.ps1`公共实现，从扩展目录原样复制（不在这里拼字符串），Remote-SSH 不读它，改逻辑不会重新弹窗；`接管安装配置.json`脚本路径、发布通道与各主机启用的能力（接管安装 / 服务保活）——易变信息集中在此，同样不参与授权。薄脚本用 $PSScriptRoot 找同目录的实现文件，所以扩展升级换目录也不会改薄脚本内容。启用保活的主机同样生成薄脚本挂 preconnect，连接时幂等检修保活包装（部署/升级/自愈），VS Code 更新到新提交号后下一次连接即自动补上。
 //
 // 主机接管前已有外部 preconnect 脚本时绝不自动套壳，弹窗让用户三选一（决策持久化在 globalState，只问一次）：直接覆盖：钩子改指我方薄脚本，原脚本引用被丢弃（不可恢复，还原时也不回填）；复制调用代码：该主机的钩子完全不动，一行调用代码复制到剪贴板由用户自己粘进原脚本，调用链变成 Remote-SSH → 用户脚本 → 我方薄脚本；还原时扩展对该主机不做任何事，只提示手动删除那行（其薄脚本与公共文件必须保留：用户没删行之前还要靠它们干活，删了会让连接直接报错）。
 'use strict';
@@ -182,7 +182,7 @@ async function 执行接管(context, 交互) {
 		}
 		return;
 	}
-	const 模块路径 = 查找模块路径(context.extensionPath);
+	const 脚本路径 = 查找安装脚本(context.extensionPath);
 	const 发布通道 = /insiders/i.test(vscode.env.appName) ? '预览版' : '稳定版';
 	const 保存目录 = context.globalStorageUri.fsPath;
 	const 当前钩子 = 取钩子全局值();
@@ -279,11 +279,11 @@ async function 执行接管(context, 交互) {
 	}
 	// 易变信息全部进配置文件与公共实现，薄脚本只留主机名，避免逻辑或路径变化重新触发授权确认
 	部署公共文件(context.extensionPath, 保存目录, {
-		模块路径: 模块路径,
+		脚本路径: 脚本路径,
 		本地版本: 发布通道,
 		接管主机: 接管清单,
 		保活主机: 保活清单,
-		// 平台提示取自 Remote-SSH 自己的 remotePlatform 设置：Windows 主机上单会话（sh/base64）必失败，提前告知模块跳过那次徒劳尝试
+		// 平台提示取自 Remote-SSH 自己的 remotePlatform 设置：Windows 主机上单会话（sh/base64）必失败，提前告知安装脚本跳过那次徒劳尝试
 		平台提示映射: (vscode.workspace.getConfiguration('remote.SSH').get('remotePlatform') || {})
 	});
 	const 新钩子 = 重建钩子(当前钩子, 方式记录, 我方条目, 保存目录);
@@ -343,7 +343,7 @@ async function 执行还原(context, 交互) {
 	if (交互) {
 		if (自调主机.length > 0) {
 			const 明细 = 自调主机.map(主机 => '「' + 主机 + '」→ ' + ((方式记录[主机] || {}).原脚本 || '（原脚本路径未记录）')).join('\n');
-			vscode.window.showWarningMessage('已还原：Remote-SSH 恢复自带的远程服务器安装。\n\n以下主机当初选择了「复制调用代码自行粘贴」，本扩展不改您的任何文件，请手动删掉当初粘贴进原脚本的那一行调用代码：\n' + 明细 + '\n\n删除之前，这些主机连接时仍会经那一行由本模块安装。');
+			vscode.window.showWarningMessage('已还原：Remote-SSH 恢复自带的远程服务器安装。\n\n以下主机当初选择了「复制调用代码自行粘贴」，本扩展不改您的任何文件，请手动删掉当初粘贴进原脚本的那一行调用代码：\n' + 明细 + '\n\n删除之前，这些主机连接时仍会经那一行由本扩展安装。');
 		} else if (是本扩展的 || 清理数量 > 0) {
 			vscode.window.showInformationMessage('已还原：Remote-SSH 恢复自带的远程服务器安装。');
 		}
@@ -528,7 +528,7 @@ function 生成接管脚本(保存目录, 主机) {
 	return 生成钩子路径(保存目录, 主机);
 }
 
-// 薄脚本：只把主机名交给同目录的公共实现。这里刻意不含模块路径、发布通道等易变信息——
+// 薄脚本：只把主机名交给同目录的公共实现。这里刻意不含脚本路径、发布通道等易变信息——
 // 它的内容 sha256 就是 Remote-SSH 的一次性授权凭据，内容越稳，升级后越不会重新弹窗。
 function 生成薄脚本内容(主机) {
 	const 转义 = 文本 => String(文本).replace(/'/g, "''");
@@ -620,13 +620,13 @@ function 判断是否本扩展的钩子(值, 保存目录) {
 	return false;
 }
 
-// 模块源码直接放在扩展的 module/ 目录内，打包与安装同此一份，扩展按相对路径取用
-function 查找模块路径(扩展目录) {
-	const 模块路径 = path.join(扩展目录, 'module', 'Install-VSCodeRemoteServer.psd1');
-	if (fs.existsSync(模块路径)) {
-		return 模块路径;
+// 安装实现是扩展私有脚本，不提供 PowerShell 模块或命令行入口。
+function 查找安装脚本(扩展目录) {
+	const 脚本路径 = path.join(扩展目录, 'scripts', '安装实现.ps1');
+	if (fs.existsSync(脚本路径)) {
+		return 脚本路径;
 	}
-	throw new Error('未找到 Install-VSCodeRemoteServer 模块，期望位置：' + 模块路径);
+	throw new Error('未找到扩展安装脚本，期望位置：' + 脚本路径);
 }
 
 // 递归展开 ~/.ssh/config 的 Host 与 Include，收集可直接用于连接的主机别名（跳过含通配符的模式名）

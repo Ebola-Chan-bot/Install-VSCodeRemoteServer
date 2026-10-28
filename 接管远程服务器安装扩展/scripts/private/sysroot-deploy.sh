@@ -127,7 +127,7 @@ RC="$HOME/.bashrc"
 touch "$RC"
 TMPRC="$RC.vscsysroot.$$"
 {
-	printf '%s\n' '# >>> vscode-sysroot (安装-VSCode远程服务 模块自动注入) >>>'
+	printf '%s\n' '# >>> vscode-sysroot (VS Code 扩展自动注入) >>>'
 	printf 'export VSCODE_SERVER_CUSTOM_GLIBC_LINKER="%s"\n' "$LOADER"
 	printf 'export VSCODE_SERVER_CUSTOM_GLIBC_PATH="%s"\n' "$LIBDIR"
 	printf 'export VSCODE_SERVER_PATCHELF_PATH="%s/bin/bin/patchelf"\n' "$SYSROOT"

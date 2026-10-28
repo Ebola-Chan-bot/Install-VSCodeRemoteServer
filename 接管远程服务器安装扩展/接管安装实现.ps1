@@ -1,6 +1,6 @@
 ﻿# 接管 Remote-SSH 远程服务器安装的公共实现（随「接管远程服务器安装」扩展分发，请勿手工修改）。
 #
-# 调用方：扩展为每台勾选主机生成的薄 preconnect 脚本（与本文件同目录，只把主机名传进来），或「复制调用代码自行粘贴」方式下用户粘贴进其原 preconnect 脚本里的那一行（同样经薄脚本进来）。Remote-SSH调用 preconnect 脚本时不传任何参数、不注入环境变量、标准输入是 ignore，脚本能自知的只有自身路径，因此主机名必须由薄脚本传参带入；模块路径、发布通道等易变信息则读同目录的配置文件。Remote-SSH只对薄脚本做内容哈希授权，改本文件与配置文件都不会重新触发授权确认。
+# 调用方：扩展为每台勾选主机生成的薄 preconnect 脚本（与本文件同目录，只把主机名传进来），或「复制调用代码自行粘贴」方式下用户粘贴进其原 preconnect 脚本里的那一行（同样经薄脚本进来）。Remote-SSH调用 preconnect 脚本时不传任何参数、不注入环境变量、标准输入是 ignore，脚本能自知的只有自身路径，因此主机名必须由薄脚本传参带入；安装脚本路径、发布通道等易变信息则读同目录的配置文件。Remote-SSH只对薄脚本做内容哈希授权，改本文件与配置文件都不会重新触发授权确认。
 #
 # 退出码约定：0 = 正常；非 0 = 失败，Remote-SSH 会中止本次连接。任何失败都如实报错退出，不静默回退到自带安装。
 [CmdletBinding()]
@@ -69,31 +69,31 @@ try {
 }
 
 # 同理：配置里缺字段时取到的是 $null，而 $null -eq '' 为假，靠「等于空串」判断根本拦不住，一律用 IsNullOrWhiteSpace。
-if ([string]::IsNullOrWhiteSpace([string]$配置.模块路径)) {
-	报错退出 ('配置文件 {0} 缺少「模块路径」，请关闭再重新开启「{1}」。' -f $配置文件, $开关名)
+if ([string]::IsNullOrWhiteSpace([string]$配置.脚本路径)) {
+	报错退出 ('配置文件 {0} 缺少「脚本路径」，请关闭再重新开启「{1}」。' -f $配置文件, $开关名)
 }
 if ([string]::IsNullOrWhiteSpace([string]$配置.本地版本)) {
 	报错退出 ('配置文件 {0} 缺少「本地版本」，请关闭再重新开启「{1}」。' -f $配置文件, $开关名)
 }
-$模块路径 = [string]$配置.模块路径
-# 模块新鲜度自愈：配置里的路径可能指向已被替换的旧构建（扩展按版本目录安装，升级后旧目录迟早被 VS Code 清理；而扩展刷新配置发生在激活时，preconnect 可能先于激活跑起来就读到了旧配置）。旧构建的模板加载与发帧实现带着已修复的缺陷，静默加载会把帧流写坏、卡死到天荒地老。故把配置路径与扩展安装目录里的副本同台比新旧，自动改用模块代码更新的一份。
+$脚本路径 = [string]$配置.脚本路径
+# 升级后旧扩展目录可能被清理，配置也可能尚未刷新；只比较实际存在的内部脚本，取最新副本，不加载任何模块清单。
 $候选 = New-Object System.Collections.Generic.List[object]
-if (Test-Path -LiteralPath $模块路径) {
-	$候选.Add([pscustomobject]@{ 路径 = $模块路径; 时间 = (Get-Item -LiteralPath $模块路径).LastWriteTime })
+if (Test-Path -LiteralPath $脚本路径) {
+	$候选.Add([pscustomobject]@{ 路径 = $脚本路径; 时间 = (Get-Item -LiteralPath $脚本路径).LastWriteTime })
 }
 foreach ($扩展根 in @((Join-Path $env:USERPROFILE '.vscode-insiders\extensions'), (Join-Path $env:USERPROFILE '.vscode\extensions'))) {
 	Get-ChildItem -LiteralPath $扩展根 -Directory -Filter 'ebola-chan-bot.remotessh-server-installer-*' -ErrorAction SilentlyContinue | ForEach-Object {
-		$副本 = Join-Path $_.FullName 'module\Install-VSCodeRemoteServer.psd1'
-		if ((Test-Path -LiteralPath $副本) -and ($副本 -ne $模块路径)) {
+		$副本 = Join-Path $_.FullName 'scripts\安装实现.ps1'
+		if ((Test-Path -LiteralPath $副本) -and ($副本 -ne $脚本路径)) {
 			$候选.Add([pscustomobject]@{ 路径 = $副本; 时间 = (Get-Item -LiteralPath $副本).LastWriteTime })
 		}
 	}
 }
 if ($候选.Count -gt 0) {
 	$最新 = $候选 | Sort-Object 时间 -Descending | Select-Object -First 1
-	if ($最新.路径 -ne $模块路径) {
-		$script:缓冲.Add(('[接管安装] 配置里的模块路径指向较旧的构建，已自动改用更新的模块: {0}' -f $最新.路径))
-		$模块路径 = $最新.路径
+	if ($最新.路径 -ne $脚本路径) {
+		$script:缓冲.Add(('[接管安装] 配置里的脚本路径指向较旧的构建，已自动改用更新的脚本: {0}' -f $最新.路径))
+		$脚本路径 = $最新.路径
 	}
 }
 $本地版本 = [string]$配置.本地版本
@@ -109,19 +109,17 @@ if (-not $启用接管 -and -not $启用保活) {
 
 & {
 	try {
-		# 免密前提由模块在 -非交互 模式下校验（它的免密检测与环境试探本是同一次连接，不再重复探测）：
-		# 需要密码时模块直接报错退出——本进程标准输入被 Remote-SSH 设为 ignore，交互收密码只会挂起，绝不回退自带安装。
+		# 本脚本固定走免密非交互路径，认证失败会如实报错；Remote-SSH 的标准输入是 ignore，绝不尝试交互收密码或回退自带安装。
 		# 注意：本文件绝不执行任何“原 preconnect 脚本”——若主机接管前有外部脚本，扩展已在勾选时让用户二选一：覆盖丢弃，或由用户把一行调用代码粘进其原脚本（那时调用链是 用户脚本 → 薄脚本 → 本文件）。
-		Import-Module -Name $模块路径 -Force -ErrorAction Stop -DisableNameChecking
-
+		$调用参数 = @{ 远程主机 = $远程主机; 本地版本 = $本地版本; 平台提示映射 = $配置.平台提示映射; ErrorAction = 'Stop' }
 		if ($启用接管) {
-			# 接管+保活同跑时把保活检修并入同一次远程会话（-含服务保活），不再单独走一轮连接；平台提示随参传入，Windows 主机由模块直走 powershell 单会话流程
-			安装-VSCode远程服务 -远程主机 $远程主机 -本地版本 $本地版本 -非交互 -含服务保活:$启用保活 -平台提示映射 $配置.平台提示映射 -ErrorAction Stop
+			# 接管+保活同跑时把保活检修并入同一次远程会话，不再单独走一轮连接。
+			$调用参数.含服务保活 = $启用保活
 		} elseif ($启用保活) {
-			# 仅保活主机：不安装 Server，只做保活包装的幂等检修（已部署跳过、旧版升级、CLI 缺失自动下载真身再包装）。
-			# 新提交号的 CLI 由 Remote-SSH 在本次连接安装，当次不受保护属预期，下一次连接由本步自动补上。
-			安装-VSCode服务保活 -远程主机 $远程主机 -本地版本 $本地版本 -非交互 -ErrorAction Stop
+			# 仅保活主机：不安装 Server，只做保活包装的幂等检修。
+			$调用参数.仅服务保活 = $true
 		}
+		& $脚本路径 @调用参数
 	} catch {
 		# throw 会穿透 *>&1 落到 stderr，故在这里收敛成一行干净消息，随缓冲走 stdout
 		$script:失败 = $true

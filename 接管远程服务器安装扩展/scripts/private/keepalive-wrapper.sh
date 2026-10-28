@@ -3,7 +3,7 @@
 # VSCODE-PERSISTENT-WRAPPER-v2 : 让 exec server 的 command-shell 脱离 sshd 会话，并把看门狗父进程钉死为 PID 1
 # v5 追加名字豁免：收割按 /proc/<pid>/comm 认名（豁免名单含 tmux/bash/sh/zsh/sshd/screen，实测同名 daemon 存活 17 小时），node 启动后 comm=MainThread、CLI comm=code-insiders-* 均在必死名单，故真身经名为 tmux 的符号链接启动、node 全树经 NODE_OPTIONS 自改名。
 # v6 追加单 daemon 复用与令牌剥离：官方安装脚本并发执行时共用 .cli.<提交号>.log 通告端口，文件被后动会话替换后，先动会话会解析到别人 daemon 的端口、配上自己的令牌，握手报 AuthChallengeBadToken；v6 改由 wrapper 捕获 daemon 通告地址写进各自会话的日志、同提交号只保留一个 daemon 并向所有会话回填同一端口，并剥离 VSCODE_CLI_REQUIRE_TOKEN 使握手不再依赖令牌匹配。
-# 由 安装-VSCode服务保活 自动生成；还原方式：安装-VSCode服务保活 -远程主机 <主机> -移除
+# 由本扩展按主机保活配置自动生成；取消该主机的保活勾选后不再维护此包装。
 # 真实二进制放数据目录之外（官方引导脚本的 GC 会按文件名清理数据目录，放在里面必被误删）
 # PERSIST_DIR 的真实路径由 服务保活部署脚本.sh 的 write_wrapper 生成时填入
 PERSIST_DIR='@@PERSIST_DIR@@'

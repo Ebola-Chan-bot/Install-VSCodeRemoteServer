@@ -82,7 +82,7 @@ $改名脚本 = ('if (Test-Path -LiteralPath "{0}\{3}") {{ Write-Output "__VSI_R
 	'}} catch {{ Write-Output "__VSI_RC__:1"; Write-Output ("__VSI_ERR__:" + $_.Exception.GetType().Name + ": " + ($_.Exception.Message -replace "\s+", " ")); exit 1 }}') -f $远端暂存目录文本, $远程包名, $完成标记名, $取消标记名
 
 # 漂移守卫：本自检的字符串是生产格式串的副本，必须逐片段回对源码；有人改了 local-supply.ps1 却没同步自检时，这里当场报错
-$源码文本 = (Get-Content -LiteralPath (Join-Path $repo 'module\private\local-supply.ps1') -Raw)
+$源码文本 = (Get-Content -LiteralPath (Join-Path $repo 'scripts\private\local-supply.ps1') -Raw)
 $关键片段 = @(
 	'__VSI_RC__:0', '__VSI_RC__:1', '__VSI_RC__:2', '__VSI_RC__:3',
 	'__VSI_ERR__:在途文件不在', '__VSI_ERR__:" + $_.Exception.GetType().Name',

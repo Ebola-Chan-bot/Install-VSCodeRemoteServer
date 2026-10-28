@@ -30,10 +30,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $仓库根 = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$模块目录 = Join-Path $仓库根 '接管远程服务器安装扩展\module'
+$模块目录 = Join-Path $仓库根 '接管远程服务器安装扩展\scripts'
 $私有目录 = Join-Path $模块目录 'private'
-$psm1路径 = Join-Path $模块目录 'Install-VSCodeRemoteServer.psd1'
-$psm1正文 = Get-Content (Join-Path $模块目录 'Install-VSCodeRemoteServer.psm1') -Raw -Encoding UTF8
+$psm1路径 = Join-Path $模块目录 '安装实现.ps1'
+$psm1正文 = Get-Content -LiteralPath $psm1路径 -Raw -Encoding UTF8
 $引导模板 = Get-Content (Join-Path $私有目录 'Windows单会话引导.ps1') -Raw -Encoding UTF8
 $stdin模板 = Get-Content (Join-Path $私有目录 'windows-stdin-bootstrap.ps1') -Raw -Encoding UTF8
 
@@ -91,19 +91,18 @@ $硬化体 = if ($硬化起 -ge 0 -and $硬化止 -gt $硬化起) { $psm1正文.
 断言 '注释留下 120KB 挂死的实测依据' ((($psm1正文 -match '120KB') -or ($psm1正文 -match '120 KB')) -and ($psm1正文 -match '66 分钟')) '否则下一个人又会把它改回管道式'
 
 Write-Host ''
-Write-Host '===== B. 模块可解析/可导入（全新进程，避免当前会话污染） ====='
-$导入脚本 = Join-Path $env:TEMP 'vsi-import-check.ps1'
-@(
-	'$ErrorActionPreference = ''Stop'''
-	('Import-Module ''' + $psm1路径 + ''' -Force')
-	'Write-Output (''命令数='' + (Get-Command -Module Install-VSCodeRemoteServer).Count)'
-	'if ($null -eq (Get-Command -Module Install-VSCodeRemoteServer -Name ''安装-VSCode远程服务'' -ErrorAction SilentlyContinue)) { Write-Output ''缺命令:安装-VSCode远程服务'' } else { Write-Output ''关键命令在位'' }'
-) -join "`r`n" | Set-Content -Path $导入脚本 -Encoding UTF8
-$导入输出 = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $导入脚本 2>&1)
-$导入退出码 = $LASTEXITCODE
-$导入文本 = ($导入输出 -join ' | ')
-断言 '模块在全新进程可导入' ($导入退出码 -eq 0) ('退出码 ' + $导入退出码 + '；' + $导入文本.Substring(0, [Math]::Min(160, $导入文本.Length)))
-断言 '导入后关键命令在位' ($导入文本 -match '关键命令在位') $导入文本
+Write-Host '===== B. 扩展内部脚本可直接调用（全新进程，避免当前会话污染） ====='
+$原EAP = $ErrorActionPreference
+try {
+	$ErrorActionPreference = 'Continue'
+	$调用输出 = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $psm1路径 -远程主机 '__入口检查__' -本地版本 '预览版' -仅服务保活 2>&1)
+	$调用退出码 = $LASTEXITCODE
+} finally {
+	$ErrorActionPreference = $原EAP
+}
+$调用文本 = ($调用输出 -join ' | ')
+断言 '扩展脚本无需模块清单即可加载并进入免密连接检查' (($调用文本 -match '初始化-SSH会话|执行-环境探测|无法连接|找不到 ssh|Permission denied') -and ($调用文本 -notmatch 'Import-Module|Export-ModuleMember')) $调用文本.Substring(0, [Math]::Min(220, $调用文本.Length))
+断言 '不存在 PowerShell 模块导入或公共命令导出' (($psm1正文 -notmatch 'Import-Module|Export-ModuleMember|安装-VSCode服务保活')) ''
 
 Write-Host ''
 Write-Host '===== C. 算术复算：新旧 argv 体积对比（用生产同一套模板与算法） ====='
@@ -120,10 +119,9 @@ function 算-载荷体积 {
 	$引导码 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($引导脚本))
 	return [pscustomobject]@{ 精简正文 = $精简正文.Length; gzip字节 = $压缩流.ToArray().Length; 载荷 = $载荷.Length; 引导码 = $引导码.Length }
 }
-# 生产路径把 remote-install-common.ps1（+win7 等）拼成安装脚本正文，这里取通用与 win7 合并作为上界近似
+# 生产路径使用通用远程安装脚本；旧命令行专用 Win7 回退已删除
 $通用正文 = Get-Content (Join-Path $私有目录 'remote-install-common.ps1') -Raw -Encoding UTF8
-$win7正文 = Get-Content (Join-Path $私有目录 'remote-install-win7.ps1') -Raw -Encoding UTF8
-$体 = 算-载荷体积 -安装脚本文本 ($通用正文 + "`n" + $win7正文)
+$体 = 算-载荷体积 -安装脚本文本 ($通用正文 + "`n" + $通用正文)
 $固定引导码 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($stdin模板))
 # 注意：$体.引导码 是「字符数」（int），$固定引导码 才是真正的字符串 —— 两者不能混用字符串相加，
 # 否则 int 会被转成它的十进制字面量（实测踩过：旧 argv 被算成 43 字符，缺陷复现断言恒失败）。
@@ -222,11 +220,8 @@ if (-not $跑全链路) {
 		# 自己先抛 PositionalParameterNotFound，用户看到的就不是结论而是一堆绑定错误（静态闸门抓出）
 		断言 ('F 未与在用连接抢资源（检测到 ' + $在用进程.Count + ' 个在用的 preconnect/供给进程，已拒绝运行）') $false ('确认没有在用连接后重跑，或加 -忽略在用连接 强制覆盖')
 	} else {
-	# 为什么不能直接调 执行-SSH命令带标准输入：它是嵌套函数（定义在 安装-VSCode远程服务 内部，与 执行-SSH命令 同层），
-	# 只在那个函数运行期间存在，模块作用域里拿不到（实测报 not recognized）。
-	# 为什么跑已安装副本而不是仓库副本：仓库里的 接管安装实现.ps1 需要同目录的 接管安装配置.json（由扩展在 globalStorage 生成），
-	#   仓库副本没有 → 必然报"找不到配置文件"。真实生产入口就是 globalStorage 里那份，它 import 的是**已安装扩展目录**里的模块，
-	#   所以 F 段先做"已安装 == 仓库"哈希核对，防止拿旧安装冒充新代码通过。
+	# 真实生产入口是 globalStorage 里的薄脚本与公共实现；它们直接调用已安装扩展目录中的安装脚本，不再导入模块。
+	# 先做已安装与仓库哈希核对，防止拿旧扩展冒充新代码通过。
 	$扩展目录 = Get-ChildItem (Join-Path $env:USERPROFILE '.vscode-insiders\extensions') -Directory -ErrorAction SilentlyContinue |
 		Where-Object { $_.Name -like 'ebola-chan-bot.remotessh-server-installer-*' } | Sort-Object Name -Descending | Select-Object -First 1
 	$接管目录 = Join-Path $env:APPDATA 'Code - Insiders\User\globalStorage\ebola-chan-bot.remotessh-server-installer'
@@ -234,8 +229,8 @@ if (-not $跑全链路) {
 	if ($null -eq $扩展目录 -or -not (Test-Path $薄脚本)) {
 		断言 'F 生产入口存在' $false ('未找到已安装扩展或薄脚本：扩展目录=' + [string]$扩展目录 + '，薄脚本=' + $薄脚本)
 	} else {
-		# 先核对已安装模块与仓库一致（psm1 + 两个 Windows 引导模板）
-		$需核对 = @('module\Install-VSCodeRemoteServer.psm1', 'module\private\windows-stdin-bootstrap.ps1', 'module\private\Windows单会话引导.ps1')
+		# 先核对已安装安装脚本与两个 Windows 引导模板
+		$需核对 = @('scripts\安装实现.ps1', 'scripts\private\windows-stdin-bootstrap.ps1', 'scripts\private\Windows单会话引导.ps1')
 		$哈希不符 = @()
 		foreach ($相 in $需核对) {
 			$仓 = Join-Path (Join-Path $仓库根 '接管远程服务器安装扩展') $相
@@ -244,7 +239,7 @@ if (-not $跑全链路) {
 			$装哈希 = if (Test-Path $装) { (Get-FileHash $装 -Algorithm SHA256).Hash } else { '未安装该文件' }
 			if ($仓哈希 -ne $装哈希) { $哈希不符 += ($相 + '（仓库 ' + $仓哈希.Substring(0, [Math]::Min(12, $仓哈希.Length)) + ' ≠ 已装 ' + $装哈希.Substring(0, [Math]::Min(12, $装哈希.Length)) + '）') }
 		}
-		断言 '已安装模块与仓库一致（否则 F 测的是旧代码）' ($哈希不符.Count -eq 0) (($哈希不符 -join '；') + $(if ($哈希不符.Count -gt 0) { '  → 请先重新打包并 code-insiders --install-extension <vsix> --force' } else { '（扩展目录 ' + $扩展目录.Name + '）' }))
+		断言 '已安装脚本与仓库一致（否则 F 测的是旧代码）' ($哈希不符.Count -eq 0) (($哈希不符 -join '；') + $(if ($哈希不符.Count -gt 0) { '  → 请先重新打包并 code-insiders --install-extension <vsix> --force' } else { '（扩展目录 ' + $扩展目录.Name + '）' }))
 
 		$F日 = Join-Path $env:TEMP 'vsi-selfcheck-preconnect.log'
 		$原EAP2 = $ErrorActionPreference
@@ -252,7 +247,7 @@ if (-not $跑全链路) {
 		$计时F = [System.Diagnostics.Stopwatch]::StartNew()
 		try {
 			$ErrorActionPreference = 'Continue'
-			# 走 Remote-SSH 的完全同一条路：薄脚本 → 公共实现 → 模块（薄脚本自带 -远程主机 传参）
+			# 走 Remote-SSH 的完全同一条路：薄脚本 → 公共实现 → 扩展内部安装脚本
 			$F输出 = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $薄脚本 2>&1)
 			$F码 = $LASTEXITCODE
 		} finally { $ErrorActionPreference = $原EAP2; $计时F.Stop() }

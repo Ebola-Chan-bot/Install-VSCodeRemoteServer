@@ -97,7 +97,7 @@ function 取-仓库根 {
 }
 
 function 取-模块目录 {
-	return (Join-Path (取-仓库根) '接管远程服务器安装扩展\module')
+	return (Join-Path (取-仓库根) '接管远程服务器安装扩展\scripts')
 }
 
 function 取-私有目录 {

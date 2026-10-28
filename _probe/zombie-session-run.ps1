@@ -2,7 +2,7 @@
 $ErrorActionPreference = 'Stop'
 $repo = 'c:\Users\vhtmf\source\repos\Install-VSCodeRemoteServer\接管远程服务器安装扩展'
 $主机 = '上科大A服务器_张天夫'
-$模块文本 = [System.IO.File]::ReadAllText((Join-Path $repo 'module\private\remote-install-common.ps1'))
+$模块文本 = [System.IO.File]::ReadAllText((Join-Path $repo 'scripts\private\remote-install-common.ps1'))
 $起 = $模块文本.IndexOf('# ===== 僵尸会话自动清理')
 $尾起 = $模块文本.IndexOf('if ($僵尸会话数 -gt 0) {', $起)
 $尾 = $模块文本.IndexOf("`n}", $尾起)

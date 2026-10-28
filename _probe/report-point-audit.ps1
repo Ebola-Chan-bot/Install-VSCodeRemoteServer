@@ -10,9 +10,9 @@ function 断言 { param([Parameter(Position = 0)]$甲, [Parameter(Position = 1)]
 
 # ============ 全局禁忌：旧机制必须彻底消失（三份源码 + sh 一起查）============
 $三份 = @(
-	(Join-Path $repo 'module\private\remote-install-common.ps1'),
-	(Join-Path $repo 'module\private\local-supply.ps1'),
-	(Join-Path $repo 'module\private\remote-install-linux.sh')
+	(Join-Path $repo 'scripts\private\remote-install-common.ps1'),
+	(Join-Path $repo 'scripts\private\local-supply.ps1'),
+	(Join-Path $repo 'scripts\private\remote-install-linux.sh')
 )
 Write-Output '===== 全局禁忌（旧机制残留） ====='
 $禁忌表 = [ordered]@{
@@ -104,7 +104,7 @@ $进展判据 = @{
 		@('$已下载 -le $轮起已下载', 1, '无进展判据取「落地 vs 轮起」')
 	)
 }
-foreach ($相对 in @('module\private\remote-install-common.ps1', 'module\private\local-supply.ps1')) {
+foreach ($相对 in @('scripts\private\remote-install-common.ps1', 'scripts\private\local-supply.ps1')) {
 	$全路径 = Join-Path $repo $相对
 	$名 = Split-Path -Leaf $全路径
 	$tokens = $null; $errors = $null
@@ -206,12 +206,11 @@ function 查-sh输出带时间 {
 断言 (@(查-sh输出带时间 @('echo "$(date -r "$DIR" +%s 2>/dev/null || echo 0) $DIR" >> "$LIST_TMP"')).Count -eq 0) '时钟检查器不误报：排序键（纪元秒 + || echo 0 回退 + 重定向到临时文件）不算违规'
 
 $ps1清单 = @(
-	'module\Install-VSCodeRemoteServer.psm1',
-	'module\private\remote-install-common.ps1',
-	'module\private\local-supply.ps1',
-	'module\private\remote-install-win7.ps1',
-	'module\private\windows-stdin-bootstrap.ps1',
-	'module\private\Windows单会话引导.ps1',
+	'scripts\安装实现.ps1',
+	'scripts\private\remote-install-common.ps1',
+	'scripts\private\local-supply.ps1',
+	'scripts\private\windows-stdin-bootstrap.ps1',
+	'scripts\private\Windows单会话引导.ps1',
 	'接管安装实现.ps1'
 )
 foreach ($相对 in $ps1清单) {
@@ -221,12 +220,12 @@ foreach ($相对 in $ps1清单) {
 	断言 ($命中 -eq 0) ("$([IO.Path]::GetFileName($相对)) 不自己打时间（交外层唯一时钟）：违规 $命中 处")
 }
 $sh清单 = @(
-	'module\private\remote-install-linux.sh',
-	'module\private\接管编排脚本模板.sh',
-	'module\private\会话帧循环.sh',
-	'module\private\native-patch.sh',
-	'module\private\sysroot-deploy.sh',
-	'module\private\keepalive-deploy.sh'
+	'scripts\private\remote-install-linux.sh',
+	'scripts\private\接管编排脚本模板.sh',
+	'scripts\private\会话帧循环.sh',
+	'scripts\private\native-patch.sh',
+	'scripts\private\sysroot-deploy.sh',
+	'scripts\private\keepalive-deploy.sh'
 )
 foreach ($相对 in $sh清单) {
 	$全路径 = Join-Path $repo $相对
@@ -236,10 +235,10 @@ foreach ($相对 in $sh清单) {
 	断言 ($命中.Count -eq 0) ("$([IO.Path]::GetFileName($相对)) 不自己打时间（交外层唯一时钟）：违规 $($命中.Count) 处" + $(if ($命中.Count) { '，行 ' + (($命中) -join ',') } else { '' }))
 }
 # Linux 侧 log() 本体不得再加时间戳（回归守卫：曾为 `echo "[$(date …)] $*"`）
-$sh正文 = Get-Content -LiteralPath (Join-Path $repo 'module\private\remote-install-linux.sh') -Raw -Encoding UTF8
+$sh正文 = Get-Content -LiteralPath (Join-Path $repo 'scripts\private\remote-install-linux.sh') -Raw -Encoding UTF8
 断言 ($sh正文 -match 'log\(\)\s*\{\s*\r?\n\s*echo "\$\*"') 'Linux 侧 log() 就是裸 echo "$*"（不再拼时间戳）'
 # 例外正向对照：两个自有输出面确实保留了时间戳
-$包装正文 = Get-Content -LiteralPath (Join-Path $repo 'module\private\keepalive-wrapper.sh') -Raw -Encoding UTF8
+$包装正文 = Get-Content -LiteralPath (Join-Path $repo 'scripts\private\keepalive-wrapper.sh') -Raw -Encoding UTF8
 断言 ($包装正文 -match '\$\(date') '例外① 保活包装脚本仍带时间戳（输出去远端本地 wrapper.log / CLI log，外层根本没标签；删了就永久无法定位事件先后）'
 $扩展正文 = Get-Content -LiteralPath (Join-Path $repo 'extension.js') -Raw -Encoding UTF8
 断言 ($扩展正文 -match 'toLocaleTimeString') '例外② 扩展终端救援 OutputChannel 仍带时间标签（VS Code 不给 OutputChannel 加标签）'
@@ -247,7 +246,7 @@ $扩展正文 = Get-Content -LiteralPath (Join-Path $repo 'extension.js') -Raw -
 # ============ Linux sh ============
 Write-Output ''
 Write-Output '===== remote-install-linux.sh ====='
-$sh路径 = Join-Path $repo 'module\private\remote-install-linux.sh'
+$sh路径 = Join-Path $repo 'scripts\private\remote-install-linux.sh'
 $sh行 = @(Get-Content -LiteralPath $sh路径)
 $sh全文 = ($sh行 -join "`n")
 断言 ($sh全文 -notmatch 'log\s+.本次下载失败') '已无「本次下载失败，清理残留文件。」这条冗余日志'
@@ -273,8 +272,8 @@ function 取-代码文本([string]$路径) {
 }
 $供给代码 = $代码文本表[$三份[1]]
 $共通代码 = $代码文本表[$三份[0]]
-$模块代码 = 取-代码文本 (Join-Path $repo 'module\Install-VSCodeRemoteServer.psm1')
-$编排代码 = 取-代码文本 (Join-Path $repo 'module\private\接管编排脚本模板.sh')
+$模块代码 = 取-代码文本 (Join-Path $repo 'scripts\安装实现.ps1')
+$编排代码 = 取-代码文本 (Join-Path $repo 'scripts\private\接管编排脚本模板.sh')
 $sh代码 = $代码文本表[$三份[2]]
 断言 ($供给代码.Length -gt 8000 -and $模块代码.Length -gt 8000) ('取样正向对照：代码文本非空（供给 ' + $供给代码.Length + ' 字符 / 模块 ' + $模块代码.Length + ' 字符）')
 
@@ -335,7 +334,7 @@ foreach ($码 in @(0, 1, 2, 3)) {
 # 看门狗从未生效：父进程（连接）被杀后供给子进程照常无限重试（线上存活 34 分钟、死握共用缓存文件）。
 Write-Output ''
 Write-Output '===== 布尔谓词纯净度（函数体内不得发射输出） ====='
-$谓词文件 = @($三份[0], $三份[1], (Join-Path $repo 'module\Install-VSCodeRemoteServer.psm1'))
+$谓词文件 = @($三份[0], $三份[1], (Join-Path $repo 'scripts\安装实现.ps1'))
 $谓词总数 = 0
 $谓词污染 = @()
 foreach ($文件 in $谓词文件) {

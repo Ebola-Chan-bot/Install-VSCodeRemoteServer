@@ -42,7 +42,7 @@ function 算-引导码长度 {
 
 $模板路径 = Join-Path $模块目录 'private\Windows单会话引导.ps1'
 $通用路径 = Join-Path $模块目录 'private\remote-install-common.ps1'
-$win7路径 = Join-Path $模块目录 'private\remote-install-win7.ps1'
+$win7路径 = Join-Path $模块目录 'private\remote-install-common.ps1'
 $模板文本 = Get-Content $模板路径 -Raw -Encoding UTF8
 Write-Host ('  Windows单会话引导.ps1     字符数 = {0}' -f $模板文本.Length)
 foreach ($对 in @(

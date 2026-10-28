@@ -6,8 +6,8 @@
 $ErrorActionPreference = 'Stop'
 $repo = 'c:\Users\vhtmf\source\repos\Install-VSCodeRemoteServer\接管远程服务器安装扩展'
 $目标 = @(
-	(Join-Path $repo 'module\private\remote-install-common.ps1'),
-	(Join-Path $repo 'module\private\local-supply.ps1')
+	(Join-Path $repo 'scripts\private\remote-install-common.ps1'),
+	(Join-Path $repo 'scripts\private\local-supply.ps1')
 )
 $样本 = @('甲', '乙', '丙', '丁', '戊', '己', '庚', '辛', '壬', '癸')
 . (Join-Path $PSScriptRoot 'lib\探针公共库.ps1')

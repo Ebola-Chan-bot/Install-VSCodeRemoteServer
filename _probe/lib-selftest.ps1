@@ -12,7 +12,7 @@ Initialize-断言 -通过前缀 '  [通过] ' -失败前缀 '  [失败] '
 
 $模块目录 = 取-模块目录
 $私有目录 = 取-私有目录
-$psm1正文 = Get-Content -LiteralPath (Join-Path $模块目录 'Install-VSCodeRemoteServer.psm1') -Raw -Encoding UTF8
+$psm1正文 = Get-Content -LiteralPath (Join-Path $模块目录 '安装实现.ps1') -Raw -Encoding UTF8
 
 Write-Host '===== A. 库本体：语法/BOM/导出面 ====='
 $查库 = 校-脚本语法 -路径 (Join-Path $PSScriptRoot 'lib\探针公共库.ps1')
@@ -161,9 +161,9 @@ foreach ($要 in @(
 
 Write-Host ''
 Write-Host '===== H. 语法/BOM 工具在真实文件上的行为 ====='
-$查psm1 = 校-脚本语法 -路径 (Join-Path $模块目录 'Install-VSCodeRemoteServer.psm1')
-写-断言 'psm1 语法可解析（正向对照：工具真能干活）' ($查psm1.语法错误 -eq 0) ($查psm1.错误明细 -join '；')
-写-断言 'psm1 是单 BOM' ($查psm1.BOM数 -eq 1) ('BOM 数 ' + $查psm1.BOM数)
+$查psm1 = 校-脚本语法 -路径 (Join-Path $模块目录 '安装实现.ps1')
+写-断言 '扩展安装脚本语法可解析（正向对照：工具真能干活）' ($查psm1.语法错误 -eq 0) ($查psm1.错误明细 -join '；')
+写-断言 '扩展安装脚本是单 BOM' ($查psm1.BOM数 -eq 1) ('BOM 数 ' + $查psm1.BOM数)
 $查引导 = 校-脚本语法 -路径 (Join-Path $私有目录 'windows-stdin-bootstrap.ps1')
 写-断言 '纯 ASCII 模板可以零 BOM（无中文标识符，PS 5.1 不按 ANSI 误读）' ($查引导.语法错误 -eq 0) ('BOM 数 ' + $查引导.BOM数)
 # 补 BOM 的幂等性与「剥到只剩一个」行为（在临时文件上验，绝不碰仓库文件）
@@ -180,7 +180,7 @@ try {
 
 Write-Host ''
 Write-Host '===== I. 仓库路径解析 ====='
-写-断言 '取-仓库根 指到仓库（含 _probe 与扩展目录）' ((Test-Path (Join-Path (取-仓库根) '_probe')) -and (Test-Path (Join-Path (取-仓库根) '接管远程服务器安装扩展\module'))) (取-仓库根)
+写-断言 '取-仓库根 指到仓库（含 _probe 与扩展目录）' ((Test-Path (Join-Path (取-仓库根) '_probe')) -and (Test-Path (Join-Path (取-仓库根) '接管远程服务器安装扩展\scripts'))) (取-仓库根)
 写-断言 '取-私有目录 指到模块 private' (Test-Path (Join-Path (取-私有目录) 'remote-install-common.ps1')) ''
 # 路径解析必须靠 $PSScriptRoot：函数里 $MyInvocation.MyCommand.Definition 拿到的是函数体文本（实测把注释当路径，Resolve-Path 直接报错）
 $根源码 = (Get-Command 取-仓库根).Definition

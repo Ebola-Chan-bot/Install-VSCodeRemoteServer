@@ -23,12 +23,12 @@ param(
 $ErrorActionPreference = 'Stop'
 $仓库根 = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $扩展根 = Join-Path $仓库根 '接管远程服务器安装扩展'
-$私有目录 = Join-Path $扩展根 'module\private'
+$私有目录 = Join-Path $扩展根 'scripts\private'
 $common路径 = Join-Path $私有目录 'remote-install-common.ps1'
 $供给路径 = Join-Path $私有目录 'local-supply.ps1'
 $sh路径 = Join-Path $私有目录 'remote-install-linux.sh'
 $编排路径 = Join-Path $私有目录 '接管编排脚本模板.sh'
-$psm1路径 = Join-Path $扩展根 'module\Install-VSCodeRemoteServer.psm1'
+$psm1路径 = Join-Path $扩展根 'scripts\安装实现.ps1'
 
 . (Join-Path $PSScriptRoot 'lib\探针公共库.ps1')
 Initialize-断言 -通过前缀 'OK   ' -失败前缀 'FAIL '

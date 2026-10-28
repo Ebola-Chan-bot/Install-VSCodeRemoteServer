@@ -1,10 +1,22 @@
-﻿# 安装-VSCode远程服务 Module
-# 通过 SSH 与 BITS 在远程 Windows 主机上安装 VS Code Server
+﻿[CmdletBinding()]
+param(
+	[Parameter(Mandatory = $true, Position = 0)]
+	[string]$远程主机,
+	[Parameter(Mandatory = $true)]
+	[ValidateSet('预览版', '稳定版')]
+	[string]$本地版本,
+	[switch]$仅服务保活,
+	[switch]$移除服务保活,
+	[switch]$含服务保活,
+	[object]$平台提示映射
+)
+
+# 仅供 VS Code 扩展的 preconnect 调用：免密、非交互，不再提供命令行模块入口。
+
 
 # 加载私有远程脚本模板
-$script:模块根目录 = Split-Path -Parent $MyInvocation.MyCommand.Path
+$script:模块根目录 = $PSScriptRoot
 $script:远程脚本_通用 = Get-Content -Path (Join-Path $script:模块根目录 'private\remote-install-common.ps1') -Raw -Encoding UTF8
-$script:远程脚本_Win7 = Get-Content -Path (Join-Path $script:模块根目录 'private\remote-install-win7.ps1') -Raw -Encoding UTF8
 $script:远程脚本_Linux = Get-Content -Path (Join-Path $script:模块根目录 'private\remote-install-linux.sh') -Raw -Encoding UTF8
 $script:脚本_sysroot部署 = Get-Content -Path (Join-Path $script:模块根目录 'private\sysroot-deploy.sh') -Raw -Encoding UTF8
 $script:脚本_原生组件补丁 = Get-Content -Path (Join-Path $script:模块根目录 'private\native-patch.sh') -Raw -Encoding UTF8
@@ -87,7 +99,7 @@ function 剥离-终端控制序列 {
 	return $结果.ToString()
 }
 
-function 安装-VSCode远程服务 {
+function 执行-扩展安装 {
 	[CmdletBinding()]
 	param(
 		[Parameter(Mandatory = $true, Position = 0)]
@@ -102,19 +114,14 @@ function 安装-VSCode远程服务 {
 		[ValidateSet('预览版', '稳定版')]
 		[string]$本地版本,
 
-		# 以下开关仅供本模块的公共入口 安装-VSCode服务保活 转发与 preconnect 非交互场景使用，对用户隐藏
+		# 保活动作仅由扩展配置决定
 		[Parameter(DontShow)]
 		[switch]$仅服务保活,
 
 		[Parameter(DontShow)]
 		[switch]$移除服务保活,
 
-		# 非交互环境（如 Remote-SSH preconnect）：需要密码时直接报错，不收集密码
-		[Parameter(DontShow)]
-		[switch]$非交互,
 
-		# 与接管安装同跑时把服务保活检修并入同一次远程会话（供 preconnect 场景使用），对用户隐藏
-		[Parameter(DontShow)]
 		[switch]$含服务保活,
 
 		# Remote-SSH 的 remotePlatform 映射（由 preconnect 实现脚本传入）：Windows 主机直走 powershell 单会话流程，不再徒劳尝试 sh 引导
@@ -490,7 +497,7 @@ function 安装-VSCode远程服务 {
 			[string]$连接目标,
 			[int]$端口,
 			# 非交互（如 Remote-SSH preconnect，标准输入是 ignore）：需要密码时直接报错而不是收集
-			[switch]$非交互,
+			
 			[string]$附加命令,
 			# 单会话通道：探测已随会话引导体发出，直接取结果；取不到（非 POSIX 远端/免密失败）则回退离散探测
 			$会话
@@ -521,59 +528,19 @@ function 安装-VSCode远程服务 {
 			$会话 = $null
 		}
 
-		# 同一次会话内复用环境报告（如 preconnect 里安装与保活各调用一次本函数）：免去重复的整轮 SSH 往返
-		if ($null -eq $script:环境报告缓存) { $script:环境报告缓存 = @{} }
-		$缓存键 = '{0}:{1}' -f $连接目标, $端口
-		if ($非交互 -and $script:环境报告缓存.ContainsKey($缓存键)) {
-			return $script:环境报告缓存[$缓存键]
-		}
 
 		# 免密探测与环境试探合并为同一次连接：成功即同时拿到免密结论与完整环境报告（含内核与 glibc 版本）
 		$报告 = 执行-环境探测 -连接目标 $连接目标 -端口 $端口 -免密模式 -附加命令 $附加命令
 		if ($null -ne $报告) {
 			Write-Host '检测到远程主机已配置免密登录，无需输入密码。'
 			$补全报告 = 补全-环境报告 -报告 $报告 -连接目标 $连接目标 -端口 $端口
-			if ($非交互) { $script:环境报告缓存[$缓存键] = $补全报告 }
+
 			return $补全报告
 		}
 
-		if ($非交互) {
-			$诊断 = '无法连接远程主机'
-			if ($script:环境探测诊断 -match 'Permission denied|denied|password|认证') { $诊断 = '未配置免密登录（密钥认证）' }
-			throw ('{0}（{1}）：本环境无法交互输入密码（Remote-SSH preconnect 的标准输入被忽略）。请为该主机配置密钥认证，或取消勾选该主机改用 Remote-SSH 自带安装。' -f $诊断, $连接目标)
-		}
-
-		# 需要密码：交互收集一次，之后通过 SSH_ASKPASS 注入到后续每次 ssh/scp 调用
-		$安全密码 = Read-Host ('请输入 {0} 的 SSH 密码（仅本次会话使用，不会保存）' -f $连接目标) -AsSecureString
-		$密码指针 = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($安全密码)
-		try {
-			$明文密码 = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($密码指针)
-		} finally {
-			[System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($密码指针)
-		}
-
-		if ([string]::IsNullOrEmpty($明文密码)) {
-			throw '密码不能为空。'
-		}
-
-		# SSH_ASKPASS 协议要求一个可执行程序：ssh 需要密码时执行它并把 stdout 第一行当作密码。
-		# 密码本体只保存在当前进程的环境变量中（不写盘），模块自带的 bat 负责把该环境变量打印出来。
-		$env:VSCODE_SSH密码 = $明文密码
-		$env:SSH_ASKPASS = Join-Path $script:模块根目录 'private\ssh-askpass.bat'
-		$env:SSH_ASKPASS_REQUIRE = 'force'
-		# 注意：不要加 BatchMode=yes——它会禁用 askpass 机制，导致密码无法注入
-		$script:SSH密码选项 = @()
-		$script:密码已注入 = $true
-
-		# 密码注入后的第一次连接同样兼作环境试探，避免为试探再单独连一次
-		$报告 = 执行-环境探测 -连接目标 $连接目标 -端口 $端口 -附加命令 $附加命令
-		if ($null -eq $报告) {
-			清除-SSH密码复用
-			throw ('SSH 认证失败：{0} 拒绝了所提供的密码。' -f $连接目标)
-		}
-
-		Write-Host '密码已收集，后续所有 SSH/SCP 操作将自动复用，无需再次输入。'
-		return (补全-环境报告 -报告 $报告 -连接目标 $连接目标 -端口 $端口)
+		$诊断 = '无法连接远程主机'
+		if ($script:环境探测诊断 -match 'Permission denied|denied|password|认证') { $诊断 = '未配置免密登录（密钥认证）' }
+		throw ('{0}（{1}）：本环境无法交互输入密码（Remote-SSH preconnect 的标准输入被忽略）。请为该主机配置密钥认证，或取消勾选该主机改用 Remote-SSH 自带安装。' -f $诊断, $连接目标)
 	}
 
 	function 清除-SSH密码复用 {
@@ -1691,33 +1658,16 @@ function 安装-VSCode远程服务 {
 		throw '无法从远程主机获取 PowerShell 版本。请确认远程主机已安装 PowerShell 且可通过 SSH 执行。'
 	}
 
-	function 选择-远程脚本 {
-		param(
-			[int]$PS主版本
-		)
-
-		# 一律自动探测：按远程 PowerShell 版本决定使用 Win7 兼容版还是通用版
-		if ($PS主版本 -le 2) {
-			Write-Host ('检测到远程 PowerShell {0}.0，使用 Win7 适配版远程脚本。' -f $PS主版本)
-			return $script:远程脚本_Win7
-		} else {
-			Write-Host ('检测到远程 PowerShell {0}.0，使用通用版远程脚本。' -f $PS主版本)
-			return $script:远程脚本_通用
-		}
-	}
-
 	function 执行-远程安装脚本 {
-		param(
-			[string]$连接目标,
-			[int]$端口,
-			[string]$脚本文本,
-			[string]$本地附加压缩包路径,
-			[string]$远程附加压缩包文件名,
-			[string]$远程登录目录,
-			[scriptblock]$每行回调
-		)
+	param(
+		[string]$连接目标,
+		[int]$端口,
+		[string]$脚本文本,
+		[string]$远程登录目录,
+		[scriptblock]$每行回调
+	)
 
-		$本地临时脚本路径 = Join-Path $env:TEMP ('临时安装-VSCode远程服务-{0}.ps1' -f ([guid]::NewGuid().ToString('N')))
+	$本地临时脚本路径 = Join-Path $env:TEMP ('临时安装-VSCode远程服务-{0}.ps1' -f ([guid]::NewGuid().ToString('N')))
 		$远程临时脚本文件名 = 'vscode-server-install-temp.ps1'
 		# 已知远程登录目录时上传目标用绝对路径，报错可直接显示完整目标路径；否则退回登录目录下的相对路径
 		$远程路径前缀 = if ([string]::IsNullOrWhiteSpace($远程登录目录)) { './' } else { $远程登录目录.TrimEnd('\', '/') + '\' }
@@ -1726,9 +1676,6 @@ function 安装-VSCode远程服务 {
 		try {
 			[System.IO.File]::WriteAllText($本地临时脚本路径, $脚本文本, [System.Text.UTF8Encoding]::new($true))
 			上传-文件到远程 -本地路径 $本地临时脚本路径 -连接目标 $连接目标 -端口 $端口 -远程路径 $远程临时脚本路径
-			if (-not [string]::IsNullOrWhiteSpace($本地附加压缩包路径) -and -not [string]::IsNullOrWhiteSpace($远程附加压缩包文件名)) {
-				上传-文件到远程 -本地路径 $本地附加压缩包路径 -连接目标 $连接目标 -端口 $端口 -远程路径 ($远程路径前缀 + $远程附加压缩包文件名)
-			}
 			执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('powershell -NoProfile -ExecutionPolicy Bypass -File "%USERPROFILE%\{0}"' -f $远程临时脚本文件名) -TTY -每行回调 $每行回调
 		} finally {
 			# 清理临时文件（无害操作，失败不影响主流程）
@@ -1970,9 +1917,7 @@ function 安装-VSCode远程服务 {
 			Write-Output ('已清理死安装终端进程树 {0} 棵（超时放弃的残留，占据会话并拖慢后续连接）。' -f $死终端数)
 		}
 	} catch { }
-	$本地附加压缩包路径 = $null
-	$远程附加压缩包文件名 = $null
-
+	
 	# 认证与环境试探合并：免密主机一次连接拿到全部环境信息；需密码主机在密码注入后的第一次连接拿到
 	# 竞速暂存的预清理+预建随环境探测同一条连接完成（残留标记与完整包清掉、目录建好）：必须早于本地供给启动（防残包被误当完整包），又不值得独占一条连接。sh -c 包装让命令只在 POSIX 端生效（cmd/PowerShell 下是无害噪声），$HOME 即登录目录，单引号避开 PS 5.1 传参剥双引号的坑。
 	# **绝不 rm -rf 整目录**：暂存目录名只按提交号、不带连接唯一性，另一条并发连接可能正在往同一目录上传 <包名>.uploading，或在写 <包名>.downloading-<PID>（远端自下载的私有在途名），整删会让它们的改名发布步骤报「在途文件不在」而白白失去供给（Windows 侧实测已发生）。只清非在途项，在途文件留给收尾清理按 6 小时龄回收。
@@ -1981,7 +1926,7 @@ function 安装-VSCode远程服务 {
 	# 非交互（preconnect）优先走单会话：探测/上传/执行一条连接全包（实测慢速主机每条独立连接 25s 会话开销）；Linux用 sh 引导，Windows 用 powershell -EncodedCommand 引导（脚本经 stdin）；建不起来或探测取不到结果时自然回退离散流程（交互式手动调用恒走离散，保留密码收集能力）
 	$接管会话 = $null
 	$平台提示 = ''
-	if ($非交互) {
+	if ($true) {
 		try {
 			$平台提示 = [string]$平台提示映射.$远程主机
 		} catch { }
@@ -2006,7 +1951,7 @@ function 安装-VSCode远程服务 {
 			}
 		}
 	}
-	$环境 = 初始化-SSH会话 -连接目标 $连接目标 -端口 $SSH端口 -非交互:$非交互 -附加命令 $竞速预备命令 -会话 $接管会话
+	$环境 = 初始化-SSH会话 -连接目标 $连接目标 -端口 $SSH端口 -非交互:$true -附加命令 $竞速预备命令 -会话 $接管会话
 
 	Write-Host ('本机自动检测到的 VS Code 命令: {0}' -f $本地信息.命令路径)
 	Write-Host ('本机自动检测到的发布通道: {0}' -f $本地信息.发布通道)
@@ -2137,35 +2082,28 @@ function 安装-VSCode远程服务 {
 }
 
 
-	# Windows 远程主机：一律自动探测脚本版本（按远程 PowerShell 版本选择）
-	$远程安装脚本 = 选择-远程脚本 -PS主版本 $环境.PS主版本
+	# Windows 离散回退：扩展只走通用安装流程，不再为命令行兼容保留 Win7 手动下载回退。
+	$远程安装脚本 = $script:远程脚本_通用
 	$竞速上下文 = $null
 	$每行回调 = $null
 	$本地供给容器 = New-Object System.Collections.ArrayList
-	if ($远程安装脚本 -eq $script:远程脚本_Win7) {
-		# Win7（PS2）版无法在远程后台作业里可靠自下载，保持原有本地下载+上传供给方式，不竞速
-		$本地附加压缩包路径 = 下载-本地服务器压缩包 -发布通道 $本地信息.发布通道 -提交号 $本地信息.提交号 -架构 'win32-x64'
-		$远程附加压缩包文件名 = 'vscode-server-upload-temp.zip'
+	$竞速上下文 = 初始化-竞速上下文 -环境 $环境 -发布通道 $本地信息.发布通道 -提交号 $本地信息.提交号
+	if ($null -ne $竞速上下文) {
+		Write-Host ('已启用竞速模式：本地子进程下载+上传 与 远程自下载并行，暂存目录 {0}（远端产物已就位时本轮零下载，自动跳过竞速）' -f $竞速上下文.暂存目录)
+		$回调包 = 新建-供给回调 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型
+		$每行回调 = $回调包.回调
+		$本地供给容器 = $回调包.供给容器
 	} else {
-		# 通用版：能确定暂存目录与远程架构时启用竞速；供给由回调在远端预备完成标记后启动（预备先于上传），远端脚本启动时自行清建暂存目录、收尾自清，无需为此单独占连接
-		$竞速上下文 = 初始化-竞速上下文 -环境 $环境 -发布通道 $本地信息.发布通道 -提交号 $本地信息.提交号
-		if ($null -ne $竞速上下文) {
-			Write-Host ('已启用竞速模式：本地子进程下载+上传 与 远程自下载并行，暂存目录 {0}（远端产物已就位时本轮零下载，自动跳过竞速）' -f $竞速上下文.暂存目录)
-			$回调包 = 新建-供给回调 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型
-			$每行回调 = $回调包.回调
-			$本地供给容器 = $回调包.供给容器
-		} else {
-			Write-Host '未启用竞速模式（登录目录或远程架构无法确定），由远程单独下载。'
-		}
+		Write-Host '未启用竞速模式（登录目录或远程架构无法确定），由远程单独下载。'
 	}
 
-	# 替换占位符（Win7 版无 __暂存目录__ 占位符，替换为空串不影响其行为）
+	# 替换通用安装脚本的版本与暂存目录占位符
 	$远程安装脚本 = $远程安装脚本.Replace('__提交号__', $本地信息.提交号)
 	$远程安装脚本 = $远程安装脚本.Replace('__发布通道__', $本地信息.发布通道)
 	$远程安装脚本 = $远程安装脚本.Replace('__暂存目录__', $(if ($null -ne $竞速上下文) { $竞速上下文.暂存目录 } else { '' }))
 
 	try {
-		执行-远程安装脚本 -连接目标 $连接目标 -端口 $SSH端口 -脚本文本 $远程安装脚本 -本地附加压缩包路径 $本地附加压缩包路径 -远程附加压缩包文件名 $远程附加压缩包文件名 -远程登录目录 $环境.登录目录 -每行回调 $每行回调
+		执行-远程安装脚本 -连接目标 $连接目标 -端口 $SSH端口 -脚本文本 $远程安装脚本 -远程登录目录 $环境.登录目录 -每行回调 $每行回调
 	} finally {
 		# 供给收尾即可：远端暂存目录由安装脚本启动时自清建、收尾自清，不再为此单独占连接
 		等待-供给进程并回收日志 -供给 @($本地供给容器.ToArray())
@@ -2174,85 +2112,5 @@ function 安装-VSCode远程服务 {
 }
 
 
-function 安装-VSCode服务保活 {
-	<#
-	.SYNOPSIS
-		让远程 Linux 主机上的 VS Code Server 脱离 SSH 会话存活，主机周期性回收超龄会话后本地重连可热附着。
 
-	.DESCRIPTION
-		部分集群登录节点会用 root 权限的周期任务强制回收超龄 SSH 会话（实测有主机把存活超过 60 分钟的会话全部杀掉）。Remote-SSH 的 exec server 进程树是 sshd 会话后代，会随之被杀：本地 VS Code 每小时掉线一次，重连后远端终端与扩展状态全部丢失，日志表现为 Unknown reconnection token 加整轮冷启动。
-
-		本命令把数据根目录下的 CLI 入口（code[-insiders]-<提交号>）替换为包装脚本：真正启动的 command-shell 以「双 fork + setsid」方式拉起——子 shell 立即退出使真身 PPID 归 1、setsid 另建会话与进程组，从而与 sshd 会话的祖先链彻底断开，在会话被周期性收割后存活；同时把 --parent-process-id 看门狗参数改写为 PID 1。真实二进制另存到 <登录目录>/.vscode-persistent/real，避开官方引导脚本按文件名对数据目录做的 GC（只保留最新 5 个匹配项）。
-
-		效果：会话仍会被回收（这层由主机管理策略决定，无法在客户端改变），但 Server 不死，本地 VS Code 自动重连时热附着，编辑器、扩展宿主与远端终端及其滚动历史原地保留。掉线代价从整轮冷启动降为十几秒闪断。
-
-		注意：VS Code 更新到新提交号后需重新执行一次本命令。新提交号的 CLI 会由官方引导脚本下载为裸 ELF，当次连接不受保护，重跑后恢复保护。
-
-	.PARAMETER 远程主机
-		目标主机名或 IP（必填，位置参数 0）。传 ~/.ssh/config 中的 Host 别名时，账户与端口由 OpenSSH 自行解析。
-
-	.PARAMETER 远程账户
-		SSH 登录账户。未指定时从 ~/.ssh/config 反查匹配项。
-
-	.PARAMETER SSH端口
-		SSH 端口。未指定时取 ~/.ssh/config 中匹配到的 Port，仍无则用 22。
-
-	.PARAMETER 本地版本
-		预览版或稳定版。本机同时安装两者时必填，用于确定提交号与数据根目录名。
-
-	.PARAMETER 移除
-		还原为官方原始布局：把真实二进制移回数据目录覆盖包装脚本，并删除 .vscode-persistent 目录。
-
-	.EXAMPLE
-		安装-VSCode服务保活 bme_login_贾梦涵
-
-		对 ~/.ssh/config 中的别名部署服务保活，账户与端口由配置文件解析。
-
-	.EXAMPLE
-		安装-VSCode服务保活 10.15.49.6 -SSH端口 22112 -远程账户 v-jiamh -本地版本 预览版
-
-		裸 IP 连接时显式给出账户、端口与本机版本。
-
-	.EXAMPLE
-		安装-VSCode服务保活 bme_login_贾梦涵 -移除
-
-		移除保活包装，还原官方原始布局。
-	#>
-	[CmdletBinding()]
-	param(
-		[Parameter(Mandatory = $true, Position = 0)]
-		[Alias('目标服务器', '计算机名', 'IP', '主机')]
-		[string]$远程主机,
-
-		[string]$远程账户,
-
-		# 0 表示未指定：将优先采用 ~/.ssh/config 中匹配到的 Port，仍无则用 22
-		[int]$SSH端口 = 0,
-
-		[ValidateSet('预览版', '稳定版')]
-		[string]$本地版本,
-
-		# 非交互环境（如 Remote-SSH preconnect）：需要密码时直接报错，不收集密码
-		[Parameter(DontShow)]
-		[switch]$非交互,
-
-		[switch]$移除
-	)
-
-	# 复用主入口已实现的连接协商（ssh config 反查、密码一次性收集复用、环境与登录目录探测），仅把动作切成服务保活的部署或移除
-	$转发参数 = @{
-		远程主机     = $远程主机
-		SSH端口      = $SSH端口
-		仅服务保活   = $true
-		移除服务保活 = $移除.IsPresent
-	}
-	if ($非交互.IsPresent) { $转发参数['非交互'] = $true }
-	if (-not [string]::IsNullOrWhiteSpace($远程账户)) { $转发参数['远程账户'] = $远程账户 }
-	if (-not [string]::IsNullOrWhiteSpace($本地版本)) { $转发参数['本地版本'] = $本地版本 }
-
-	安装-VSCode远程服务 @转发参数
-}
-
-
-# 导出公共函数
-Export-ModuleMember -Function '安装-VSCode远程服务', '安装-VSCode服务保活'
+执行-扩展安装 -远程主机 $远程主机 -本地版本 $本地版本 -仅服务保活:$仅服务保活 -移除服务保活:$移除服务保活 -含服务保活:$含服务保活 -平台提示映射 $平台提示映射
