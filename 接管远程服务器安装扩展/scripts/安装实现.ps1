@@ -314,7 +314,7 @@ function 执行-扩展安装 {
 	function 取-环境探测命令 {
 		# 单条跨 shell 兼容（sh / cmd / PowerShell 5.1）的多行探测命令：每行在不适用的平台上要么输出可识别的垃圾、要么报非致命错误，解析端按标记/值形态筛选。
 		# 行序有讲究：Windows 关键行在前（PowerShell 默认 shell 若配置文件设了 EAP=Stop，不存在的命令会终止后续行，此时 Linux 专用行丢失也无妨），Linux 关键行在后
-		# 硬约束：命令行内绝不得出现双引号与圆括号——PS 5.1 向原生命令传字符串参数时不转义内部双引号，远端收到时已被剥掉；剥掉后裸露的 ( 对远端 bash 是语法错误，会中止整段脚本导致后续所有关键行丢失（实测：含括号的 ARCH_PS 行让 Linux 主机报告退化为不完整，每次都回退逐项试探）。因此所有取值行都用裸值输出，由解析端按值形态识别（Linux 词汇 / Windows 大写架构名 / 盘符路径 / 纯数字）
+		# 硬约束：命令行内绝不得出现双引号与圆括号——PS 5.1 向原生命令传字符串参数时不转义内部双引号，远端收到时已被剥掉；剥掉后裸露的 ( 对远端 bash 是语法错误，会中止整段脚本导致后续所有关键行丢失。所有取值行都用裸值输出，由解析端按值形态识别（Linux 词汇 / Windows 大写架构名 / 盘符路径 / 纯数字）；缺字段直接报错，不再逐项试探。
 		# 命令正文存于 private\环境探测命令.txt（脚本正文一律独立成文件，不在字符串里内嵌），改正文前先读上面的硬约束
 		return $script:脚本_环境探测命令
 	}
@@ -413,134 +413,72 @@ function 执行-扩展安装 {
 		}
 	}
 
-	function 执行-环境探测 {
-		param(
-			[string]$连接目标,
-			[int]$端口,
-			[switch]$免密模式,
-			# 与探测同行执行的轻量远端准备（同一条连接）；语法须跨 sh/cmd/PowerShell 全兼容（约束见 取-环境探测命令 注释）
-			[string]$附加命令
-		)
+	function 校验-环境报告 {
+		param([pscustomobject]$报告)
 
-		# 一次 SSH 调用完成全部环境试探；认证失败（退出码 255）返回 $null 由调用方进入密码收集流程
-		$ssh命令 = Get-Command ssh -ErrorAction SilentlyContinue | Select-Object -First 1
-		if ($null -eq $ssh命令) {
-			throw '未找到 ssh 命令，无法探测远程环境。'
+		if ($null -eq $报告) { throw '单会话环境探测未返回报告，安装已中止。' }
+		if (-not $报告.完整) {
+			$缺失 = New-Object System.Collections.Generic.List[string]
+			if ([string]::IsNullOrWhiteSpace($报告.登录目录)) { $缺失.Add('登录目录') }
+			if (($报告.系统类型 -eq 'Windows') -and ($null -eq $报告.PS主版本)) { $缺失.Add('PowerShell 版本') }
+			throw ('环境探测报告不完整（缺少 {0}；系统类型={1}），安装已中止，不再回退逐项试探。' -f ($缺失 -join '、'), $报告.系统类型)
 		}
-
-		$ssh参数 = @('-n', '-p', $端口) + $script:SSH密码选项
-		if ($免密模式) { $ssh参数 += @('-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10') }
-		# 探测命令必须用 LF 行尾：本模块文件以 CRLF 保存，here-string 会带上 \r，远端 sh 会把行尾的 \r 当成命令的一部分（如 uname -s\r 报 invalid option），导致关键输出行丢失
-		$探测命令文本 = (取-环境探测命令) -replace "`r`n", "`n"
-		if (-not [string]::IsNullOrWhiteSpace($附加命令)) {
-			$探测命令文本 = $探测命令文本 + "`n" + $附加命令
-		}
-		$ssh参数 += @($连接目标, $探测命令文本)
-
-		# PS 5.1 下原生命令 stderr 一旦被重定向即变终止性错误，捕获期间临时切 Continue 并在 finally 恢复；不重定向时探测命令的多平台垃圾行会污染控制台，故此处选择捕获
-		$原始EAP = $ErrorActionPreference
-		try {
-			$ErrorActionPreference = 'Continue'
-			$输出 = @(& $ssh命令.Source $ssh参数 2>&1)
-		} finally {
-			$ErrorActionPreference = $原始EAP
-		}
-
-		if ($LASTEXITCODE -eq 255) {
-			# 留诊断给非交互模式报错时区分「要密码」与「连不上」
-			$script:环境探测诊断 = (@($输出) | ForEach-Object { [string]$_ }) -join ' '
-			return $null
-		}
-
-		return (解析-环境报告 -输出 $输出)
+		return $报告
 	}
 
-	function 补全-环境报告 {
+	function 取-会话诊断摘要 {
 		param(
-			[pscustomobject]$报告,
-			[string]$连接目标,
-			[int]$端口
+			$会话,
+			[AllowNull()][string[]]$标准输出
 		)
 
-		# 探测报告不完整时（如远程 shell 行为异常）退回逐项试探，保证正确性优先于连接次数
-		if ($报告.完整) {
-			return $报告
+		# SSH 的拒绝原因可能写在 stdout 而不是 stderr（例如 SFTP-only 服务），必须同时保留两路输出与退出码，不能把“未收到协议标记”当成根因。
+		$详情 = New-Object System.Collections.Generic.List[string]
+		try {
+			if ($会话.进程.HasExited) { $详情.Add('SSH 退出码: ' + [string]$会话.进程.ExitCode) }
+		} catch { }
+		if ($null -eq $标准输出) {
+			try { $标准输出 = @([string]$会话.标准输出.ReadToEnd() -split "`r?`n") } catch { $标准输出 = @() }
 		}
-
-		Write-Host '环境探测报告不完整，退回逐项试探。'
-		$探测结果 = 探测-远程系统类型 -连接目标 $连接目标 -端口 $端口
-		$系统类型 = $探测结果.系统类型
-		$登录目录 = if ($报告.登录目录 -ne '') { $报告.登录目录 } else { 取-远程登录目录 -连接目标 $连接目标 -端口 $端口 -远程系统类型 $系统类型 }
-		$PS主版本 = $报告.PS主版本
-		if ($系统类型 -eq 'Windows' -and $null -eq $PS主版本) {
-			$PS主版本 = 探测-远程PS版本 -连接目标 $连接目标 -端口 $端口
+		$输出文本 = (@($标准输出 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join "`n").Trim()
+		if ($输出文本.Length -gt 4000) { $输出文本 = $输出文本.Substring($输出文本.Length - 4000) }
+		if ($输出文本 -match 'allows sftp connections only') {
+			$详情.Add('远端仅允许 SFTP，禁止 SSH 命令执行，安装引导无法启动；请为该账户开放 SSH 登录 Shell，或改用具有命令执行权限的账户。')
 		}
-
-		# 合并探测拿到的架构优先；退回逐项试探时用逐项结果补齐（竞速依赖）
-		$原始架构 = if ($报告.原始架构 -ne '') { $报告.原始架构 } else { $探测结果.原始架构 }
-
-		return [pscustomobject]@{
-			系统类型 = $系统类型
-			登录目录 = $登录目录
-			PS主版本 = $PS主版本
-			原始架构 = $原始架构
-			内核版本 = $报告.内核版本
-			Glibc版本 = $报告.Glibc版本
-			提交余量KB = $报告.提交余量KB
-			严格提交模式 = $报告.严格提交模式
-			完整 = $true
-		}
+		if (-not [string]::IsNullOrWhiteSpace($输出文本)) { $详情.Add("远端标准输出:`n" + $输出文本) }
+		try {
+			$null = $会话.错误任务.Wait(2000)
+			if ($会话.错误任务.IsCompleted) {
+				$错误文本 = ([string]$会话.错误任务.Result).Trim()
+				if ($错误文本.Length -gt 4000) { $错误文本 = $错误文本.Substring($错误文本.Length - 4000) }
+				if (-not [string]::IsNullOrWhiteSpace($错误文本)) { $详情.Add("远端标准错误:`n" + $错误文本) }
+			}
+		} catch { }
+		if ($详情.Count -eq 0) { return '远端未返回任何错误详情。' }
+		return ($详情 -join "`n")
 	}
 
 	function 初始化-SSH会话 {
-		param(
-			[string]$连接目标,
-			[int]$端口,
-			# 非交互（如 Remote-SSH preconnect，标准输入是 ignore）：需要密码时直接报错而不是收集
-			
-			[string]$附加命令,
-			# 单会话通道：探测已随会话引导体发出，直接取结果；取不到（非 POSIX 远端/免密失败）则回退离散探测
-			$会话
-		)
+		param($会话)
 
+		# 单会话是唯一探测通道：失败立即报告真实原因，不再另起离散连接。
 		$script:SSH密码选项 = @()
 		$script:密码已注入 = $false
-
-		if ($null -ne $会话 -and $会话.进程.HasExited) {
-			Write-Host '单会话进程已退出，回退离散流程。'
+		if ($null -eq $会话) { throw '单会话对象为空，环境探测与安装已中止。' }
+		if ($会话.进程.HasExited) {
+			$错误摘要 = 取-会话诊断摘要 -会话 $会话
+			throw ("单会话进程已退出，安装已中止。`n{0}" -f $错误摘要)
 		}
-		if ($null -ne $会话 -and -not $会话.进程.HasExited) {
-			$会话探测行 = 读取-会话探测 $会话
-			if ($null -ne $会话探测行) {
-				Write-Host '检测到远程主机已配置免密登录，无需输入密码。'
-				$报告 = 解析-环境报告 -输出 $会话探测行
-				return (补全-环境报告 -报告 $报告 -连接目标 $连接目标 -端口 $端口)
-			}
-			# 会话没能完成探测：弃用会话，回退下方离散流程（它会给出准确的免密/连接报错）；把会话错误流带出来否则无从排查
-			try {
-				$null = $会话.错误任务.Wait(2000)
-				if ($会话.错误任务.IsCompleted -and -not [string]::IsNullOrWhiteSpace($会话.错误任务.Result)) {
-					Write-Host ('单会话错误流: {0}' -f ($会话.错误任务.Result.Trim()))
-				}
-			} catch { }
-			Write-Host '单会话探测未完成，回退离散流程。'
+
+		$会话探测 = 读取-会话探测 $会话
+		if (-not $会话探测.完成) {
+			$错误摘要 = 取-会话诊断摘要 -会话 $会话 -标准输出 $会话探测.行
 			关闭-接管会话 $会话
-			$会话 = $null
+			throw ("单会话探测未完成：未收到 PROBE_END，安装已中止，不再回退离散流程。`n{0}" -f $错误摘要)
 		}
-
-
-		# 免密探测与环境试探合并为同一次连接：成功即同时拿到免密结论与完整环境报告（含内核与 glibc 版本）
-		$报告 = 执行-环境探测 -连接目标 $连接目标 -端口 $端口 -免密模式 -附加命令 $附加命令
-		if ($null -ne $报告) {
-			Write-Host '检测到远程主机已配置免密登录，无需输入密码。'
-			$补全报告 = 补全-环境报告 -报告 $报告 -连接目标 $连接目标 -端口 $端口
-
-			return $补全报告
-		}
-
-		$诊断 = '无法连接远程主机'
-		if ($script:环境探测诊断 -match 'Permission denied|denied|password|认证') { $诊断 = '未配置免密登录（密钥认证）' }
-		throw ('{0}（{1}）：本环境无法交互输入密码（Remote-SSH preconnect 的标准输入被忽略）。请为该主机配置密钥认证，或取消勾选该主机改用 Remote-SSH 自带安装。' -f $诊断, $连接目标)
+		Write-Host '检测到远程主机已配置免密登录，无需输入密码。'
+		$报告 = 解析-环境报告 -输出 $会话探测.行
+		return (校验-环境报告 -报告 $报告)
 	}
 
 	function 清除-SSH密码复用 {
@@ -735,105 +673,6 @@ function 执行-扩展安装 {
 			} catch { }
 			throw ('SSH 执行失败（标准输入通道），退出码: {0}{1}' -f $退出码, $错误摘要)
 		}
-	}
-
-	function 上传-文件到远程 {
-		param(
-			[string]$本地路径,
-			[string]$连接目标,
-			[int]$端口,
-			[string]$远程路径
-		)
-
-		$SCP命令 = Get-Command scp -ErrorAction SilentlyContinue | Select-Object -First 1
-		if ($null -eq $SCP命令) {
-			throw '未找到 scp 命令。请确保已安装 OpenSSH 客户端。'
-		}
-
-		$scp参数 = @('-P', $端口) + $script:SSH密码选项 + @($本地路径, ('{0}:{1}' -f $连接目标, $远程路径))
-
-		# PS 5.1 下原生命令的 stderr 一旦被重定向就会变成终止性错误，因此探测与捕获期间临时切换为 Continue，并在 finally 中恢复
-		$原始EAP = $ErrorActionPreference
-		try {
-			$ErrorActionPreference = 'Continue'
-			# 默认走 SFTP 协议上传
-			& $SCP命令.Source $scp参数 2>&1 | Out-Null
-		} finally {
-			$ErrorActionPreference = $原始EAP
-		}
-
-		if ($LASTEXITCODE -eq 0) {
-			return
-		}
-
-		# SFTP 协议失败时，远端常只给出模糊的 "close remote: Failure"，掩盖真实原因（实测它对应的往往是 Linux 端的 "Disk quota exceeded"）；经典 SCP 协议（-O）会把远端真实错误原样回显。用它补传一次：成功则上传就此完成；仍失败则取其输出作为直白的报错依据
-		$原始EAP = $ErrorActionPreference
-		try {
-			$ErrorActionPreference = 'Continue'
-			$诊断输出 = @(& $SCP命令.Source (@('-O') + $scp参数) 2>&1)
-		} finally {
-			$ErrorActionPreference = $原始EAP
-		}
-
-		if ($LASTEXITCODE -eq 0) {
-			return
-		}
-
-		$远端错误 = ($诊断输出 | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() }) -join "`n"
-
-		# 空间不足类错误额外指明出问题的目标路径（含主机）与要上传的文件大小，便于定位是哪台机器的哪个路径空间不足、需要腾出多少空间
-		if ($远端错误 -match 'quota exceeded|No space left|空间不足|磁盘已满|配额') {
-			$文件信息 = Get-Item -LiteralPath $本地路径 -ErrorAction SilentlyContinue
-			$大小显示 = if ($null -ne $文件信息) { ('{0} 字节' -f $文件信息.Length) } else { '未知' }
-			throw ('SCP 上传失败，退出码: {0}。上传到目标路径 {1}:{2} 时远端空间不足，要上传的文件大小为 {3}。{4}{5}' -f $LASTEXITCODE, $连接目标, $远程路径, $大小显示, "`n", $远端错误)
-		}
-
-		throw ('SCP 上传失败，退出码: {0}。{1}{2}' -f $LASTEXITCODE, "`n", $远端错误)
-	}
-
-	function 取-服务器压缩包文件名 {
-		param(
-			[string]$架构
-		)
-
-		return ('vscode-server-{0}.zip' -f $架构)
-	}
-
-	function 取-服务器压缩包下载地址 {
-		param(
-			[string]$发布通道,
-			[string]$提交号,
-			[string]$架构
-		)
-
-		$文件名 = 取-服务器压缩包文件名 -架构 $架构
-		return ('https://vscode.download.prss.microsoft.com/dbazure/download/{0}/{1}/{2}' -f $发布通道, $提交号, $文件名)
-	}
-
-	function 下载-本地服务器压缩包 {
-		param(
-			[string]$发布通道,
-			[string]$提交号,
-			[string]$架构
-		)
-
-		$下载地址 = 取-服务器压缩包下载地址 -发布通道 $发布通道 -提交号 $提交号 -架构 $架构
-		$本地压缩包路径 = Join-Path $env:TEMP ('vscode-server-{0}-{1}.zip' -f $架构, $提交号)
-
-		if (-not (Test-Path $本地压缩包路径)) {
-			Write-Host ('本机开始下载 VS Code Server 压缩包: {0}' -f $下载地址)
-			try {
-				Invoke-WebRequest -Uri $下载地址 -OutFile $本地压缩包路径 -UseBasicParsing
-			} catch {
-				throw ('本机下载 VS Code Server 压缩包失败: {0}' -f $_.Exception.Message)
-			}
-		}
-
-		if (-not (Test-Path $本地压缩包路径)) {
-			throw ('本机下载完成后未找到压缩包: {0}' -f $本地压缩包路径)
-		}
-
-		return $本地压缩包路径
 	}
 
 	function 取-远程架构标识 {
@@ -1076,67 +915,6 @@ function 执行-扩展安装 {
 		}
 	}
 
-	function 执行-SSH命令并捕获 {
-		param(
-			[string]$连接目标,
-			[int]$端口,
-			[string]$命令文本
-		)
-
-		# 捕获版 SSH 执行：返回 pscustomobject（勿用元组，空输出时会被 PowerShell 展平导致属性错位），-n 防老版 sshd 挂起
-		$ssh命令 = Get-Command ssh -ErrorAction SilentlyContinue | Select-Object -First 1
-		if ($null -eq $ssh命令) {
-			throw '未找到 ssh 命令，无法连接远程服务器。'
-		}
-
-		$原始EAP = $ErrorActionPreference
-		try {
-			# PS 5.1 下原生命令 stderr 一旦被重定向即变终止性错误，捕获期间临时切 Continue 并在 finally 恢复
-			$ErrorActionPreference = 'Continue'
-			$输出 = @(& $ssh命令.Source (@('-n', '-p', $端口) + $script:SSH密码选项 + @($连接目标, $命令文本)) 2>&1)
-		} finally {
-			$ErrorActionPreference = $原始EAP
-		}
-
-		return [pscustomobject]@{ 输出 = $输出; 退出码 = $LASTEXITCODE }
-	}
-
-	function 探测-远程glibc版本 {
-		param(
-			[string]$连接目标,
-			[int]$端口
-		)
-
-		# 解析 ldd --version 首行（如 "ldd (GNU libc) 2.17"）；非 glibc 环境或探测失败返回 $null
-		$结果 = 执行-SSH命令并捕获 -连接目标 $连接目标 -端口 $端口 -命令文本 'ldd --version 2>/dev/null | head -1'
-		if ($结果.退出码 -ne 0) { return $null }
-		foreach ($行 in $结果.输出) {
-			$文本 = ([string]$行).Trim()
-			if ($文本 -match '(\d+\.\d+)\s*$') {
-				try { return [version]$Matches[1] } catch { return $null }
-			}
-		}
-		return $null
-	}
-
-	function 探测-远程内核版本 {
-		param(
-			[string]$连接目标,
-			[int]$端口
-		)
-
-		# 解析 uname -r 的主次版本号（如 2.6.32-504.el6.x86_64 → 2.6）；探测失败返回 $null
-		$结果 = 执行-SSH命令并捕获 -连接目标 $连接目标 -端口 $端口 -命令文本 'uname -r'
-		if ($结果.退出码 -ne 0) { return $null }
-		foreach ($行 in $结果.输出) {
-			$文本 = ([string]$行).Trim()
-			if ($文本 -match '^(\d+\.\d+)') {
-				try { return [version]$Matches[1] } catch { return $null }
-			}
-		}
-		return $null
-	}
-
 	function 取-sysroot素材清单 {
 		# sysroot 素材定义（glibc/libstdc++/libgcc 的 CentOS 8 RPM + patchelf 0.18 静态二进制，共约 5MB）：本地供给与远程自下载共用同一地址列表
 		# vault.centos.org 对无 UA 请求返回 403，故走清华/阿里镜像并显式 UA；patchelf 用 GitHub Release 官方静态包（0.17.x 有 segfault 问题，官方要求 >= 0.18），并附 GitHub 加速镜像作备源（部分网络 GitHub 直连不可达，实测 ghfast.top 可达）
@@ -1154,47 +932,6 @@ function 执行-扩展安装 {
 			地址列表 = @($patchelf地址, ('https://ghfast.top/{0}' -f $patchelf地址), ('https://gh-proxy.com/{0}' -f $patchelf地址))
 		})
 		return @($清单)
-	}
-
-	function 上传-一批文件到远程 {
-		param(
-			[string[]]$本地路径,
-			[string]$连接目标,
-			[int]$端口,
-			[string]$远程目录
-		)
-
-		# 多文件一次连接上传（scp 单次调用接受多个源）：把逐文件上传的 N 次连接开销压成 1 次（慢速主机上每次连接可达数十秒）
-		$SCP命令 = Get-Command scp -ErrorAction SilentlyContinue | Select-Object -First 1
-		if ($null -eq $SCP命令) {
-			throw '未找到 scp 命令。请确保已安装 OpenSSH 客户端。'
-		}
-		$目标 = '{0}:{1}/' -f $连接目标, $远程目录.TrimEnd('/', '\')
-
-		$原始EAP = $ErrorActionPreference
-		try {
-			$ErrorActionPreference = 'Continue'
-			& $SCP命令.Source (@('-P', $端口) + $script:SSH密码选项 + $本地路径 + @($目标)) 2>&1 | Out-Null
-		} finally {
-			$ErrorActionPreference = $原始EAP
-		}
-		if ($LASTEXITCODE -eq 0) {
-			return
-		}
-
-		# 与单文件上传同款回退：SFTP 失败时用经典 SCP 协议（-O）补传一次，远端真实报错（如磁盘配额）才能回显
-		$原始EAP = $ErrorActionPreference
-		try {
-			$ErrorActionPreference = 'Continue'
-			$诊断输出 = @(& $SCP命令.Source (@('-O', '-P', $端口) + $script:SSH密码选项 + $本地路径 + @($目标)) 2>&1)
-		} finally {
-			$ErrorActionPreference = $原始EAP
-		}
-		if ($LASTEXITCODE -eq 0) {
-			return
-		}
-		$远端错误 = ($诊断输出 | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() }) -join "`n"
-		throw ('SCP 批量上传失败，退出码: {0}。目标 {1}。{2}{3}' -f $LASTEXITCODE, $目标, "`n", $远端错误)
 	}
 
 	function 构造-保活部署文本 {
@@ -1243,7 +980,7 @@ function 执行-扩展安装 {
 		)
 
 		# 单会话帧协议：一条 SSH 连接内完成 探测 → 等待本地备好阶段文件 → 逐帧上传 → 就地执行 全程。
-		# 远端引导体经 base64 编码后由 echo | base64 -d 写入远端临时文件再由 sh 执行（写文件而不在命令里内嵌正文，任何 POSIX 登录 shell 都能启动、彻底避开引号/括号转义问题；关键：sh 的 stdin 必须是 ssh 通道本身，帧循环才能收到后续帧——不能用 echo | base64 -d | sh，那样 sh 的 stdin 是脚本管道、读完即 EOF，帧循环秒退且看似成功）；Windows 远端没有 sh/base64 会立即失败，由调用方回退离散流程。
+		# 远端引导体经 base64 编码后由 echo | base64 -d 写入远端临时文件再由 sh 执行（写文件而不在命令里内嵌正文，任何 POSIX 登录 shell 都能启动、彻底避开引号/括号转义问题；关键：sh 的 stdin 必须是 ssh 通道本身，帧循环才能收到后续帧——不能用 echo | base64 -d | sh，那样 sh 的 stdin 是脚本管道、读完即 EOF，帧循环秒退且看似成功）；缺少 sh/base64 或连接失败会直接报错，不再回退离散流程。
 		# stdin 是帧通道，四类帧：__FILE__（<字节数>\n<裸名>\n<裸字节>，落盘 $HOME/）、__CMD__（一行命令静默执行，用于改名+写标记，帧序即“先文件后改名”的原子序，坏包/截断包永远不会被就位）、__RUN__（一行命令，后台起编排，输出继承会话 stdout 回传，结束时回传 __ORCH_EXIT__=N 退出码）、__EXIT__（收尾退循环）。编排运行期间帧循环不退，供给产物的上传帧可随时插入——单会话由主线程（读输出）与上传器线程（写帧）双工占用；写入仅由一方执行，无并发写入风险。
 		$帧循环 = $script:脚本_会话帧循环
 		$引导体 = ((取-环境探测命令) -replace "`r`n", "`n")
@@ -1297,13 +1034,13 @@ function 执行-扩展安装 {
 	function 读取-会话探测 {
 		param($会话)
 
-		# 读到 PROBE_END 为止返回全部输出行；到 EOF 都没见标记返回 $null（非 POSIX 远端或免密失败），由调用方回退离散流程
+		# 读到 PROBE_END 为止返回全部输出行；EOF 时也保留已读内容，供调用方显示服务器写在 stdout 的真实拒绝原因。
 		$行 = New-Object System.Collections.Generic.List[string]
 		while ($true) {
 			$文本 = $会话.标准输出.ReadLine()
-			if ($null -eq $文本) { return $null }
+			if ($null -eq $文本) { return [pscustomobject]@{ 完成 = $false; 行 = $行.ToArray() } }
 			$行.Add($文本)
-			if ($文本 -match 'PROBE_END') { return $行 }
+			if ($文本 -match 'PROBE_END') { return [pscustomobject]@{ 完成 = $true; 行 = $行.ToArray() } }
 		}
 	}
 
@@ -1456,11 +1193,11 @@ function 执行-扩展安装 {
 			[ValidateSet('部署', '移除')][string]$保活动作,
 			$竞速上下文,
 			[scriptblock]$每行回调,
-			# 单会话通道（非交互场景）：阶段文件从其 stdin 逐帧送入、就地执行；为 $null 或已退出时回退离散上传+执行
-			$会话
-		)
+		# 编排只走已建立的单会话；会话不可用时立即失败，不再另起离散上传。
+		$会话
+	)
 
-		# 一次批量上传 + 一次远程会话跑完全部阶段（sysroot → 安装 → 原生补丁 → 保活 → 清理）：慢速主机上每条 SSH 往返可达数十秒，逐阶段上传+执行的连接开销远超干活本身。未见「编排完成」标记（异常退出）时才在 finally 兜底清理远端暂存文件（失败无害）。
+		# 阶段文件经帧通道送入同一远程会话，依次执行 sysroot → 安装 → 原生补丁 → 保活 → 清理；未见「编排完成」标记时在 finally 兜底清理远端暂存文件。
 		$根目录 = $远程登录目录.TrimEnd('/', '\')
 		$暂存目录 = if ($null -ne $竞速上下文) { $竞速上下文.暂存目录 } else { '' }
 		$兼容性目录 = $根目录 + '/vscode-sysroot'
@@ -1501,26 +1238,15 @@ function 执行-扩展安装 {
 				& $落盘 'vsi-stage-renamer.js' $script:脚本_服务保活改名器
 			}
 
-			if ($null -ne $会话 -and -not $会话.进程.HasExited) {
-				# 单会话路径：阶段帧 + RUN 帧 + 供给交接帧 全走这一条连接，省掉独立上传/改名的每条连接开销
-				Write-Host '编排经单会话帧通道执行（全部阶段共用这一条连接）。'
-				$帧清单 = @()
-				foreach ($路径 in $上传清单) {
-					$帧清单 += @{ 路径 = $路径; 名 = [System.IO.Path]::GetFileName($路径) }
-				}
-				发送-会话阶段 -会话 $会话 -文件清单 $帧清单 -运行命令 'sh vsi-stage-orch.sh' -每行回调 $包装回调 -交接目录 $env:TEMP -交接匹配 ('race-supply-{0}-*.job' -f $提交号)
-			} else {
-				$会话状态 = if ($null -eq $会话) { '对象为空' } elseif ($会话.进程.HasExited) { ('进程已退出，退出码 ' + $会话.进程.ExitCode) } else { '进程仍在运行' }
-				Write-Host ('单会话不可用（{0}），编排回退离散上传+执行（多条连接）。' -f $会话状态)
-				if ($null -ne $会话) {
-					try {
-						$null = $会话.错误任务.Wait(1500)
-						if ($会话.错误任务.IsCompleted -and -not [string]::IsNullOrWhiteSpace($会话.错误任务.Result)) { Write-Host ('单会话错误流: {0}' -f ($会话.错误任务.Result.Trim())) }
-					} catch { }
-				}
-				上传-一批文件到远程 -本地路径 $上传清单.ToArray() -连接目标 $连接目标 -端口 $端口 -远程目录 $根目录
-				执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 'sh vsi-stage-orch.sh' -TTY -每行回调 $包装回调
+			if ($null -eq $会话) { throw '单会话不可用（对象为空），编排已中止，不再回退离散上传。' }
+			if ($会话.进程.HasExited) { throw ('单会话不可用（进程已退出，退出码 {0}），编排已中止。' -f $会话.进程.ExitCode) }
+			# 单会话路径：阶段帧 + RUN 帧 + 供给交接帧 全走这一条连接，省掉独立上传/改名的每条连接开销。
+			Write-Host '编排经单会话帧通道执行（全部阶段共用这一条连接）。'
+			$帧清单 = @()
+			foreach ($路径 in $上传清单) {
+				$帧清单 += @{ 路径 = $路径; 名 = [System.IO.Path]::GetFileName($路径) }
 			}
+			发送-会话阶段 -会话 $会话 -文件清单 $帧清单 -运行命令 'sh vsi-stage-orch.sh' -每行回调 $包装回调 -交接目录 $env:TEMP -交接匹配 ('race-supply-{0}-*.job' -f $提交号)
 		} finally {
 			Remove-Item -LiteralPath $本地目录 -Recurse -Force -ErrorAction SilentlyContinue
 			if ($null -ne $会话) {
@@ -1534,171 +1260,13 @@ function 执行-扩展安装 {
 		}
 	}
 
-	function 探测-远程系统类型 {
-		param(
-			[string]$连接目标,
-			[int]$端口
-		)
-
-		$ssh命令 = Get-Command ssh -ErrorAction SilentlyContinue | Select-Object -First 1
-		if ($null -eq $ssh命令) {
-			throw '未找到 ssh 命令，无法探测远程系统类型。'
-		}
-
-		# Windows 远程主机的默认 shell（cmd）没有 uname 命令，只有 Linux 会原样输出内核名与硬件架构。一次取回 uname -s 与 uname -m：Linux 侧同时拿到系统类型与原始架构（竞速所需）；Windows 主机执行 uname 必失败，其 stderr 在 PS 5.1 下会被提升为终止性错误，此处静默捕获并视为 Windows（Windows 架构另有探测路径），这是预期的判别路径
-		# -n 将 stdin 重定向为 NUL：老版 sshd（如 Win7 自带）在远程命令结束后仍会等待 stdin 关闭才断开会话，不加 -n 会永久挂起
-		try {
-			$输出 = & $ssh命令.Source (@('-n', '-p', $端口) + $script:SSH密码选项 + @($连接目标, 'uname -s; uname -m'))
-			$行列表 = @($输出 | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
-			if ($LASTEXITCODE -eq 0 -and $行列表.Contains('Linux')) {
-				# uname -m 的输出紧跟在 uname -s 后行，取 Linux 行的下一行作原始架构
-				$索引 = [array]::IndexOf($行列表, 'Linux')
-				$架构 = if (($索引 + 1) -lt $行列表.Count) { $行列表[$索引 + 1] } else { '' }
-				Write-Host ('检测到远程系统类型: Linux，原始架构: {0}' -f $架构)
-				return [pscustomobject]@{ 系统类型 = 'Linux'; 原始架构 = $架构 }
-			}
-
-			# uname 执行失败但认证已通过（LASTEXITCODE 非 0 但不是认证问题），视为 Windows
-			# 认证失败的退出码通常是 255，且伴随 Permission denied；此处简化处理：非 0 即 Windows
-			$win架构 = 探测-Windows架构 -连接目标 $连接目标 -端口 $端口
-			Write-Host ('检测到远程系统类型: Windows，原始架构: {0}' -f $win架构)
-			return [pscustomobject]@{ 系统类型 = 'Windows'; 原始架构 = $win架构 }
-		} catch {
-			# 已知且无害：Windows 无 uname 命令，失败即代表远程是 Windows
-			$win架构 = 探测-Windows架构 -连接目标 $连接目标 -端口 $端口
-			Write-Host ('检测到远程系统类型: Windows，原始架构: {0}' -f $win架构)
-			return [pscustomobject]@{ 系统类型 = 'Windows'; 原始架构 = $win架构 }
-		}
-	}
-
-	function 探测-Windows架构 {
-		param(
-			[string]$连接目标,
-			[int]$端口
-		)
-
-		# cmd 默认 shell 下 %PROCESSOR_ARCHITECTURE% 直接展开；远程默认 shell 是 PowerShell 时该语法也兼容（输出原样回显变量值不成立，但回退路径里 PS 版本单独探，这里只取 cmd 展开形态）。失败返回空串（只影响竞速启用，不影响安装）
-		$ssh命令 = Get-Command ssh -ErrorAction SilentlyContinue | Select-Object -First 1
-		if ($null -eq $ssh命令) { return '' }
-		try {
-			$输出 = @(& $ssh命令.Source (@('-n', '-p', $端口) + $script:SSH密码选项 + @($连接目标, 'echo %PROCESSOR_ARCHITECTURE%')))
-			if ($LASTEXITCODE -ne 0) { return '' }
-			foreach ($行 in $输出) {
-				$文本 = ([string]$行).Trim()
-				if ($文本 -match '^(AMD64|ARM64|x86|X64)$') { return $文本 }
-			}
-			return ''
-		} catch {
-			return ''
-		}
-	}
-
-	function 取-远程登录目录 {
-		param(
-			[string]$连接目标,
-			[int]$端口,
-			[string]$远程系统类型
-		)
-
-		# 取远程登录目录（scp 相对路径的基准目录），用于把上传目标拼成绝对路径，报错时能指明完整目标路径
-		$查询命令 = if ($远程系统类型 -eq 'Linux') {
-			'printf %s "$HOME"'
-		} else {
-			'powershell -NoProfile -Command "Write-Output $env:USERPROFILE"'
-		}
-
-		$ssh命令 = Get-Command ssh -ErrorAction SilentlyContinue | Select-Object -First 1
-		if ($null -eq $ssh命令) {
-			return ''
-		}
-
-		# 解析失败属可降级场景，返回空串由调用方退回相对路径，故不抛错
-		# -n 避免老版 sshd（如 Win7）在命令结束后等待 stdin 而挂起
-		try {
-			$输出 = @(& $ssh命令.Source (@('-n', '-p', $端口) + $script:SSH密码选项 + @($连接目标, $查询命令)))
-		} catch {
-			return ''
-		}
-
-		if ($LASTEXITCODE -ne 0) {
-			return ''
-		}
-
-		# 取最后一个非空行：登录横幅等杂项输出在前，真实目录在命令输出末尾
-		for ($序号 = $输出.Count - 1; $序号 -ge 0; $序号--) {
-			$文本 = ([string]$输出[$序号]).Trim().TrimEnd('/', '\')
-			if (-not [string]::IsNullOrWhiteSpace($文本)) {
-				return $文本
-			}
-		}
-
-		return ''
-	}
-
-	function 探测-远程PS版本 {
-		param(
-			[string]$连接目标,
-			[int]$端口
-		)
-
-		# -n 避免老版 sshd（如 Win7）在命令结束后等待 stdin 而挂起
-		$输出 = & (Get-Command ssh -ErrorAction SilentlyContinue | Select-Object -First 1).Source (@('-n', '-p', $端口) + $script:SSH密码选项 + @($连接目标, 'powershell -NoProfile -Command "Write-Output $PSVersionTable.PSVersion.Major"'))
-		if ($LASTEXITCODE -eq 0 -and $输出) {
-			foreach ($行 in $输出) {
-				$行 = $行.Trim()
-				# 跳过 SSH 诊断信息（CNAME 警告等）
-				if ($行 -match '^\d+$') {
-					$主版本 = [int]$行
-					Write-Host ('检测到远程 PowerShell 主版本: {0}' -f $主版本)
-					return $主版本
-				}
-			}
-		}
-
-		throw '无法从远程主机获取 PowerShell 版本。请确认远程主机已安装 PowerShell 且可通过 SSH 执行。'
-	}
-
-	function 执行-远程安装脚本 {
-	param(
-		[string]$连接目标,
-		[int]$端口,
-		[string]$脚本文本,
-		[string]$远程登录目录,
-		[scriptblock]$每行回调
-	)
-
-	$本地临时脚本路径 = Join-Path $env:TEMP ('临时安装-VSCode远程服务-{0}.ps1' -f ([guid]::NewGuid().ToString('N')))
-		$远程临时脚本文件名 = 'vscode-server-install-temp.ps1'
-		# 已知远程登录目录时上传目标用绝对路径，报错可直接显示完整目标路径；否则退回登录目录下的相对路径
-		$远程路径前缀 = if ([string]::IsNullOrWhiteSpace($远程登录目录)) { './' } else { $远程登录目录.TrimEnd('\', '/') + '\' }
-		$远程临时脚本路径 = $远程路径前缀 + $远程临时脚本文件名
-
-		try {
-			[System.IO.File]::WriteAllText($本地临时脚本路径, $脚本文本, [System.Text.UTF8Encoding]::new($true))
-			上传-文件到远程 -本地路径 $本地临时脚本路径 -连接目标 $连接目标 -端口 $端口 -远程路径 $远程临时脚本路径
-			执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('powershell -NoProfile -ExecutionPolicy Bypass -File "%USERPROFILE%\{0}"' -f $远程临时脚本文件名) -TTY -每行回调 $每行回调
-		} finally {
-			# 清理临时文件（无害操作，失败不影响主流程）
-			if (Test-Path $本地临时脚本路径) {
-				Remove-Item $本地临时脚本路径 -Force -ErrorAction SilentlyContinue
-			}
-
-			try {
-				# 远程默认 shell 可能是 PowerShell 也可能是 cmd，cmd 专属语法（del、2>nul）在 PowerShell 下会报错，统一用 powershell 包装，两种 shell 下都能正确执行且静默失败
-				执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 ('powershell -NoProfile -Command "Remove-Item $env:USERPROFILE\{0} -Force -ErrorAction SilentlyContinue"' -f $远程临时脚本文件名)
-			} catch {
-				# 远程清理失败不影响主流程，临时文件会被系统定期清理
-			}
-		}
-	}
-
 	function 初始化-竞速上下文-Windows单会话 {
 		param(
 			[string]$发布通道,
 			[string]$提交号
 		)
 
-		# Windows 单会话模式的竞速上下文：无需探测登录目录与架构——远端脚本自行推算暂存目录，本地供给用相对路径 scp；架构固定 win32-x64（PS2 老主机由引导版本门回退离散流程，其路径同样硬编码此架构；ARM64远端会在标记核对时拒收异架构包，改由远程自下载供给）
+		# Windows 单会话模式的竞速上下文：无需探测登录目录与架构——远端脚本自行推算暂存目录；架构固定 win32-x64，PS2 老主机由调用方直接报错，ARM64 包由远端标记核对拒收。
 		$架构标识 = 'win32-x64'
 		$数据目录名 = if ($发布通道 -eq 'insider') { '.vscode-server-insiders' } else { '.vscode-server' }
 		$服务端下载地址 = ('https://vscode.download.prss.microsoft.com/dbazure/download/{0}/{1}/vscode-server-{2}.zip' -f $发布通道, $提交号, $架构标识)
@@ -1793,7 +1361,7 @@ function 执行-扩展安装 {
 		#   ① 远端 sshd DefaultShell = powershell.exe（不是 cmd.exe，故无 8191 字符命令行上限）；
 		#   ② 远端读全量 stdin → 去掉一切空白 → base64 解码，2KB/40KB/120KB/400KB 四档的长度与 SHA256 双判据全部一致、退出码 0、单程约 1 秒（本地 PowerShell 在管道结束时关闭 ssh 的标准输入，EOF 确定送达，无需赌收尾）。
 		# 而旧做法实测致命：双重 base64 使 argv 达 37,950 字符 > CreateProcess 上限 32,767 → ssh.exe 拒绝启动（Program 'ssh.exe' failed to run: The filename or extension is too long）→ preconnect 退出码 1→Remote-SSH 判 PreconnectScriptFailure（Session Summary「预连接脚本已失败」）→ 整条连接夭折，窗口再也重连不上。
-		# 引导自带 PS2 版本门：命中打 __PS2__ 标记并退出 0，调用方据此回退离散流程。返回 '完成' 或 'PS2'。
+		# 引导自带 PS2 版本门：命中打 __PS2__ 标记，调用方直接报错；返回 '完成' 或 'PS2'。
 		$精简正文 = (($脚本文本 -split "`r?`n") | Where-Object { $_ -notmatch '^\s*#' -and $_.Trim() -ne '' }) -join "`n"
 		$压缩流 = New-Object System.IO.MemoryStream
 		$压缩器 = New-Object System.IO.Compression.GZipStream($压缩流, [System.IO.Compression.CompressionMode]::Compress)
@@ -1923,7 +1491,7 @@ function 执行-扩展安装 {
 	# **绝不 rm -rf 整目录**：暂存目录名只按提交号、不带连接唯一性，另一条并发连接可能正在往同一目录上传 <包名>.uploading，或在写 <包名>.downloading-<PID>（远端自下载的私有在途名），整删会让它们的改名发布步骤报「在途文件不在」而白白失去供给（Windows 侧实测已发生）。只清非在途项，在途文件留给收尾清理按 6 小时龄回收。
 	$竞速数据目录名 = if ($本地信息.发布通道 -eq 'insider') { '.vscode-server-insiders' } else { '.vscode-server' }
 	$竞速预备命令 = "sh -c 'D=`$HOME/{0}/race-{1}; mkdir -p `$D; for f in `$D/*; do [ -e `$f ] || continue; case `$f in *.uploading) continue;; *.downloading-*) continue;; esac; rm -rf `$f; done; exit 0'" -f $竞速数据目录名, $本地信息.提交号
-	# 非交互（preconnect）优先走单会话：探测/上传/执行一条连接全包（实测慢速主机每条独立连接 25s 会话开销）；Linux用 sh 引导，Windows 用 powershell -EncodedCommand 引导（脚本经 stdin）；建不起来或探测取不到结果时自然回退离散流程（交互式手动调用恒走离散，保留密码收集能力）
+	# 扩展只走单会话：Linux 用 sh 引导，Windows 用 powershell -EncodedCommand 引导（脚本经 stdin）；建立、探测或报告任一环节失败都直接报错，不回退离散流程。
 	$接管会话 = $null
 	$平台提示 = ''
 	if ($true) {
@@ -1931,7 +1499,7 @@ function 执行-扩展安装 {
 			$平台提示 = [string]$平台提示映射.$远程主机
 		} catch { }
 		if ($平台提示 -match '^(?i)windows') {
-			# ===== Windows 单会话全流程：探测/预备/安装/竞速监控/收尾一条 ssh 全包（离散流程要 4~7 条）；PS2老主机由引导版本门拦下，回退下方离散流程 =====
+			# Windows 仅支持通用单会话流程；遇到不支持的 PowerShell 版本时直接报错。
 			$单会话上下文 = 初始化-竞速上下文-Windows单会话 -发布通道 $本地信息.发布通道 -提交号 $本地信息.提交号
 			$远程安装脚本文本 = $script:远程脚本_通用.Replace('__提交号__', $本地信息.提交号).Replace('__发布通道__', $本地信息.发布通道).Replace('__暂存目录__', 'AUTO')
 			Write-Host ('远程连接目标: {0}' -f $连接目标)
@@ -1941,17 +1509,13 @@ function 执行-扩展安装 {
 				清除-SSH密码复用
 				return
 			}
-			Write-Host '远程 PowerShell 为 2.0（Win7 适配），回退离散安装流程。'
+			throw '远程 PowerShell 为 2.0（Win7 适配），当前扩展不支持该版本，安装已中止。'
 		} elseif ($平台提示 -notmatch '^(?i)windows') {
-			try {
-				$接管会话 = 建立-接管会话 -连接目标 $连接目标 -端口 $SSH端口 -预备命令 $竞速预备命令
-			} catch {
-				Write-Host ('单会话建立失败，回退离散流程：{0}' -f $_.Exception.Message)
-				$接管会话 = $null
-			}
+			# 会话建立失败原样抛出，保留 ssh 的真实错误，不再改走离散安装。
+			$接管会话 = 建立-接管会话 -连接目标 $连接目标 -端口 $SSH端口 -预备命令 $竞速预备命令
 		}
 	}
-	$环境 = 初始化-SSH会话 -连接目标 $连接目标 -端口 $SSH端口 -非交互:$true -附加命令 $竞速预备命令 -会话 $接管会话
+	$环境 = 初始化-SSH会话 -会话 $接管会话
 
 	Write-Host ('本机自动检测到的 VS Code 命令: {0}' -f $本地信息.命令路径)
 	Write-Host ('本机自动检测到的发布通道: {0}' -f $本地信息.发布通道)
@@ -1994,22 +1558,18 @@ function 执行-扩展安装 {
 		}
 		# 旧 glibc 兼容（官方 sysroot 妥协方案）：VS Code 1.99+ 的 server 要求 glibc >= 2.28，老系统（如 CentOS 7 glibc 2.17）需在家目录部署 sysroot 并注入 VSCODE_SERVER_CUSTOM_GLIBC_* 环境变量
 		$兼容性sysroot目录 = ''
-		# 合并环境探测已带回 glibc/内核则直接用（各免一轮 SSH 往返），缺失才退回单独探测
+		# glibc 必须来自同一次环境探测；缺失视为探测失败，不再另起逐项试探。
 		$glibc版本 = $环境.Glibc版本
-		if ($null -eq $glibc版本) { $glibc版本 = 探测-远程glibc版本 -连接目标 $连接目标 -端口 $SSH端口 }
-		if ($null -ne $glibc版本) {
-			Write-Host ('远程 glibc 版本: {0}' -f $glibc版本)
-		}
+		if ($null -eq $glibc版本) { throw '环境探测未返回 glibc 版本，安装已中止。' }
+		Write-Host ('远程 glibc 版本: {0}' -f $glibc版本)
 		if (($null -ne $glibc版本) -and ($glibc版本 -lt [version]'2.28')) {
 			if ([string]::IsNullOrWhiteSpace($环境.登录目录)) {
 				Write-Host '警告: 远程 glibc 过旧且登录目录未知，无法自动部署 sysroot；Remote-SSH 连接将因先决条件失败。'
 			} else {
-				# sysroot 妥协方案的硬性前提：glibc 2.28 的 loader 要求内核 ≥ 3.2，旧内核（如 CentOS 6 的 2.6.32）上 loader 启动即报 FATAL: kernel too old 拒绝加载任何程序，补丁与安装均无意义，先探明内核再决定是否继续
+				# sysroot 妥协方案的硬性前提：glibc 2.28 的 loader 要求内核 ≥ 3.2，旧内核（如 CentOS 6 的 2.6.32）上 loader 启动即报 FATAL: kernel too old 拒绝加载任何程序，补丁与安装均无意义。
 				$内核版本 = $环境.内核版本
-				if ($null -eq $内核版本) { $内核版本 = 探测-远程内核版本 -连接目标 $连接目标 -端口 $SSH端口 }
-				if ($null -ne $内核版本) {
-					Write-Host ('远程内核版本: {0}' -f $内核版本)
-				}
+				if ($null -eq $内核版本) { throw '旧 glibc 主机需要内核版本判定兼容性，但环境探测未返回内核版本，安装已中止。' }
+				Write-Host ('远程内核版本: {0}' -f $内核版本)
 				if (($null -ne $内核版本) -and ($内核版本 -lt [version]'3.2')) {
 					清除-SSH密码复用
 					throw ('远程内核 {0} 过旧：glibc 2.28 运行时要求内核不低于 3.2，旧内核上 loader 启动即报 FATAL: kernel too old 拒绝运行，sysroot 妥协方案无解（实测 /bin/ls 都无法加载）。请升级主机内核/系统，或对该主机改用支持旧内核的旧版 VS Code。' -f $内核版本)
@@ -2081,36 +1641,6 @@ function 执行-扩展安装 {
 	return
 }
 
-
-	# Windows 离散回退：扩展只走通用安装流程，不再为命令行兼容保留 Win7 手动下载回退。
-	$远程安装脚本 = $script:远程脚本_通用
-	$竞速上下文 = $null
-	$每行回调 = $null
-	$本地供给容器 = New-Object System.Collections.ArrayList
-	$竞速上下文 = 初始化-竞速上下文 -环境 $环境 -发布通道 $本地信息.发布通道 -提交号 $本地信息.提交号
-	if ($null -ne $竞速上下文) {
-		Write-Host ('已启用竞速模式：本地子进程下载+上传 与 远程自下载并行，暂存目录 {0}（远端产物已就位时本轮零下载，自动跳过竞速）' -f $竞速上下文.暂存目录)
-		$回调包 = 新建-供给回调 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型
-		$每行回调 = $回调包.回调
-		$本地供给容器 = $回调包.供给容器
-	} else {
-		Write-Host '未启用竞速模式（登录目录或远程架构无法确定），由远程单独下载。'
-	}
-
-	# 替换通用安装脚本的版本与暂存目录占位符
-	$远程安装脚本 = $远程安装脚本.Replace('__提交号__', $本地信息.提交号)
-	$远程安装脚本 = $远程安装脚本.Replace('__发布通道__', $本地信息.发布通道)
-	$远程安装脚本 = $远程安装脚本.Replace('__暂存目录__', $(if ($null -ne $竞速上下文) { $竞速上下文.暂存目录 } else { '' }))
-
-	try {
-		执行-远程安装脚本 -连接目标 $连接目标 -端口 $SSH端口 -脚本文本 $远程安装脚本 -远程登录目录 $环境.登录目录 -每行回调 $每行回调
-	} finally {
-		# 供给收尾即可：远端暂存目录由安装脚本启动时自清建、收尾自清，不再为此单独占连接
-		等待-供给进程并回收日志 -供给 @($本地供给容器.ToArray())
-	}
-	清除-SSH密码复用
 }
-
-
 
 执行-扩展安装 -远程主机 $远程主机 -本地版本 $本地版本 -仅服务保活:$仅服务保活 -移除服务保活:$移除服务保活 -含服务保活:$含服务保活 -平台提示映射 $平台提示映射
