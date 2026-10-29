@@ -84,7 +84,7 @@ log() {
 	echo "$*"
 }
 
-# 事件行输出（下载失败/重试等中断提示）：与 Windows 侧同一个「单一时钟」规则——汇报周期既是打印节奏也是重试节奏。一次中断恒为一条消息（每轮只调一次，各源的细节由调用方并进同一条正文，不另起行），打印即重启汇报时钟；同时把「到下个汇报点还差多少秒」写进 EVENT_SLEEP_NEXT 供调用方 sleep（下限 1 秒），于是重试就在下个汇报周期：一次耗时几十秒的尝试本身已消耗一个周期（差值为负则立即重试），不在其上再叠一段固定等待；只由调用方在「本轮毫无进展」时 EVENT_INTERVAL 放宽一档，放宽不设上限（中途越糟间隔越长；仍禁止旧的「翻倍 + 封顶 30 秒」与任何形式的固定上限）。心跳行（race_artifact）与时钟无关地按周期报已传字节数，故源端爬行期报 0 字节也不会死寂。
+# 事件行输出（下载失败/重试等中断提示）：与 Windows 侧同一个「单一时钟」规则——汇报周期既是打印节奏也是重试节奏。一次中断恒为一条消息（每轮只调一次，各源的细节由调用方并进同一条正文，不另起行）；异常先记录，EVENT_SLEEP_NEXT 到下个汇报点的剩余等待（下限 1 秒），等待结束才打印并立即重试，不在异常瞬间抢先打印，也不在汇报后再叠一段固定等待；只由调用方在「本轮毫无进展」时 EVENT_INTERVAL 放宽一档，放宽不设上限（中途越糟间隔越长；仍禁止旧的「翻倍 + 封顶 30 秒」与任何形式的固定上限）。心跳行（race_artifact）与时钟无关地按周期报已传字节数，故源端爬行期报 0 字节也不会死寂。
 # POSIX sh 无局部变量，门控状态一律用 EVENT_ 前缀的独特全局名，避免与调用方变量互相覆盖（教训：循环变量曾覆盖同名配置变量）。
 EVENT_REPORT_AT=0
 EVENT_INTERVAL=1
@@ -102,9 +102,10 @@ log_event() {
 	fi
 	# 原因可能自带尾句号，直接拼分隔符会出现「…字节。，」这种错标点，先剥尾部标点
 	EVENT_REASON=$(printf '%s' "$1" | sed 's/[。，、；！;.!]*$//')
-	# 措辞不再用「下个汇报周期」（本行自己就是本轮的汇报，再说“下次汇报”会让人以为 N 秒是过时值）；EVENT_SLEEP_NEXT 就是从本行打印的此刻算起、调用方紧接着 sleep 的真实剩余秒数
-	log "$EVENT_REASON。$EVENT_SLEEP_NEXT 秒后续传重试"
-	EVENT_REPORT_AT=$EVENT_NOW
+	# 异常先记录，等到下个汇报周期再打印；打印后立即续传，不在汇报后再叠等待。
+	sleep "$EVENT_SLEEP_NEXT"
+	log "$EVENT_REASON（上个汇报周期内发生）。本次汇报即续传重试"
+	EVENT_REPORT_AT=$(date +%s)
 }
 
 # 竞速暂存目录清理（并发安全）：绝不 rm -rf 整目录——另一条并发连接（同主机同提交号，staging 名相同）可能正在传 <包名>.uploading，或在写 <包名>.downloading-<PID>（本端自下载的私有在途名），整删会让它的改名步骤报「在途文件不在」而失去供给。只清非在途项（残留完成/取消标记会让本轮误判胜负，完整包本轮要重新竞速），在途文件超过 6 小时未动（死连接遗留）才顺手清掉防堆积。
@@ -223,7 +224,6 @@ run_remote_download() {
 			EVENT_INTERVAL=$((EVENT_INTERVAL + 1))
 		fi
 		log_event "[远程自下载-服务端] 第 $CLI_ATTEMPT 次下载失败（$SRC_TOTAL 个源均未取到，${ROUND_NOTE}残留已清理）"
-		sleep "$EVENT_SLEEP_NEXT"
 	done
 }
 
@@ -267,7 +267,6 @@ run_remote_cli_download() {
 		fi
 		# 失败与重试合并为一条事件行（旧写法每轮刷「清理残留」+「等待重试」+「第 N 次尝试」共 3 行）
 		log_event "[远程自下载-CLI] 第 $CLI_ATTEMPT 次 CLI 下载失败（${ROUND_NOTE}残留已清理）"
-		sleep "$EVENT_SLEEP_NEXT"
 	done
 }
 
@@ -414,7 +413,6 @@ install_cli() {
 			EVENT_INTERVAL=$((EVENT_INTERVAL + 1))
 		fi
 		log_event "[远程自下载-CLI] 第 $CLI_ATTEMPT 次 CLI 补装下载失败（残留已清理）"
-		sleep "$EVENT_SLEEP_NEXT"
 	done
 }
 
