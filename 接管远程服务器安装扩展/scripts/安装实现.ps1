@@ -610,12 +610,16 @@ function 执行-扩展安装 {
 				$文本 = 剥离-终端控制序列 $文本行
 				# 远端 powershell 在非控制台 stdio 下会把进度记录序列化成 CLIXML 噪声，滤掉不进日志
 				if ($文本 -match '^(#< CLIXML|<Objs|</Objs>)') { return }
-				Write-Host $文本
-				if ($每行回调) { & $每行回调 $文本 }
+				if (-not (登记-竞速快照 $文本)) {
+					Write-Host $文本
+					if ($每行回调) { & $每行回调 $文本 }
+				}
 				转发-供给日志
+				推进-统一竞速汇报
 			}
 			$读任务 = $进程.StandardOutput.ReadLineAsync()
 			while ($true) {
+				推进-统一竞速汇报
 				if ($读任务.Wait(500)) {
 					$行 = $读任务.Result
 					if ($null -eq $行) { break }    # 读到 null = 远端标准输出已关闭
@@ -778,7 +782,30 @@ function 执行-扩展安装 {
 			[string]$系统类型
 		)
 
-		# 供给以独立子 powershell 进程运行（不再是 Start-Job 的同进程 runspace）：Start-Job 无法中断阻塞的网络调用，而子进程可在任意步骤被 taskkill /T /F 连同其派生的 ssh/scp 一起终止，实现真正的零轮询即时取消。本函数只启动调用方传入的产物清单；CLI 与服务端由回调按远端竞速顺序逐个传入，sysroot 素材则可按独立阶段批量传入。参数经 Clixml 文件传入子进程（避开命令行转义与 PS 5.1 原生 stderr 陷阱）；stdout/stderr 重定向到日志文件，收尾时回收打印。返回供给对象数组：{产物名;进程;日志路径;错误路径;参数文件路径}。
+		# 供给以独立子 powershell 进程运行（不再是 Start-Job 的同进程 runspace）：Start-Job 无法中断阻塞的网络调用，而子进程可在任意步骤被 taskkill /T /F 连同其派生的 ssh/scp 一起终止，实现真正的零轮询即时取消。CLI 与服务端交给同一个组合协调器同时启动、共享汇报周期；sysroot 素材仍按独立产物供给。参数经 Clixml 文件传入子进程（避开命令行转义与 PS 5.1 原生 stderr 陷阱）；stdout/stderr 重定向到日志文件，收尾时回收打印。
+		$组合产物 = @($竞速上下文.产物列表 | Where-Object { $_.产物名 -in @('CLI', '服务端') })
+		if ($组合产物.Count -eq @($竞速上下文.产物列表).Count -and $组合产物.Count -gt 0) {
+			$控制目录 = Join-Path $env:TEMP ('race-coordinator-' + ([guid]::NewGuid().ToString('N')))
+			$null = New-Item -ItemType Directory -Force -Path $控制目录
+			$参数文件 = Join-Path $控制目录 '组合参数.xml'
+			$配置列表 = @($组合产物 | ForEach-Object {
+				[pscustomobject]@{
+					产物名 = $_.产物名; 连接目标 = $连接目标; 端口 = $端口; 密码选项 = @($script:SSH密码选项); 暂存目录 = $竞速上下文.暂存目录
+					下载地址列表 = @($_.下载地址列表); 本地文件名 = [string]$_.本地文件名; 远程包名 = $_.远程包名; 完成标记名 = $_.完成标记名; 取消标记名 = $_.取消标记名
+					系统类型 = $系统类型; 分隔符 = $竞速上下文.分隔符; 提交号 = $竞速上下文.提交号; 架构标识 = $竞速上下文.架构标识; 父进程ID = $PID
+				}
+			})
+			[pscustomobject]@{ 控制目录 = $控制目录; 产物列表 = $配置列表 } | Export-Clixml -LiteralPath $参数文件
+			$日志文件 = Join-Path $env:TEMP ('race-supply-log-{0}.txt' -f ([guid]::NewGuid().ToString('N')))
+			$错误文件 = Join-Path $env:TEMP ('race-supply-err-{0}.txt' -f ([guid]::NewGuid().ToString('N')))
+			$协调脚本 = Join-Path $script:模块根目录 'private\local-race-coordinator.ps1'
+			$powershell命令 = Get-Command powershell -ErrorAction SilentlyContinue | Select-Object -First 1
+			$powershellExe = if ($powershell命令) { $powershell命令.Source } else { 'powershell.exe' }
+			$进程 = Start-Process -FilePath $powershellExe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $协调脚本), ('"{0}"' -f $参数文件)) -RedirectStandardOutput $日志文件 -RedirectStandardError $错误文件 -WindowStyle Hidden -PassThru
+			[void]$script:供给日志登记.Add([pscustomobject]@{ 产物名 = '组合'; 路径 = $日志文件; 已读字节 = [long]0; 残段 = '' })
+			[void]$script:供给日志登记.Add([pscustomobject]@{ 产物名 = '组合'; 路径 = $错误文件; 已读字节 = [long]0; 残段 = '' })
+			return [pscustomobject]@{ 产物名 = '组合'; 进程 = $进程; 日志路径 = $日志文件; 错误路径 = $错误文件; 参数文件路径 = $参数文件; 控制目录 = $控制目录 }
+		}
 		$供给列表 = @()
 		foreach ($产物 in $竞速上下文.产物列表) {
 			$参数文件 = Join-Path $env:TEMP ('race-supply-param-{0}.xml' -f ([guid]::NewGuid().ToString('N')))
@@ -846,6 +873,19 @@ function 执行-扩展安装 {
 		}
 	}
 
+	function 停止-指定产物供给 {
+		param($供给, [string]$产物名)
+		# 组合协调器用逐产物停止文件只结束对应下载；独立供给仍直接终止进程树。
+		foreach ($单个 in @($供给)) {
+			if ($单个.产物名 -eq '组合' -and -not [string]::IsNullOrWhiteSpace([string]$单个.控制目录)) {
+				$null = New-Item -ItemType Directory -Force -Path $单个.控制目录 -ErrorAction SilentlyContinue
+				Set-Content -LiteralPath (Join-Path $单个.控制目录 ($产物名 + '.stop')) -Value '停止' -Encoding ASCII -ErrorAction SilentlyContinue
+			} elseif ($单个.产物名 -eq $产物名) {
+				停止-供给进程树 -供给 $单个
+			}
+		}
+	}
+
 	function 转发-供给日志 {
 		param([switch]$收尾)
 
@@ -869,18 +909,21 @@ function 执行-扩展安装 {
 			$登记.残段 = $段落[$段落.Count - 1]
 			if ($段落.Count -gt 1) {
 				foreach ($行 in $段落[0..($段落.Count - 2)]) {
-					Write-Host ('[本地供给-{0}] {1}' -f $登记.产物名, $行)
+					if (登记-竞速快照 $行) { continue }
+					if ($行 -match '^\[本地供给-(?<产物>CLI|服务端)\].*本地下载完成') { 完成-竞速端点 '本地' $Matches['产物'] }
+					if ($行 -match '^\[本地供给-') { Write-Host $行 } else { Write-Host ('[本地供给-{0}] {1}' -f $登记.产物名, $行) }
 				}
 			}
 		}
 		if ($收尾) {
 			foreach ($登记 in @($script:供给日志登记)) {
 				if (-not [string]::IsNullOrEmpty($登记.残段)) {
-					Write-Host ('[本地供给-{0}] {1}' -f $登记.产物名, $登记.残段)
+					if ($登记.残段 -match '^\[本地供给-') { Write-Host $登记.残段 } else { Write-Host ('[本地供给-{0}] {1}' -f $登记.产物名, $登记.残段) }
 					$登记.残段 = ''
 				}
 			}
 		}
+		推进-统一竞速汇报
 	}
 
 	function 刷新-接管输出缓冲 {
@@ -1104,8 +1147,11 @@ function 执行-扩展安装 {
 					break
 				}
 				$净化 = 剥离-终端控制序列 $文本行
-				Write-Host $净化
-				if ($每行回调) { & $每行回调 $净化 }
+				if (-not (登记-竞速快照 $净化)) {
+					Write-Host $净化
+					if ($每行回调) { & $每行回调 $净化 }
+				}
+				推进-统一竞速汇报
 			}
 		} finally {
 			# 先送 EXIT 再停上传器：上传器可能正在写遗留供给的大帧，先停会卡在等帧写完；EXIT 或随后的 stdin 关闭（EOF）都会让远端帧循环退出
@@ -1285,6 +1331,71 @@ function 执行-扩展安装 {
 		}
 	}
 
+	function 初始化-统一竞速汇报 {
+		param([string[]]$产物列表)
+		$状态 = @{}
+		foreach ($产物名 in $产物列表) {
+			$状态[$产物名] = @{ 完成 = $false; 本地 = @{ 已下载 = 0L; 总长度 = 0L; 完成 = $false }; 远程 = @{ 已下载 = 0L; 总长度 = 0L; 完成 = $false } }
+		}
+		$script:统一竞速汇报 = @{ 活跃 = $true; 周期 = 1; 起始时刻 = Get-Date; 下次汇报时刻 = (Get-Date).AddSeconds(1); 状态 = $状态 }
+	}
+
+	function 登记-竞速快照([string]$行) {
+		if (-not $行.StartsWith('__VSI_SNAPSHOT__')) { return $false }
+		if ($null -eq $script:统一竞速汇报) { return $true }
+		try {
+			$快照 = $行.Substring(16) | ConvertFrom-Json
+			$产物名 = [string]$快照.产物
+			$端 = [string]$快照.端
+			if ($script:统一竞速汇报.状态.ContainsKey($产物名) -and $script:统一竞速汇报.状态[$产物名].ContainsKey($端)) {
+				$script:统一竞速汇报.状态[$产物名][$端].已下载 = [long]$快照.已下载
+				$script:统一竞速汇报.状态[$产物名][$端].总长度 = [long]$快照.总长度
+			}
+		} catch { }
+		return $true
+	}
+
+	function 完成-竞速产物([string]$产物名) {
+		if ($null -ne $script:统一竞速汇报 -and $script:统一竞速汇报.状态.ContainsKey($产物名)) {
+			$script:统一竞速汇报.状态[$产物名].完成 = $true
+		}
+	}
+	function 完成-竞速端点([string]$端, [string]$产物名) {
+		if ($null -ne $script:统一竞速汇报 -and $script:统一竞速汇报.状态.ContainsKey($产物名)) {
+			$script:统一竞速汇报.状态[$产物名][$端].完成 = $true
+		}
+	}
+
+	function 推进-统一竞速汇报 {
+		if ($null -eq $script:统一竞速汇报 -or -not $script:统一竞速汇报.活跃 -or (Get-Date) -lt $script:统一竞速汇报.下次汇报时刻) { return }
+		$意见 = @()
+		foreach ($产物名 in @('CLI', '服务端')) {
+			if (-not $script:统一竞速汇报.状态.ContainsKey($产物名)) { continue }
+			$产物状态 = $script:统一竞速汇报.状态[$产物名]
+			if ($产物状态.完成) { continue }
+			foreach ($端 in @('本地', '远程')) {
+				$快照 = $产物状态[$端]
+				if ($快照.完成) { continue }
+				$标签 = if ($端 -eq '本地') { '本地供给' } else { '远程自下载' }
+				$句式 = if ($端 -eq '本地') { '本地下载进度' } else { '远程下载进度' }
+				if ($快照.总长度 -gt 0) {
+					$百分比 = [Math]::Round($快照.已下载 * 100.0 / $快照.总长度, 1)
+					Write-Host ('[{0}-{1}] {2}：{3} / {4} 字节（{5}%）' -f $标签, $产物名, $句式, $快照.已下载, $快照.总长度, $百分比)
+				} else {
+					Write-Host ('[{0}-{1}] {2}：已传 {3} 字节' -f $标签, $产物名, $句式, $快照.已下载)
+				}
+			}
+			$已下载 = [Math]::Max([long]$产物状态.本地.已下载, [long]$产物状态.远程.已下载)
+			$总长度 = [Math]::Max([long]$产物状态.本地.总长度, [long]$产物状态.远程.总长度)
+			$已用秒 = ((Get-Date) - $script:统一竞速汇报.起始时刻).TotalSeconds
+			$周期 = $script:统一竞速汇报.周期
+			if ($总长度 -gt 0 -and $已下载 -gt 0 -and (($总长度 - $已下载) * $已用秒 * 2 -lt $周期 * ($周期 - 1) * $已下载)) { $意见 += -1 } else { $意见 += 1 }
+		}
+		if ($意见.Count -eq 0) { $script:统一竞速汇报.活跃 = $false; return }
+		if ($意见 -contains 1) { $script:统一竞速汇报.周期++ } elseif (@($意见 | Where-Object { $_ -ne -1 }).Count -eq 0) { $script:统一竞速汇报.周期 = [Math]::Max(1, $script:统一竞速汇报.周期 - 1) }
+		$script:统一竞速汇报.下次汇报时刻 = (Get-Date).AddSeconds($script:统一竞速汇报.周期)
+	}
+
 	function 新建-供给回调 {
 		param(
 			[pscustomobject]$竞速上下文,
@@ -1293,56 +1404,34 @@ function 执行-扩展安装 {
 			[string]$系统类型
 		)
 
-		# 本地供给与远端使用同一产物顺序：预备后只启动第一个待装产物，收到该产物的决出行才启动下一个；同一产物内部仍是本地与远程并行竞速。
+		# 预备完成后 CLI 与服务端同时交给组合协调器；产物各自判胜、各自停止，另一产物继续下载。
 		$供给容器 = New-Object System.Collections.ArrayList
-		$待启动队列 = New-Object System.Collections.ArrayList
 		$已启动产物 = New-Object 'System.Collections.Generic.HashSet[string]'
 		$调度状态 = @{ 已结束 = $false }
 		$启动动作 = ${function:启动-本地竞速供给}
 		$停止动作 = ${function:停止-供给进程树}
-		$启动下一产物 = {
-			if ($调度状态.已结束 -or $待启动队列.Count -eq 0) { return }
-			$产物名 = [string]$待启动队列[0]
-			$待启动队列.RemoveAt(0)
-			$子上下文 = [pscustomobject]@{
-				暂存目录 = $竞速上下文.暂存目录
-				包扩展名 = $竞速上下文.包扩展名
-				提交号 = $竞速上下文.提交号
-				分隔符 = $竞速上下文.分隔符
-				架构标识 = $竞速上下文.架构标识
-				产物列表 = @($竞速上下文.产物列表 | Where-Object { $_.产物名 -eq $产物名 })
-			}
-			foreach ($单个 in (& $启动动作 -竞速上下文 $子上下文 -连接目标 $连接目标 -端口 $端口 -系统类型 $系统类型)) {
-				[void]$供给容器.Add($单个)
-			}
-			[void]$已启动产物.Add($产物名)
-		}.GetNewClosure()
+		$停止产物动作 = ${function:停止-指定产物供给}
+		$初始化汇报动作 = ${function:初始化-统一竞速汇报}
+		$完成汇报动作 = ${function:完成-竞速产物}
 		$回调 = {
 			param($行)
 			if (-not $调度状态.已结束 -and $行 -match '^__接管预备完成__(.*)$') {
 				$待装列表 = @($Matches[1] -split '\s+' | Where-Object { $_ })
-				foreach ($产物 in $竞速上下文.产物列表) {
-					if (($待装列表 -contains $产物.产物名) -and -not $已启动产物.Contains($产物.产物名) -and -not $待启动队列.Contains($产物.产物名)) {
-						[void]$待启动队列.Add([string]$产物.产物名)
-					}
+				& $初始化汇报动作 -产物列表 $待装列表
+				$待装上下文 = [pscustomobject]@{
+					暂存目录 = $竞速上下文.暂存目录; 包扩展名 = $竞速上下文.包扩展名; 提交号 = $竞速上下文.提交号; 分隔符 = $竞速上下文.分隔符; 架构标识 = $竞速上下文.架构标识
+					产物列表 = @($竞速上下文.产物列表 | Where-Object { ($待装列表 -contains $_.产物名) -and -not $已启动产物.Contains($_.产物名) })
 				}
-				& $启动下一产物
+				foreach ($单个 in (& $启动动作 -竞速上下文 $待装上下文 -连接目标 $连接目标 -端口 $端口 -系统类型 $系统类型)) { [void]$供给容器.Add($单个) }
+				foreach ($产物 in $待装上下文.产物列表) { [void]$已启动产物.Add([string]$产物.产物名) }
 			}
 			if ($行 -match '竞速获胜|本轮零下载') {
 				$调度状态.已结束 = $true
-				$待启动队列.Clear()
 				& $停止动作 -供给 @($供给容器.ToArray())
 			}
-			# 本地或远程任一方决出当前产物，都推进到下一个产物；远程获胜时同时停止该产物的本地供给，保留按产物即时止损。
 			if (-not $调度状态.已结束 -and $行 -match '竞速决出：(?<产物>[^\s]+?)\s*由(?<获胜方>远程自下载|本地供给)获胜') {
-				$产物名 = $Matches['产物']
-				if ($Matches['获胜方'] -eq '远程自下载') {
-					& $停止动作 -供给 @($供给容器.ToArray() | Where-Object { $_.产物名 -eq $产物名 })
-				}
-				for ($i = $待启动队列.Count - 1; $i -ge 0; $i--) {
-					if ([string]$待启动队列[$i] -eq $产物名) { $待启动队列.RemoveAt($i) }
-				}
-				& $启动下一产物
+				& $完成汇报动作 $Matches['产物']
+				if ($Matches['获胜方'] -eq '远程自下载') { & $停止产物动作 -供给 @($供给容器.ToArray()) -产物名 $Matches['产物'] }
 			}
 		}.GetNewClosure()
 		return [pscustomobject]@{ 回调 = $回调; 供给容器 = $供给容器 }
@@ -1587,7 +1676,7 @@ function 执行-扩展安装 {
 		$每行回调 = $null
 		if ($null -ne $竞速上下文) {
 			Write-Host ('已启用竞速模式：本地子进程下载+上传 与 远程自下载并行，暂存目录 {0}（远端产物已就位时本轮零下载，自动跳过竞速）' -f $竞速上下文.暂存目录)
-			# sysroot 素材属于安装前的独立阶段，保持原有供给；CLI 与服务端改由预备标记和决出行驱动，与远端一样逐个启动。
+			# sysroot 素材属于安装前的独立阶段；CLI 与服务端由预备标记一次性同时启动，进度快照汇入 preconnect 的单一共享汇报器。
 			$素材上下文 = [pscustomobject]@{
 				暂存目录 = $竞速上下文.暂存目录
 				包扩展名 = $竞速上下文.包扩展名
@@ -1604,6 +1693,7 @@ function 执行-扩展安装 {
 			$回调包 = 新建-供给回调 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型
 			$调度回调 = $回调包.回调
 			$停止供给动作 = ${function:停止-供给进程树}
+			$停止产物动作 = ${function:停止-指定产物供给}
 			$每行回调 = {
 				param($行)
 				& $调度回调 $行
@@ -1611,8 +1701,7 @@ function 执行-扩展安装 {
 					& $停止供给动作 -供给 @($本地供给.ToArray())
 				}
 				if ($行 -match '竞速决出：(?<产物>[^\s]+?)\s*由远程自下载获胜') {
-					$产物名 = $Matches['产物']
-					& $停止供给动作 -供给 @($本地供给.ToArray() | Where-Object { $_.产物名 -eq $产物名 })
+					& $停止产物动作 -供给 @($本地供给.ToArray()) -产物名 $Matches['产物']
 				}
 			}.GetNewClosure()
 		} else {

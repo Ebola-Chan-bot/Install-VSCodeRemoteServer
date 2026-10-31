@@ -139,9 +139,16 @@ cleanup_staging() {
 download_file() {
 	url="$1"
 	output="$2"
+	rm -f "$output.headers" "$output.length"
 	if [ "$DOWNLOADER" = 'curl' ]; then
-		# curl 默认往 stderr 打英文进度条（回车刷屏文案），会污染输出流；-s 静音进度条、-S 仍显示错误
-		curl -fsSL --connect-timeout 30 -o "$output" "$url"
+		# curl 默认往 stderr 打英文进度条（回车刷屏文案），会污染输出流；-s 静音进度条、-S 仍显示错误；响应头中的长度供共享汇报器显示百分比。
+		curl -fsSL --connect-timeout 30 -D "$output.headers" -o "$output" "$url"
+		DL_RC=$?
+		if [ -f "$output.headers" ]; then
+			DL_LENGTH=$(awk 'BEGIN { IGNORECASE=1 } /^Content-Length:/ { gsub("\\r", "", $2); value=$2 } END { print value }' "$output.headers")
+			case "$DL_LENGTH" in ''|*[!0-9]*) ;; *) echo "$DL_LENGTH" > "$output.length" ;; esac
+		fi
+		return "$DL_RC"
 	else
 		wget -q -O "$output" "$url"
 	fi
@@ -170,7 +177,6 @@ echo "发布通道: $CHANNEL"
 echo "自动检测到的系统架构: $ARCH"
 echo "自动检测到的安装目录: $INSTALL_DIR"
 echo "下载工具: $DOWNLOADER"
-echo "CLI 下载地址: $CLI_URL"
 
 # ===== 下载与竞速原语（sh 逐行解释执行，函数必须定义在所有调用点之前）=====
 
@@ -270,19 +276,19 @@ run_remote_cli_download() {
 	done
 }
 
-# 竞速单个产物：后台远程自下载 与 本地下载+上传（由本地模块负责）并行，先完成者获胜。$1=产物名 $2=远程包路径 $3=远程完成标记 $4=本地包路径 $5=本地完成标记 $6=本地取消标记 $7=远程后台下载函数名（空串=远程不下载）
-# 返回后 RACE_WINNER_SIDE（remote/local）与 RACE_WINNER_PKG（获胜包路径）有效
-race_artifact() {
-	RACE_WINNER_SIDE=''
-	RACE_WINNER_PKG=''
+# 启动单个产物竞速；统一协调器随后同时监控 CLI 与服务端。启动结果经 RACE_START_* 返回。
+start_race_artifact() {
+	RACE_START_READY=0
+	RACE_START_PID=''
+	RACE_START_PKG=''
 	# 清理本端上一轮残留：只删标记（残留标记 = 假获胜）与不完整的成品；本地包与本地标记由本地供给任务管理，不在此处删（可能已先于本脚本完成）
 	rm -f "$3" "$6"
 	# 成品已完整则直接获胜（存在即视为完成）：staging 按提交号命名，同名即同版本，而成品如今只由「校验通过后才改名发布」产生。实测 190MB 包在慢网下两边各下一遍纯属浪费带宽；旧版直接写成品名留下的截断半成品会在这里被 gzip -t 判为不完整而重下
 	if [ -s "$2" ] && gzip -t "$2" 2>/dev/null; then
 		touch "$3"
 		touch "$6"
-		RACE_WINNER_SIDE='remote'
-		RACE_WINNER_PKG="$2"
+		RACE_START_READY=1
+		RACE_START_PKG="$2"
 		log "[远程自下载-$1] 远端已有完整自下载成品（$(wc -c < "$2" 2>/dev/null | tr -d ' ') 字节），直接判远程自下载获胜，跳过重复下载。"
 		# 与下面正常决出路径同一事件行格式：主模块回调按「竞速决出：X 由远程自下载获胜」按产物粒度击杀对应本地供给；缺这行时本路径直接 return，本地供给会把已无用的包白下完
 		log "竞速决出：$1 由远程自下载获胜（用包 $(basename "$2")）。"
@@ -298,61 +304,86 @@ race_artifact() {
 		log "[远程自下载-$1] 本端缺少 curl/wget 不参与下载，只等本地供给。"
 	fi
 
-	ELAPSED=0
-	# 远端进度心跳无产物总大小可比对（只报已传字节数），报告周期只增不减（每次报告后加 1 秒，不设上限）；心跳与时钟无关地报当下字节数，一个字节都没落地时就报 0，故爬行期不死寂
-	REPORT_PERIOD=1
-	NEXT_REPORT=$REPORT_PERIOD
-	while true; do
-		if [ -f "$3" ]; then
-			RACE_WINNER_SIDE='remote'
-			break
-		fi
-		if [ -f "$5" ]; then
-			RACE_WINNER_SIDE='local'
-			break
-		fi
-		sleep 1
-		ELAPSED=$((ELAPSED + 1))
-		if [ "$ELAPSED" -ge "$NEXT_REPORT" ]; then
-			if [ -n "$7" ]; then
-				RSIZE=0
-				# 成品名只在下载完成的那一瞬才出现，进度必须看本会话的私有在途名（并取同产物各在途副本的最大值，避免报 0）
-				for RF in "$2" "$2".downloading-*; do
-					[ -e "$RF" ] || continue
-					RSZ=$(wc -c < "$RF" 2>/dev/null | tr -d ' ')
-					case "$RSZ" in ''|*[!0-9]*) RSZ=0 ;; esac
-					if [ "$RSZ" -gt "$RSIZE" ]; then
-						RSIZE=$RSZ
-					fi
-				done
-				# 该平台远程自下载的输出被静音（curl 进度条是英文噪声），本心跳是唯一的远端进度来源：用统一句式的总量未知形态，不带竞速等待后缀；进度行不带内嵌时间戳，故不经 log 前缀；[远程自下载-产物名] 端标注与本地侧 [本地供给-产物名] 对称
-				echo "[远程自下载-$1] 远程下载进度：已传 ${RSIZE} 字节"
-			else
-				log "[远程自下载-$1] 竞速等待 ${ELAPSED}s：本端不参与下载，只等本地供给。"
-			fi
-			REPORT_PERIOD=$((REPORT_PERIOD + 1))
-			NEXT_REPORT=$((ELAPSED + REPORT_PERIOD))
+	RACE_START_PID="$DL_PID"
+}
+
+# 读取一个产物的当前在途字节与已知总长度，供统一汇报器使用。
+race_measure() {
+	RACE_CUR_SIZE=0
+	RACE_CUR_TOTAL=0
+	for RACE_MF in "$1" "$1".downloading-*; do
+		[ -e "$RACE_MF" ] || continue
+		RACE_MS=$(wc -c < "$RACE_MF" 2>/dev/null | tr -d ' ')
+		case "$RACE_MS" in ''|*[!0-9]*) RACE_MS=0 ;; esac
+		if [ "$RACE_MS" -gt "$RACE_CUR_SIZE" ]; then RACE_CUR_SIZE=$RACE_MS; fi
+		if [ -f "$RACE_MF.length" ]; then
+			RACE_MT=$(cat "$RACE_MF.length" 2>/dev/null || echo 0)
+			case "$RACE_MT" in ''|*[!0-9]*) RACE_MT=0 ;; esac
+			if [ "$RACE_MT" -gt 0 ]; then RACE_CUR_TOTAL=$RACE_MT; fi
 		fi
 	done
+}
 
-	# 胜负已分：写该产物的取消标记让本地供给任务停止该产物的后续动作，并终止远程后台下载
-	touch "$6"
-	if [ -n "$DL_PID" ]; then
-		if command -v pkill >/dev/null 2>&1; then
-			pkill -P "$DL_PID" 2>/dev/null || true
+# CLI 与服务端同时竞速；这里只发送快照，preconnect 的单一汇报器按活跃产物投票，已完成产物不再发送也不再投票。
+race_all_artifacts() {
+	RACE_CLI_ACTIVE=0
+	RACE_SERVER_ACTIVE=0
+	RACE_CLI_PID=''
+	RACE_SERVER_PID=''
+	if [ "$NEED_CLI" = '1' ]; then
+		start_race_artifact 'CLI' "$STAGING/REMOTE_CLI.tar.gz" "$STAGING/REMOTE_CLI_DONE" "$STAGING/LOCAL_CLI.tar.gz" "$STAGING/LOCAL_CLI_DONE.$ARCH" "$STAGING/LOCAL_CLI_CANCEL" "$RACE_CLI_DL_FN"
+		RACE_CLI_PID=$RACE_START_PID
+		RACE_CLI_ACTIVE=1
+		if [ "$RACE_START_READY" = '1' ]; then RACE_CLI_ACTIVE=0; CLI_WINNER_PKG=$RACE_START_PKG; fi
+	fi
+	if [ "$NEED_SERVER" = '1' ]; then
+		start_race_artifact '服务端' "$STAGING/REMOTE.tar.gz" "$STAGING/REMOTE_DONE" "$STAGING/LOCAL.tar.gz" "$STAGING/LOCAL_DONE.$ARCH" "$STAGING/LOCAL_CANCEL" "$RACE_SERVER_DL_FN"
+		RACE_SERVER_PID=$RACE_START_PID
+		RACE_SERVER_ACTIVE=1
+		if [ "$RACE_START_READY" = '1' ]; then RACE_SERVER_ACTIVE=0; SERVER_WINNER_PKG=$RACE_START_PKG; fi
+	fi
+	while [ "$RACE_CLI_ACTIVE" = '1' ] || [ "$RACE_SERVER_ACTIVE" = '1' ]; do
+		if [ "$RACE_CLI_ACTIVE" = '1' ]; then
+			RACE_WINNER=''
+			if [ -f "$STAGING/REMOTE_CLI_DONE" ]; then RACE_WINNER='远程自下载'; CLI_WINNER_PKG="$STAGING/REMOTE_CLI.tar.gz";
+			elif [ -f "$STAGING/LOCAL_CLI_DONE.$ARCH" ]; then RACE_WINNER='本地供给'; CLI_WINNER_PKG="$STAGING/LOCAL_CLI.tar.gz"; fi
+			if [ -n "$RACE_WINNER" ]; then
+				touch "$STAGING/LOCAL_CLI_CANCEL"
+				if [ -n "$RACE_CLI_PID" ]; then
+					if command -v pkill >/dev/null 2>&1; then pkill -P "$RACE_CLI_PID" 2>/dev/null || true; fi
+					kill "$RACE_CLI_PID" 2>/dev/null || true
+					wait "$RACE_CLI_PID" 2>/dev/null || true
+				fi
+				log "竞速决出：CLI 由${RACE_WINNER}获胜（用包 $(basename "$CLI_WINNER_PKG")）。"
+				RACE_CLI_ACTIVE=0
+			fi
 		fi
-		kill "$DL_PID" 2>/dev/null || true
-		wait "$DL_PID" 2>/dev/null || true
-	fi
-
-	if [ "$RACE_WINNER_SIDE" = 'local' ]; then
-		RACE_WINNER_PKG="$4"
-		# 决出行两端同一格式（与 Windows 侧逐字一致）：主模块回调就按「竞速决出：X 由远程自下载获胜」按产物粒度即时击杀该产物的本地供给，不再等全部产物就位才杀（旧格式「竞速决出（X）：远程自下载的压缩包。」回调匹配不上，等于只靠全局行止损）
-		log "竞速决出：$1 由本地供给获胜（用包 $(basename "$4")）。"
-	else
-		RACE_WINNER_PKG="$2"
-		log "竞速决出：$1 由远程自下载获胜（用包 $(basename "$2")）。"
-	fi
+		if [ "$RACE_SERVER_ACTIVE" = '1' ]; then
+			RACE_WINNER=''
+			if [ -f "$STAGING/REMOTE_DONE" ]; then RACE_WINNER='远程自下载'; SERVER_WINNER_PKG="$STAGING/REMOTE.tar.gz";
+			elif [ -f "$STAGING/LOCAL_DONE.$ARCH" ]; then RACE_WINNER='本地供给'; SERVER_WINNER_PKG="$STAGING/LOCAL.tar.gz"; fi
+			if [ -n "$RACE_WINNER" ]; then
+				touch "$STAGING/LOCAL_CANCEL"
+				if [ -n "$RACE_SERVER_PID" ]; then
+					if command -v pkill >/dev/null 2>&1; then pkill -P "$RACE_SERVER_PID" 2>/dev/null || true; fi
+					kill "$RACE_SERVER_PID" 2>/dev/null || true
+					wait "$RACE_SERVER_PID" 2>/dev/null || true
+				fi
+				log "竞速决出：服务端由${RACE_WINNER}获胜（用包 $(basename "$SERVER_WINNER_PKG")）。"
+				RACE_SERVER_ACTIVE=0
+			fi
+		fi
+		if [ "$RACE_CLI_ACTIVE" != '1' ] && [ "$RACE_SERVER_ACTIVE" != '1' ]; then break; fi
+		sleep 1
+		if [ "$RACE_CLI_ACTIVE" = '1' ]; then
+			race_measure "$STAGING/REMOTE_CLI.tar.gz"
+			printf '__VSI_SNAPSHOT__{"端":"远程","产物":"CLI","已下载":%s,"总长度":%s}\n' "$RACE_CUR_SIZE" "$RACE_CUR_TOTAL"
+		fi
+		if [ "$RACE_SERVER_ACTIVE" = '1' ]; then
+			race_measure "$STAGING/REMOTE.tar.gz"
+			printf '__VSI_SNAPSHOT__{"端":"远程","产物":"服务端","已下载":%s,"总长度":%s}\n' "$RACE_CUR_SIZE" "$RACE_CUR_TOTAL"
+		fi
+	done
 }
 
 # 解包 CLI 压缩包并按引导契约落到正式名（包内为单个 code[-insiders] 可执行文件）；$1=压缩包路径
@@ -511,10 +542,10 @@ fi
 CLI_WINNER_PKG=''
 SERVER_WINNER_PKG=''
 if [ -n "$STAGING" ]; then
-	# ===== 竞速模式：每个缺失产物各竞速一次（本地下载+上传 vs 远程自下载，先完成者获胜），CLI 与服务端独立判胜、互不拖累 =====
+	# ===== 竞速模式：CLI 与服务端同时开始，本地与远程快照统一交给 preconnect 的单一汇报器 =====
 	# 单边断网时由另一边补上：远端连不上下载服务器就等本地供给，本地下载失败就等远程自下载
 	mkdir -p "$STAGING"
-	# 与 Windows 同一供给协议：本地模块先启动第一个待装产物，收到该产物的决出行再启动下一个，避免本地并行而远端串行。
+	# 本地组合协调器与远端同时收到全部待装产物，两个产物独立判胜、互不等候。
 	RACE_PENDING=''
 	if [ "$NEED_CLI" = '1' ]; then
 		RACE_PENDING='CLI'
@@ -531,14 +562,7 @@ if [ -n "$STAGING" ]; then
 		RACE_CLI_DL_FN='run_remote_cli_download'
 		RACE_SERVER_DL_FN='run_remote_download'
 	fi
-	if [ "$NEED_CLI" = '1' ]; then
-		race_artifact 'CLI' "$STAGING/REMOTE_CLI.tar.gz" "$STAGING/REMOTE_CLI_DONE" "$STAGING/LOCAL_CLI.tar.gz" "$STAGING/LOCAL_CLI_DONE.$ARCH" "$STAGING/LOCAL_CLI_CANCEL" "$RACE_CLI_DL_FN"
-		CLI_WINNER_PKG="$RACE_WINNER_PKG"
-	fi
-	if [ "$NEED_SERVER" = '1' ]; then
-		race_artifact '服务端' "$STAGING/REMOTE.tar.gz" "$STAGING/REMOTE_DONE" "$STAGING/LOCAL.tar.gz" "$STAGING/LOCAL_DONE.$ARCH" "$STAGING/LOCAL_CANCEL" "$RACE_SERVER_DL_FN"
-		SERVER_WINNER_PKG="$RACE_WINNER_PKG"
-	fi
+	race_all_artifacts
 	if [ "$NEED_CLI" = '1' ] || [ "$NEED_SERVER" = '1' ]; then
 		# 至少一个产物竞速决出：该行触发主流程立即击杀本地供给进程树（零轮询即时取消）
 		echo '竞速获胜：全部产物已就位，开始安装。'

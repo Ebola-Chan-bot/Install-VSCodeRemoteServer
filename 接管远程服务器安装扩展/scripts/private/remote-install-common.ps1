@@ -200,7 +200,8 @@ function 竞速-单个产物 {
 		[string]$本地包路径,
 		[string]$本地完成标记,
 		[string]$本地取消标记,
-		[string]$下载函数文本
+		[string]$下载函数文本,
+		[switch]$仅启动
 	)
 
 	# 单个产物的竞速：远程自下载（后台作业）与本地下载+上传（由本地模块负责）并行，先完成者获胜，返回 {获胜方;获胜包路径}。
@@ -256,15 +257,15 @@ function 竞速-单个产物 {
 	Write-Host ('{0} 竞速：远程自下载与本地下载+上传并行，先完成者用于安装。' -f $产物名)
 	# 把断点续传下载函数以文本形式带入后台作业（Start-Job 是独立进程，无法直接调用本脚本函数），保证竞速模式下远程侧仍是断点续传。
 	# 注意：Definition 属性不含花括号（函数体以 param(...) 开头），注入时必须自行包上 { }，否则是非法函数声明
-	$下载作业 = Start-Job -ArgumentList $下载函数文本, $下载地址, $远程在途路径, $远程包路径, $远程完成标记, $产物名 -ScriptBlock {
-		param($下载函数文本, $下载地址, $远程在途路径, $远程包路径, $远程完成标记, $产物名)
+	$下载作业 = Start-Job -ArgumentList $下载函数文本, $下载地址, $远程在途路径, $远程包路径, $远程完成标记, $产物名, ([bool]$仅启动) -ScriptBlock {
+		param($下载函数文本, $下载地址, $远程在途路径, $远程包路径, $远程完成标记, $产物名, $仅启动)
 		$ErrorActionPreference = 'Continue'
 		[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 		Invoke-Expression ('function 通过HTTP断点续传下载 { ' + $下载函数文本 + ' }')
 		# 端标注：本作业每一行都带上「哪一端哪个产物」，与本地供给的 [本地供给-产物名] 对称（两端的下载行交织在同一份日志里）
 		$端标注 = '[远程自下载-{0}]' -f $产物名
 		try {
-			通过HTTP断点续传下载 -下载地址 $下载地址 -目标路径 $远程在途路径 -端标注 $端标注
+			通过HTTP断点续传下载 -下载地址 $下载地址 -目标路径 $远程在途路径 -端标注 $端标注 -结构化进度 $仅启动
 			if ((Test-Path -LiteralPath $远程在途路径) -and ((Get-Item -LiteralPath $远程在途路径).Length -gt 0)) {
 				# 发布：先改名到成品名、再写完成标记 —— 顺序不可颠倒，否则会短暂出现「标记在、包不完整」的窗口骗过竞速判定
 				try {
@@ -288,6 +289,9 @@ function 竞速-单个产物 {
 		} catch {
 			Write-Output ('{0} 远程自下载异常终止: {1}' -f $端标注, $_.Exception.Message)
 		}
+	}
+	if ($仅启动) {
+		return [pscustomobject]@{ 产物名 = $产物名; 下载作业 = $下载作业; 远程包路径 = $远程包路径; 远程完成标记 = $远程完成标记; 本地包路径 = $本地包路径; 本地完成标记 = $本地完成标记; 本地取消标记 = $本地取消标记 }
 	}
 
 	$获胜方 = $null
@@ -313,6 +317,75 @@ function 竞速-单个产物 {
 	}
 
 	return [pscustomobject]@{ 获胜方 = $获胜方; 获胜包路径 = $获胜包路径 }
+}
+
+function 竞速-全部产物 {
+	param(
+		[hashtable]$CLI参数,
+		[hashtable]$服务端参数
+	)
+
+	# CLI 与服务端同时启动并统一监控；本函数只发送快照，preconnect 的单一汇报器按活跃产物投票并输出四条进度。
+	$项表 = @{}
+	$状态表 = @{}
+	$结果表 = @{ CLI = $null; 服务端 = $null }
+	$起始时刻 = Get-Date
+	foreach ($产物名 in @('CLI', '服务端')) {
+		$参数 = if ($产物名 -eq 'CLI') { $CLI参数 } else { $服务端参数 }
+		if ($null -eq $参数) { continue }
+		$项 = 竞速-单个产物 @参数 -仅启动
+		$项表[$产物名] = $项
+		$状态表[$产物名] = @{ 已下载 = 0L; 总长度 = 0L; 已完成 = $false }
+		if ($null -eq $项.PSObject.Properties['下载作业']) {
+			$状态表[$产物名].已完成 = $true
+			$结果表[$产物名] = $项.获胜包路径
+		}
+	}
+	try {
+		while ($true) {
+			foreach ($产物名 in @($项表.Keys)) {
+				$项 = $项表[$产物名]
+				if ($状态表[$产物名].已完成) { continue }
+				foreach ($输出项 in @(Receive-Job -Job $项.下载作业 -ErrorAction SilentlyContinue)) {
+					$行 = [string]$输出项
+					if ($行.StartsWith('__VSI_PROGRESS__')) {
+						try {
+							$进度 = $行.Substring(16) | ConvertFrom-Json
+							$状态表[$产物名].已下载 = [long]$进度.已下载
+							$状态表[$产物名].总长度 = [long]$进度.总长度
+						} catch { }
+					} elseif (-not [string]::IsNullOrWhiteSpace($行)) {
+						Write-Host $行
+					}
+				}
+				$获胜方 = $null
+				if (Test-Path -LiteralPath $项.远程完成标记) { $获胜方 = '远程自下载' }
+				elseif (Test-Path -LiteralPath $项.本地完成标记) { $获胜方 = '本地供给' }
+				if ($null -ne $获胜方) {
+					New-Item -ItemType File -Force $项.本地取消标记 | Out-Null
+					Stop-Job -Job $项.下载作业 -ErrorAction SilentlyContinue
+					Receive-Job -Job $项.下载作业 -ErrorAction SilentlyContinue | Where-Object { -not ([string]$_).StartsWith('__VSI_PROGRESS__') } | ForEach-Object { Write-Host ([string]$_) }
+					Remove-Job -Job $项.下载作业 -Force -ErrorAction SilentlyContinue
+					$获胜包路径 = if ($获胜方 -eq '本地供给') { $项.本地包路径 } else { $项.远程包路径 }
+					if (-not (Test-Path -LiteralPath $获胜包路径)) { throw ('竞速决出的包不存在: {0}' -f $获胜包路径) }
+					$结果表[$产物名] = $获胜包路径
+					$状态表[$产物名].已完成 = $true
+					Write-Host ('竞速决出：{0} 由{1}获胜（用包 {2}）。' -f $产物名, $获胜方, (Split-Path $获胜包路径 -Leaf))
+				}
+			}
+			if (@($项表.Keys | Where-Object { -not $状态表[$_].已完成 }).Count -eq 0) { break }
+			foreach ($产物名 in @('CLI', '服务端')) {
+				if (-not $项表.ContainsKey($产物名) -or $状态表[$产物名].已完成) { continue }
+				Write-Host ('__VSI_SNAPSHOT__' + (@{ 端 = '远程'; 产物 = $产物名; 已下载 = [long]$状态表[$产物名].已下载; 总长度 = [long]$状态表[$产物名].总长度 } | ConvertTo-Json -Compress))
+			}
+			Start-Sleep -Seconds 1
+		}
+	} finally {
+		foreach ($项 in @($项表.Values)) {
+			if ($null -ne $项.PSObject.Properties['下载作业']) { Remove-Job -Job $项.下载作业 -Force -ErrorAction SilentlyContinue }
+		}
+	}
+	return $结果表
 }
 
 function 清理-竞速暂存目录 {
@@ -467,7 +540,8 @@ function 通过HTTP断点续传下载 {
 	param(
 		[string]$下载地址,
 		[string]$目标路径,
-		[string]$端标注 = '[远程自下载-服务端]'
+		[string]$端标注 = '[远程自下载-服务端]',
+		[bool]$结构化进度 = $false
 	)
 
 	# 本函数的函数体会被整段文本化送进后台下载作业重新定义（见 $下载函数文本），故自适应函数必须内嵌在函数体内随行，不能依赖外部定义
@@ -481,6 +555,12 @@ function 通过HTTP断点续传下载 {
 		else {
 			return $上次汇报间隔 + 1
 		}
+	}
+	function 发送-下载进度([long]$已下载字节数, [long]$总字节数) {
+		if ($结构化进度) { Write-Output ('__VSI_PROGRESS__' + (@{ 已下载 = $已下载字节数; 总长度 = $总字节数 } | ConvertTo-Json -Compress)) }
+	}
+	function 写-进度主机([string]$文本) {
+		if (-not $结构化进度) { Write-Host $文本 }
 	}
 
 	# 基于 HTTP Range 头的断点续传：本地已存在部分文件时从偏移处继续。
@@ -545,6 +625,7 @@ function 通过HTTP断点续传下载 {
 				$响应任务 = $Web请求.BeginGetResponse($null, $null)
 				while (-not $响应任务.AsyncWaitHandle.WaitOne(1000)) {
 					$当前时间 = Get-Date
+					发送-下载进度 $已存在字节数 $已知总长度
 					if (($当前时间 - $上次汇报时刻).TotalSeconds -ge $报告周期秒数) {
 						$上次汇报时刻 = $当前时间
 						$零进展 = ($已存在字节数 -le $上次汇报字节数)
@@ -554,9 +635,9 @@ function 通过HTTP断点续传下载 {
 						$上次汇报字节数 = $已存在字节数
 						if ($已知总长度 -gt 0) {
 							$进度 = [math]::Round(($已存在字节数 * 100.0) / $已知总长度, 1)
-							Write-Host ('{0} 远程下载进度：{1} / {2} 字节（{3}%）' -f $端标注, $已存在字节数, $已知总长度, $进度)
+							写-进度主机 ('{0} 远程下载进度：{1} / {2} 字节（{3}%）' -f $端标注, $已存在字节数, $已知总长度, $进度)
 						} else {
-							Write-Host ('{0} 远程下载进度：已传 {1} 字节' -f $端标注, $已存在字节数)
+							写-进度主机 ('{0} 远程下载进度：已传 {1} 字节' -f $端标注, $已存在字节数)
 						}
 						# 响应头未到无法按本轮响应重新估算，只增不减（无上限）；能走到这里的汇报必是连后首报基线（非基线零进展已走重建，重建处同样 +1）
 						$报告周期秒数++
@@ -607,6 +688,7 @@ function 通过HTTP断点续传下载 {
 								$读取字节数 = $响应流.EndRead($读取结果)
 							}
 							$当前时间 = Get-Date
+							发送-下载进度 ($已存在字节数 + $已写入字节数) $内容总长度
 							if (($当前时间 - $上次汇报时刻).TotalSeconds -ge $报告周期秒数) {
 								$上次汇报时刻 = $当前时间
 								$已传总字节数 = $已存在字节数 + $已写入字节数
@@ -618,11 +700,11 @@ function 通过HTTP断点续传下载 {
 								# 进度行只有远程/本地两种句式且不带内嵌时间戳：批量补刷后外层显示时刻与实际发生时刻一致，内嵌远端时钟只会与外层本地时钟打架
 								if ($内容总长度 -gt 0) {
 									$进度 = [math]::Round(($已传总字节数 * 100.0) / $内容总长度, 1)
-									Write-Host ('{0} 远程下载进度：{1} / {2} 字节（{3}%）' -f $端标注, $已传总字节数, $内容总长度, $进度)
+									写-进度主机 ('{0} 远程下载进度：{1} / {2} 字节（{3}%）' -f $端标注, $已传总字节数, $内容总长度, $进度)
 									# 能被汇报出的零进展必是连后首报基线（非基线零进展已走重建）：按总量未知规则放宽一档；有进展由 下次汇报间隔 按预计剩余时间自适应，放宽不设上限
 									if ($零进展) { $报告周期秒数++ } else { $报告周期秒数 = 下次汇报间隔 $报告周期秒数 ($当前时间 - $下载起始时刻).TotalSeconds $已传总字节数 $内容总长度 }
 								} else {
-									Write-Host ('{0} 远程下载进度：已传 {1} 字节' -f $端标注, $已传总字节数)
+									写-进度主机 ('{0} 远程下载进度：已传 {1} 字节' -f $端标注, $已传总字节数)
 									# 总大小未知（分块响应）时无法估算剩余时间，只增不减（无上限）
 									$报告周期秒数++
 								}
@@ -916,7 +998,6 @@ Write-Host ('准备安装 VS Code 远程服务，提交号: {0}' -f $提交号)
 Write-Host ('发布通道: {0}' -f $发布通道)
 Write-Host ('自动检测到的系统架构: {0}' -f $系统架构)
 Write-Host ('自动检测到的安装目录: {0}' -f $最终安装目录)
-Write-Host ('下载地址: {0}' -f $下载地址)
 
 # ===== 历史版本回收：后台进程执行，不占用本次连接的主流程 =====
 $历史清理报告路径 = Join-Path (Join-Path $HOME $(if ($发布通道 -eq 'insider') { '.vscode-server-insiders' } else { '.vscode-server' })) '.vsi-gc-report.log'
@@ -944,16 +1025,19 @@ if ($启用竞速) {
 		if ($待装产物名.Count -gt 0) {
 			Write-Host ('__接管预备完成__{0}' -f ($待装产物名 -join ' '))
 		}
-	# 把断点续传下载函数以文本形式带入后台作业（Start-Job 是独立进程，无法直接调用本脚本函数），竞速双方产物都用它下载
+	# 把断点续传下载函数以文本形式带入后台作业（Start-Job 是独立进程，无法直接调用本脚本函数），两个产物同时开始、由一个汇报器统一输出。
 	$下载函数文本 = (Get-Command '通过HTTP断点续传下载').Definition
+	$CLI参数 = $null
+	$服务端参数 = $null
 	if (-not $CLI已就位) {
-		$CLI竞速结果 = 竞速-单个产物 -产物名 'CLI' -下载地址 $CLI信息.下载地址 -远程包路径 (Join-Path $暂存目录 'REMOTE_CLI.zip') -远程完成标记 (Join-Path $暂存目录 'REMOTE_CLI_DONE') -本地包路径 (Join-Path $暂存目录 'LOCAL_CLI.zip') -本地完成标记 (Join-Path $暂存目录 ('LOCAL_CLI_DONE.{0}' -f $系统架构)) -本地取消标记 (Join-Path $暂存目录 'LOCAL_CLI_CANCEL') -下载函数文本 $下载函数文本
-		$CLI获胜包路径 = $CLI竞速结果.获胜包路径
+		$CLI参数 = @{ 产物名 = 'CLI'; 下载地址 = $CLI信息.下载地址; 远程包路径 = (Join-Path $暂存目录 'REMOTE_CLI.zip'); 远程完成标记 = (Join-Path $暂存目录 'REMOTE_CLI_DONE'); 本地包路径 = (Join-Path $暂存目录 'LOCAL_CLI.zip'); 本地完成标记 = (Join-Path $暂存目录 ('LOCAL_CLI_DONE.{0}' -f $系统架构)); 本地取消标记 = (Join-Path $暂存目录 'LOCAL_CLI_CANCEL'); 下载函数文本 = $下载函数文本 }
 	}
 	if (-not $服务端已就绪) {
-		$服务端竞速结果 = 竞速-单个产物 -产物名 '服务端' -下载地址 $下载地址 -远程包路径 (Join-Path $暂存目录 'REMOTE.zip') -远程完成标记 (Join-Path $暂存目录 'REMOTE_DONE') -本地包路径 (Join-Path $暂存目录 'LOCAL.zip') -本地完成标记 (Join-Path $暂存目录 ('LOCAL_DONE.{0}' -f $系统架构)) -本地取消标记 (Join-Path $暂存目录 'LOCAL_CANCEL') -下载函数文本 $下载函数文本
-		$获胜包路径 = $服务端竞速结果.获胜包路径
+		$服务端参数 = @{ 产物名 = '服务端'; 下载地址 = $下载地址; 远程包路径 = (Join-Path $暂存目录 'REMOTE.zip'); 远程完成标记 = (Join-Path $暂存目录 'REMOTE_DONE'); 本地包路径 = (Join-Path $暂存目录 'LOCAL.zip'); 本地完成标记 = (Join-Path $暂存目录 ('LOCAL_DONE.{0}' -f $系统架构)); 本地取消标记 = (Join-Path $暂存目录 'LOCAL_CANCEL'); 下载函数文本 = $下载函数文本 }
 	}
+	$全部竞速结果 = 竞速-全部产物 -CLI参数 $CLI参数 -服务端参数 $服务端参数
+	$CLI获胜包路径 = $全部竞速结果.CLI
+	$获胜包路径 = $全部竞速结果.服务端
 	if ($待装产物名.Count -gt 0) {
 		# 至少一个产物竞速决出：该行触发主流程立即击杀本地供给进程树（零轮询即时取消）
 		Write-Host '竞速获胜：全部产物已就位，开始安装。'
