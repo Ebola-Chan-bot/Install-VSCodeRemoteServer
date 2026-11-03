@@ -542,6 +542,15 @@ function 执行-扩展安装 {
 		}
 	}
 
+	function 抛出-stdin启动中断($进程, $错误任务) {
+		# 专用抛出点保证调用方能收到带类型的通道异常，而不是 PowerShell 对函数内终止错误的通用包装。
+		$null = $进程.WaitForExit(30000)
+		$退出描述 = if ($进程.HasExited) { '退出码 ' + [string]$进程.ExitCode } else { '进程仍未退出（PID ' + [string]$进程.Id + '）' }
+		$错误摘要 = ''
+		try { if ($错误任务.Wait(1000)) { $错误摘要 = ([string]$错误任务.Result).Trim() } } catch { }
+		throw ('[stdin通道中断] SSH 在完整接收安装载荷前关闭了标准输入，远端安装尚未开始（{0}）。{1}' -f $退出描述, $错误摘要)
+	}
+
 	# 走标准输入下发大载荷的 SSH 调用（Windows 单会话引导专用）：自己起 ssh 进程、把载荷一次性写入 StandardInput 后**显式 Close()**，输出异步读并配硬超时看门狗。为什么不用 PowerShell 管道（`$文本 | & ssh …`）：管道收尾不可靠是**偶发真实故障**——实测同一条通道 2KB/40KB/400KB 三档都在约 1 秒内无损送达（长度 + SHA256 双判据一致、退出码 0），但 120KB 那一档**挂死约 66 分钟**（退出码 -1、哈希无法核对）。无声挂死会把 Remote-SSH 的整个连接一起拖死，所以这里改成：EOF 由我们自己关闭（确定性），并加超时看门狗——超时即 taskkill 整树 + 抛类型化错误，让调用方重试而不是干等。
 	function 执行-SSH命令带标准输入 {
 		param(
@@ -582,6 +591,7 @@ function 执行-扩展安装 {
 		$进程 = [System.Diagnostics.Process]::Start($psi)
 		# stderr 必须异步抽干：只重定向不读取，缓冲区写满（约 4KB）就会把远端进程堵住 → 表现为"挂死"，与被替换掉的管道式写法是同一类故障，这里一并根除（仓库既有的 预热直连 也是这么做的）
 		$错误任务 = $进程.StandardError.ReadToEndAsync()
+		$标准输入关闭 = $false
 		$截止 = (Get-Date).AddSeconds($超时秒)
 		$已超时 = $false
 		$有效行数 = 0
@@ -594,9 +604,14 @@ function 执行-扩展安装 {
 			# 载荷一次性写入并立刻关闭：EOF 由我们决定，不给通道留"收尾不确定"的空间
 			# 载荷是 base64 分块（纯 ASCII，不含 CR 也容忍被加 CRLF），用 ASCII 写字节即可
 			$载荷字节 = [System.Text.Encoding]::ASCII.GetBytes($标准输入文本)
-			$进程.StandardInput.BaseStream.Write($载荷字节, 0, $载荷字节.Length)
-			$进程.StandardInput.Flush()
-			$进程.StandardInput.Close()
+			try {
+				$进程.StandardInput.BaseStream.Write($载荷字节, 0, $载荷字节.Length)
+				$进程.StandardInput.Flush()
+				$进程.StandardInput.Close()
+				$标准输入关闭 = $true
+			} catch {
+				抛出-stdin启动中断 $进程 $错误任务
+			}
 			# 本地侧检查点：写出+关闭完成说明 EOF 已交给 ssh.exe，此后若再无任何有效输出，挂点必在远端/连接层而非载荷没送出去——事后取证时这行日志就是分界线
 			Write-Host ('[单会话] 载荷已写出 {0} 字节并关闭标准输入，等待远端引导回执…' -f $载荷字节.Length)
 
@@ -651,6 +666,7 @@ function 执行-扩展安装 {
 			$ErrorActionPreference = $原EAP
 		}
 
+		if (-not $标准输入关闭) { 抛出-stdin启动中断 $进程 $错误任务 }
 		if ($已超时) {
 			# 看门狗：挂死的会话必须连整棵进程树一起清掉，否则本地 ssh 与远端 powershell 会双双留着占会话
 			try { & taskkill /PID $进程.Id /T /F 2>&1 | Out-Null } catch { }
@@ -1479,17 +1495,16 @@ function 执行-扩展安装 {
 		}
 		try {
 			$命令行 = 'powershell -NoProfile -EncodedCommand {0}' -f $固定引导码
-			# 通道挂死重试：实测管道式 stdin 会偶发无声挂死（120KB 那一档挂了约 66 分钟），现在改走"显式 Close() + 看门狗"的新函数，挂死会在 240 秒无进展时被判死并清树，这里再重试一次。只对 [stdin超时] 这一类重试；其它错误（含 PS2、认证失败、远端报错）原样抛出，保留真实原因。
+			# 启动前通道故障只重试一次：无输出挂死或对端提前关闭 stdin 都可能由瞬时 SSH 断连引起；认证失败、远端脚本异常等其它错误仍原样抛出。
 			$尝试上限 = 2
 			for ($轮次 = 1; $轮次 -le $尝试上限; $轮次++) {
 				try {
 					执行-SSH命令带标准输入 -连接目标 $连接目标 -端口 $端口 -命令文本 $命令行 -标准输入文本 $载荷标准输入 -超时秒 240 -每行回调 $检测回调
 					break
 				} catch {
-					if ($_.Exception.Message -notmatch '^\[stdin超时\]') { throw }
+					if ($_.Exception.Message -notmatch '^\[stdin(超时|通道中断)\]') { throw }
 					if ($轮次 -ge $尝试上限) { throw }
-					# 把挂点诊断透进日志：「启动层挂死」与「安装段静默」是两种完全不同的故障（前者查连接/僵尸会话，后者查安装脚本哪段没有输出），只报"挂死"会让每次事故都要重新取证
-					Write-Host ('[单会话] 标准输入通道挂死（第 {0} 次尝试），已按看门狗终止并清理，重试第 {1} 次。挂点诊断：{2}' -f $轮次, ($轮次 + 1), $_.Exception.Message)
+					Write-Host ('[单会话] 标准输入通道中断（第 {0} 次尝试），重试第 {1} 次。{2}' -f $轮次, ($轮次 + 1), $_.Exception.Message)
 					$script:单会话PS2标记 = $false
 				}
 			}

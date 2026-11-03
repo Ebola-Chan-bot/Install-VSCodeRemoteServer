@@ -76,25 +76,22 @@ if ([string]::IsNullOrWhiteSpace([string]$配置.本地版本)) {
 	报错退出 ('配置文件 {0} 缺少「本地版本」，请关闭再重新开启「{1}」。' -f $配置文件, $开关名)
 }
 $脚本路径 = [string]$配置.脚本路径
-# 升级后旧扩展目录可能被清理，配置也可能尚未刷新；只比较实际存在的内部脚本，取最新副本，不加载任何模块清单。
-$候选 = New-Object System.Collections.Generic.List[object]
+# 当前扩展写入的有效路径始终优先，绝不能按文件时间在稳定版与 Insiders 之间跨通道挑选；发布通道也必须跟随脚本所在的扩展目录，避免脚本与下载通道错配。
+$通道目录名 = if ($配置.本地版本 -eq '预览版') { '.vscode-insiders' } else { '.vscode' }
 if (Test-Path -LiteralPath $脚本路径) {
-	$候选.Add([pscustomobject]@{ 路径 = $脚本路径; 时间 = (Get-Item -LiteralPath $脚本路径).LastWriteTime })
-}
-foreach ($扩展根 in @((Join-Path $env:USERPROFILE '.vscode-insiders\extensions'), (Join-Path $env:USERPROFILE '.vscode\extensions'))) {
-	Get-ChildItem -LiteralPath $扩展根 -Directory -Filter 'ebola-chan-bot.remotessh-server-installer-*' -ErrorAction SilentlyContinue | ForEach-Object {
-		$副本 = Join-Path $_.FullName 'scripts\安装实现.ps1'
-		if ((Test-Path -LiteralPath $副本) -and ($副本 -ne $脚本路径)) {
-			$候选.Add([pscustomobject]@{ 路径 = $副本; 时间 = (Get-Item -LiteralPath $副本).LastWriteTime })
-		}
+	# 有效配置路径是通道与构建的唯一事实来源；即使另一通道的扩展更晚安装，也绝不替换它。
+} else {
+	# 仅当配置指向的旧扩展目录已被清理时，才在同一 VS Code 通道内寻找仍可用的同版本脚本；找不到就明确失败，不回退到另一通道。
+	$扩展根 = Join-Path $env:USERPROFILE ($通道目录名 + '\extensions')
+	$候选 = @(Get-ChildItem -LiteralPath $扩展根 -Directory -Filter 'ebola-chan-bot.remotessh-server-installer-*' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+	$替代 = $null
+	foreach ($目录 in $候选) {
+		$副本 = Join-Path $目录.FullName 'scripts\安装实现.ps1'
+		if (Test-Path -LiteralPath $副本) { $替代 = $副本; break }
 	}
-}
-if ($候选.Count -gt 0) {
-	$最新 = $候选 | Sort-Object 时间 -Descending | Select-Object -First 1
-	if ($最新.路径 -ne $脚本路径) {
-		$script:缓冲.Add(('[接管安装] 配置里的脚本路径指向较旧的构建，已自动改用更新的脚本: {0}' -f $最新.路径))
-		$脚本路径 = $最新.路径
-	}
+	if ($null -eq $替代) { 报错退出 ('配置中的安装脚本不存在，且在 {0} 通道未找到替代副本：{1}' -f $通道目录名, $脚本路径) }
+	$script:缓冲.Add(('[接管安装] 配置中的旧脚本路径已失效，改用同一 VS Code 通道的现有脚本: {0}' -f $替代))
+	$脚本路径 = $替代
 }
 $本地版本 = [string]$配置.本地版本
 # 本主机启用的能力：接管安装与服务保活相互独立（可重叠），都来自配置文件里的主机清单

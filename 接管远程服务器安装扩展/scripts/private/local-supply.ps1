@@ -540,8 +540,17 @@ try {
 			Write-Output '远端暂存文件已被并发连接清走，重新上传一次...'
 		}
 		$上传目标 = ('{0}:{1}{2}{3}.uploading' -f $连接目标, $暂存目录, $分隔符, $远程包名)
-		$null = & $scp命令.Source (@('-P', $端口) + $密码选项 + @($本地包路径, $上传目标)) 2>&1
-		if ($LASTEXITCODE -ne 0) { Write-Output ('上传失败，退出码 {0}，本地供给退出（远程将继续自下载）。' -f $LASTEXITCODE); return }
+		# 必须保留 scp 自己的 stderr/stdout：scp 的具体原因（连接被拒、远端目录不存在、磁盘满、协议/认证失败）都在原生命令输出里，$null 会把它们全部吞掉，只剩一个没有诊断价值的 255。输出先收集，失败时逐行原样回传；成功时不把 scp 噪声混进正常进度日志。
+		$scp输出 = @(& $scp命令.Source (@('-P', $端口) + $密码选项 + @($本地包路径, $上传目标)) 2>&1)
+		$scp退出码 = $LASTEXITCODE
+		if ($scp退出码 -ne 0) {
+			Write-Output ('上传失败，退出码 {0}，目标: {1}。scp 原始输出:' -f $scp退出码, $上传目标)
+			foreach ($行 in @($scp输出)) {
+				if (-not [string]::IsNullOrWhiteSpace([string]$行)) { Write-Output ([string]$行) }
+			}
+			Write-Output '本地供给退出（远程将继续自下载）。'
+			return
+		}
 
 		# 上传完整性核对：远端字节数必须与本地一致才写完成标记（scp 断流截断时绝不放行，否则远端会拿坏包解压）
 		$本地大小 = (Get-Item -LiteralPath $本地包路径).Length
