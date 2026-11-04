@@ -26,6 +26,7 @@ const 公共实现文件名 = '接管安装实现.ps1';
 const 配置文件名 = '接管安装配置.json';
 const 接管主机键 = '接管的主机';
 const 保活主机键 = '启用保活的主机';
+const 清理未认证连接主机键 = '清理未认证连接的主机';
 const 命令_选择主机 = 设置节 + '.选择接管主机';
 const 命令_诊断终端通道 = 设置节 + '.诊断终端通道';
 const 状态键_接管方式 = '接管方式'; // 主机 → { 方式: '覆盖'|'自调', 原脚本 }；只对有过外部原脚本的主机记录
@@ -47,7 +48,7 @@ function 串行对齐(context, 交互) {
 function 激活(context) {
 	// 主机清单变化（设置页保存、手改 settings.json 都算）→ 立即对齐，交互模式下允许弹窗
 	context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(事件 => {
-		if (事件.affectsConfiguration(设置节 + '.' + 接管主机键) || 事件.affectsConfiguration(设置节 + '.' + 保活主机键)) {
+		if (事件.affectsConfiguration(设置节 + '.' + 接管主机键) || 事件.affectsConfiguration(设置节 + '.' + 保活主机键) || 事件.affectsConfiguration(设置节 + '.' + 清理未认证连接主机键)) {
 			串行对齐(context, true);
 		}
 	}));
@@ -81,7 +82,8 @@ async function 选择接管主机() {
 	const 候选 = 解析SSH主机();
 	const 当前接管 = 取主机清单设置(接管主机键);
 	const 当前保活 = 取主机清单设置(保活主机键);
-	for (const 名单 of [当前接管, 当前保活]) {
+	const 当前清理 = 取主机清单设置(清理未认证连接主机键);
+	for (const 名单 of [当前接管, 当前保活, 当前清理]) {
 		for (const 主机 of 名单) {
 			if (!候选.includes(主机)) {
 				候选.push(主机);
@@ -111,6 +113,14 @@ async function 选择接管主机() {
 		return; // 第二步取消：接管清单已生效，保活清单保持原样
 	}
 	await vscode.workspace.getConfiguration(设置节).update(保活主机键, 勾选保活.map(项 => 项.label), vscode.ConfigurationTarget.Global);
+
+	const 勾选清理 = await vscode.window.showQuickPick(勾选接管.map(项 => ({ label: 项.label, picked: 当前清理.includes(项.label) })), {
+		canPickMany: true,
+		title: '选择安装后清理未认证 SSH 残留连接的主机',
+		placeHolder: '仅清理无 TCP、无子进程的 sshd -y 残留，不影响已认证会话；默认不勾选'
+	});
+	if (勾选清理 === undefined) { return; }
+	await vscode.workspace.getConfiguration(设置节).update(清理未认证连接主机键, 勾选清理.map(项 => 项.label), vscode.ConfigurationTarget.Global);
 }
 
 // 读主机清单类设置（「接管的主机」「启用保活的主机」）：去重、去空、去首尾空白（用户可能手改 settings.json）
@@ -283,6 +293,7 @@ async function 执行接管(context, 交互) {
 		本地版本: 发布通道,
 		接管主机: 接管清单,
 		保活主机: 保活清单,
+		清理未认证连接主机: 取主机清单设置(清理未认证连接主机键).filter(主机 => 接管清单.includes(主机)),
 		// 平台提示取自 Remote-SSH 自己的 remotePlatform 设置：Windows 主机上单会话（sh/base64）必失败，提前告知安装脚本跳过那次徒劳尝试
 		平台提示映射: (vscode.workspace.getConfiguration('remote.SSH').get('remotePlatform') || {})
 	});

@@ -60,6 +60,15 @@
 					"default": [],
 					"scope": "application",
 					"markdownDescription": "要启用服务保活的主机清单（`~/.ssh/config` 里的主机别名）：server 脱离 SSH 会话存活，集群回收超龄会话后本地重连热附着。勾选的主机在每次连接（preconnect）时**自动检修**保活包装（幂等部署/升级/自愈，VS Code 更新到新提交号后下一次连接即自动补上）。与「接管的主机」相互独立、可重叠。推荐用命令「选择接管与保活的主机…」勾选；直接在此编辑等效，保存即生效。"
+				},
+				"安装VSCode远程服务.清理未认证连接的主机": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"default": [],
+					"scope": "application",
+					"markdownDescription": "在接管安装成功后清理 Windows 远端无 TCP、无子进程的 `sshd -y` 未认证残留代理，为接下来的 Remote-SSH 连接释放资源。仅对接管的主机生效，默认关闭；不会终止已认证会话或其他用户进程。推荐用命令「选择接管与保活的主机…」勾选。"
 				}
 			}
 		},

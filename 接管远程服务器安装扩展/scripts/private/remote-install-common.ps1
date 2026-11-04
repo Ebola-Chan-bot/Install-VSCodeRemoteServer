@@ -979,6 +979,29 @@ if ($僵尸会话数 -gt 0) {
 	Write-Output ('已清理僵尸 sshd 会话 {0} 条（客户端早已消失、sshd 不自行退出；有连接的活会话与本次连接的会话一概未碰）。' -f $僵尸会话数)
 }
 
+function 清理-未认证SSH残留代理 {
+	# 可选的收尾清理：只处理 OpenSSH 的 -y 未认证代理，且必须同时满足无 TCP、无子进程；-R/-z 已认证会话树与所有其他进程绝不触碰。
+	$进程快照 = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+	$连接进程 = @{}
+	foreach ($连接 in @(Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue)) { $连接进程[[int]$连接.OwningProcess] = $true }
+	$有子进程 = @{}
+	foreach ($项 in $进程快照) { if ($null -ne $项.ParentProcessId) { $有子进程[[int]$项.ParentProcessId] = $true } }
+	$已清理 = 0
+	foreach ($项 in $进程快照) {
+		if ($项.Name -ne 'sshd.exe' -or [string]::IsNullOrWhiteSpace($项.CommandLine)) { continue }
+		if ($项.CommandLine -notmatch '(^|\s)-y(\s|$)') { continue }
+		if ($连接进程.ContainsKey([int]$项.ProcessId) -or $有子进程.ContainsKey([int]$项.ProcessId)) { continue }
+		try {
+			Stop-Process -Id $项.ProcessId -Force -ErrorAction Stop
+			$已清理++
+			Write-Output ('已清理未认证 SSH 残留代理 PID {0}（无 TCP、无子进程）。' -f $项.ProcessId)
+		} catch {
+			Write-Output ('未认证 SSH 残留代理 PID {0} 清理失败：{1}。不影响本次安装结果。' -f $项.ProcessId, $_.Exception.Message)
+		}
+	}
+	Write-Output ('未认证 SSH 残留代理清理完成：共 {0} 个；已认证会话未触碰。' -f $已清理)
+}
+
 # 竞速暂存目录：本地模块与远程脚本约定在同一目录交换压缩包与标记文件；空串表示未启用竞速，回退远程单独下载
 $暂存目录 = '__暂存目录__'
 if ($暂存目录 -eq 'AUTO') {
@@ -1067,6 +1090,7 @@ if ($服务端已就绪) {
 	# 表格经 Out-String 转为单字符串后由 Write-Host 输出：避免成功流与信息流在 SSH 管道合并时缺换行，导致表格与上一行粘连
 	$目录表格 = (Get-ChildItem -Force $最终安装目录 | Select-Object Name, Length, Mode | Format-Table -AutoSize | Out-String).TrimEnd()
 	Write-Host $目录表格
+	if ('__清理未认证连接__' -eq '1') { 清理-未认证SSH残留代理 }
 	return
 }
 
@@ -1123,3 +1147,4 @@ Write-Host '安装完成，当前目录内容如下。'
 # 表格经 Out-String 转为单字符串后由 Write-Host 输出：避免成功流与信息流在 SSH 管道合并时缺换行，导致表格与上一行粘连
 $目录表格 = (Get-ChildItem -Force $最终安装目录 | Select-Object Name, Length, Mode | Format-Table -AutoSize | Out-String).TrimEnd()
 Write-Host $目录表格
+if ('__清理未认证连接__' -eq '1') { 清理-未认证SSH残留代理 }
