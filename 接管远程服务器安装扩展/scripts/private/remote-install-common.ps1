@@ -861,7 +861,7 @@ $发布通道 = '__发布通道__'
 $守卫块 = "`r`n" + [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'ssh-pipe-guard.ps1'), [System.Text.Encoding]::UTF8)
 $守卫路径 = Join-Path $env:USERPROFILE 'Documents\WindowsPowerShell\profile.ps1'
 $守卫现状 = if (Test-Path -LiteralPath $守卫路径) { [System.IO.File]::ReadAllText($守卫路径) } else { '' }
-if ($守卫现状 -notmatch "管道执行守卫 v4'") {
+if ($守卫现状 -notmatch "管道执行守卫 v5'") {
 	# 先剥离旧版守卫块再贴新版：守卫总是追加在文件末尾，从首个守卫特征行截到文件尾即可；旧块若留在前面会先于新版触发并永久卡死（等 EOF 的旧 ReadToEnd）
 	$截断位置 = -1
 	foreach ($特征 in @('$守卫标记 = ''Remote-SSH 管道执行守卫', '# Remote-SSH 管道执行守卫', '$stdinScriptText', '[Console]::IsInputRedirected')) {
