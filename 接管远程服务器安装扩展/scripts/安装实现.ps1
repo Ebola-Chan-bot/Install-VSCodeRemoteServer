@@ -8,8 +8,7 @@ param(
 	[switch]$仅服务保活,
 	[switch]$移除服务保活,
 	[switch]$含服务保活,
-	[switch]$清理未认证连接,
-	[object]$平台提示映射
+	[switch]$清理未认证连接
 )
 
 # 仅供 VS Code 扩展的 preconnect 调用：免密、非交互，不再提供命令行模块入口。
@@ -123,11 +122,7 @@ function 执行-扩展安装 {
 		[switch]$移除服务保活,
 
 
-		[switch]$含服务保活,
-
-		# Remote-SSH 的 remotePlatform 映射（由 preconnect 实现脚本传入）：Windows 主机直走 powershell 单会话流程，不再徒劳尝试 sh 引导
-		[Parameter(DontShow)]
-		[object]$平台提示映射
+		[switch]$含服务保活
 	)
 
 	function 取-本地VSCode信息 {
@@ -457,6 +452,33 @@ function 执行-扩展安装 {
 		} catch { }
 		if ($详情.Count -eq 0) { return '远端未返回任何错误详情。' }
 		return ($详情 -join "`n")
+	}
+
+	# 平台自动探测的 Windows 引导回执：用最小 PowerShell 探针（带连字符标记，避开官方安装脚本回显的干扰）经 ssh 直接执行。PS2 版打 __WINPROBE_PS2__，其余打 __WINPROBE_OK__；Linux 上命令会被当成不存在的 powershell 而报错退出（且无标记）。
+	# 复用 执行-SSH命令带标准输入 的进程封装（免密参数与异步抽干 stderr），传一个无实际用途的极小 stdin 载荷（探针不读 stdin）；每行回调检查标记。
+	function 执行-Windows平台探测 {
+		param(
+			[string]$连接目标,
+			[int]$端口
+		)
+
+		$探针码 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes("if (`$PSVersionTable.PSVersion.Major -le 2) { Write-Output '__WINPROBE_PS2__' } else { Write-Output '__WINPROBE_OK__' }"))
+		$命令行 = 'powershell -NoProfile -EncodedCommand {0}' -f $探针码
+		$script:探测Windows标记 = $false
+		$script:探测PS2标记 = $false
+		$标记回调 = {
+			param($行)
+			if ($行 -match '__WINPROBE_PS2__') { $script:探测PS2标记 = $true }
+			if ($行 -match '__WINPROBE_OK__') { $script:探测Windows标记 = $true }
+		}
+		try {
+			执行-SSH命令带标准输入 -连接目标 $连接目标 -端口 $端口 -命令文本 $命令行 -标准输入文本 '__WINPROBE__' -超时秒 30 -每行回调 $标记回调
+		} catch {
+			# 探针失败（含命令不存在/超时）：一律视为非 Windows，保持原 Linux 错误。
+			return $false
+		}
+		if ($script:探测PS2标记) { throw '远程 PowerShell 为 2.0（Win7 适配），当前扩展不支持该版本，安装已中止。' }
+		return $script:探测Windows标记
 	}
 
 	function 初始化-SSH会话 {
@@ -1598,29 +1620,35 @@ function 执行-扩展安装 {
 	$竞速预备命令 = "sh -c 'D=`$HOME/{0}/race-{1}; mkdir -p `$D; for f in `$D/*; do [ -e `$f ] || continue; case `$f in *.uploading) continue;; *.downloading-*) continue;; esac; rm -rf `$f; done; exit 0'" -f $竞速数据目录名, $本地信息.提交号
 	# 扩展只走单会话：Linux 用 sh 引导，Windows 用 powershell -EncodedCommand 引导（脚本经 stdin）；建立、探测或报告任一环节失败都直接报错，不回退离散流程。
 	$接管会话 = $null
-	$平台提示 = ''
-	if ($true) {
+	# 平台自动判定：先按 Linux 建单会话；若引导失败（如对端实为 Windows、没有 sh/base64），稍后按 Windows 引导回执自动回退，不再读取 remote.SSH.remotePlatform 等手动设置。
+	try {
+		$接管会话 = 建立-接管会话 -连接目标 $连接目标 -端口 $SSH端口 -预备命令 $竞速预备命令
+	} catch {
+		# 会话建立失败：若为 Windows 回执则走 Windows 流程，否则原样抛出保留 ssh 真实错误。
+		if (-not (执行-Windows平台探测 -连接目标 $连接目标 -端口 $SSH端口)) { throw }
+	}
+	$环境 = $null
+	if ($null -ne $接管会话) {
 		try {
-			$平台提示 = [string]$平台提示映射.$远程主机
-		} catch { }
-		if ($平台提示 -match '^(?i)windows') {
-			# Windows 仅支持通用单会话流程；遇到不支持的 PowerShell 版本时直接报错。
-			$单会话上下文 = 初始化-竞速上下文-Windows单会话 -发布通道 $本地信息.发布通道 -提交号 $本地信息.提交号
-			$远程安装脚本文本 = $script:远程脚本_通用.Replace('__提交号__', $本地信息.提交号).Replace('__发布通道__', $本地信息.发布通道).Replace('__暂存目录__', 'AUTO').Replace('__清理未认证连接__', $(if ($清理未认证连接) { '1' } else { '0' }))
-			Write-Host ('远程连接目标: {0}' -f $连接目标)
-			Write-Host '远程系统类型: Windows（单会话全流程）'
-			Write-Host ('已启用竞速模式：本地子进程下载+上传 与 远程自下载并行，暂存目录 {0}（远端产物已就位时本轮零下载，自动跳过竞速）' -f $单会话上下文.暂存目录)
-			if ((执行-Windows单会话安装 -连接目标 $连接目标 -端口 $SSH端口 -脚本文本 $远程安装脚本文本 -竞速上下文 $单会话上下文) -eq '完成') {
-				清除-SSH密码复用
-				return
-			}
-			throw '远程 PowerShell 为 2.0（Win7 适配），当前扩展不支持该版本，安装已中止。'
-		} elseif ($平台提示 -notmatch '^(?i)windows') {
-			# 会话建立失败原样抛出，保留 ssh 的真实错误，不再改走离散安装。
-			$接管会话 = 建立-接管会话 -连接目标 $连接目标 -端口 $SSH端口 -预备命令 $竞速预备命令
+			$环境 = 初始化-SSH会话 -会话 $接管会话
+		} catch {
+			# Linux 单会话建立或探测失败：若对方实际是 Windows（没有 sh/base64、PowerShell 不支持 &&），按其引导回执自动改走 Windows 单会话，不再依赖任何平台设置。
+			$回退标记 = 执行-Windows平台探测 -连接目标 $连接目标 -端口 $SSH端口
+			if (-not $回退标记) { throw }
 		}
 	}
-	$环境 = 初始化-SSH会话 -会话 $接管会话
+	if ($null -eq $环境) {
+		$单会话上下文 = 初始化-竞速上下文-Windows单会话 -发布通道 $本地信息.发布通道 -提交号 $本地信息.提交号
+		$远程安装脚本文本 = $script:远程脚本_通用.Replace('__提交号__', $本地信息.提交号).Replace('__发布通道__', $本地信息.发布通道).Replace('__暂存目录__', 'AUTO').Replace('__清理未认证连接__', $(if ($清理未认证连接) { '1' } else { '0' }))
+		Write-Host ('远程连接目标: {0}' -f $连接目标)
+		Write-Host '远程系统类型: Windows（单会话全流程，平台由远端引导回执自动判定）'
+		Write-Host ('已启用竞速模式：本地子进程下载+上传 与 远程自下载并行，暂存目录 {0}（远端产物已就位时本轮零下载，自动跳过竞速）' -f $单会话上下文.暂存目录)
+		if ((执行-Windows单会话安装 -连接目标 $连接目标 -端口 $SSH端口 -脚本文本 $远程安装脚本文本 -竞速上下文 $单会话上下文) -eq '完成') {
+			清除-SSH密码复用
+			return
+		}
+		throw '远程 PowerShell 为 2.0（Win7 适配），当前扩展不支持该版本，安装已中止。'
+	}
 
 	Write-Host ('本机自动检测到的 VS Code 命令: {0}' -f $本地信息.命令路径)
 	Write-Host ('本机自动检测到的发布通道: {0}' -f $本地信息.发布通道)
@@ -1748,4 +1776,4 @@ function 执行-扩展安装 {
 
 }
 
-执行-扩展安装 -远程主机 $远程主机 -本地版本 $本地版本 -仅服务保活:$仅服务保活 -移除服务保活:$移除服务保活 -含服务保活:$含服务保活 -平台提示映射 $平台提示映射
+执行-扩展安装 -远程主机 $远程主机 -本地版本 $本地版本 -仅服务保活:$仅服务保活 -移除服务保活:$移除服务保活 -含服务保活:$含服务保活

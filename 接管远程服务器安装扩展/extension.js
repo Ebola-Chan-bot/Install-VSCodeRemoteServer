@@ -293,9 +293,8 @@ async function 执行接管(context, 交互) {
 		本地版本: 发布通道,
 		接管主机: 接管清单,
 		保活主机: 保活清单,
-		清理未认证连接主机: 取主机清单设置(清理未认证连接主机键).filter(主机 => 接管清单.includes(主机)),
-		// 平台提示取自 Remote-SSH 自己的 remotePlatform 设置：Windows 主机上单会话（sh/base64）必失败，提前告知安装脚本跳过那次徒劳尝试
-		平台提示映射: (vscode.workspace.getConfiguration('remote.SSH').get('remotePlatform') || {})
+		清理未认证连接主机: 取主机清单设置(清理未认证连接主机键).filter(主机 => 接管清单.includes(主机))
+		// 平台判定在安装脚本内自动完成（Linux 引导失败后按 Windows 回执回退），不再传递任何平台设置。
 	});
 	const 新钩子 = 重建钩子(当前钩子, 方式记录, 我方条目, 保存目录);
 	if (JSON.stringify(取钩子全局值()) !== JSON.stringify(新钩子)) {
