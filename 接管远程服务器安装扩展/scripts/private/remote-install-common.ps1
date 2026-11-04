@@ -857,32 +857,11 @@ function 展开-服务器压缩包 {
 $提交号 = '__提交号__'
 $发布通道 = '__发布通道__'
 # ===== Remote-SSH 管道执行守卫（幂等部署到用户 profile）：远端 sshd 的默认 shell 是 PowerShell 且 Remote-SSH 的连接脚本不带 -NoProfile、经 stdin 管道喂给交互式 REPL 执行，回显与提示符让输出膨胀并滞留在管道渲染段（连接端等不到握手标记只能超时，实测 122 秒超时仍失败）。
-# 守卫把「无命令行参数的管道会话」（裸 powershell 被整本喂脚本的形态）转为非交互整本执行，输出只剩脚本本身的少量关键行，一次冲刷即达；带参数/命令的会话与交互登录不受影响，本模块自身的 -EncodedCommand 会话也不受影响。经 stdin 管道喂给守卫自身即可执行修复脚本（守卫即执行通道）；修复/部署脚本的标识符必须用 ASCII（控制台输入按 GBK 解码，中文标识符会被毁）。
-$守卫块 = @'
-
-$守卫标记 = 'Remote-SSH 管道执行守卫 v3' # 幂等标记与版本号（勿删本行）：标记必须留在代码行尾注释里（整行注释会被载荷的去注释步骤剥掉，标记丢失会导致每连一次就重贴一份守卫）
-# stdin 是管道且进程无命令行参数 = 有程序把整本脚本喂给裸 REPL 执行（带参数/命令的会话照常执行，不拦截）。
-# 分块即读即执行、绝不等 EOF：实测管道 EOF 在终端场景下经常不来，等 EOF 的旧守卫会永久卡在 ReadToEnd（追踪只有 GUARD_START 没有 STDIN_BYTES）；逐行累积、能解析就立即点执行，脚本跑到哪算哪；非交互执行让输出只剩脚本本身的少量关键行，不再有回显/提示符膨胀滞留问题。
-if ([Console]::IsInputRedirected -and ([Environment]::GetCommandLineArgs().Count -eq 1)) {
-	$缓冲 = New-Object System.Text.StringBuilder
-	while ($true) {
-		$行文本 = [Console]::In.ReadLine()
-		if ($null -eq $行文本) { break }
-		[void]$缓冲.AppendLine($行文本)
-		try { $块 = [scriptblock]::Create($缓冲.ToString()) } catch { continue }
-		[void]$缓冲.Clear()
-		try { . $块 } catch { Write-Output ('脚本异常: {0}' -f $_.Exception.Message) }
-	}
-	if ($缓冲.Length -gt 0) {
-		try { . ([scriptblock]::Create($缓冲.ToString())) } catch { Write-Output ('脚本异常: {0}' -f $_.Exception.Message) }
-	}
-	exit
-}
-$守卫结束 = 1 # 守卫块结束标记（勿删本行）
-'@
+# 守卫正文从同目录的兄弟文件读取（引导已把本脚本与守卫文件一起落盘到临时目录，$PSScriptRoot 指向真实路径）
+$守卫块 = "`r`n" + [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'ssh-pipe-guard.ps1'), [System.Text.Encoding]::UTF8)
 $守卫路径 = Join-Path $env:USERPROFILE 'Documents\WindowsPowerShell\profile.ps1'
 $守卫现状 = if (Test-Path -LiteralPath $守卫路径) { [System.IO.File]::ReadAllText($守卫路径) } else { '' }
-if ($守卫现状 -notmatch "管道执行守卫 v3'") {
+if ($守卫现状 -notmatch "管道执行守卫 v4'") {
 	# 先剥离旧版守卫块再贴新版：守卫总是追加在文件末尾，从首个守卫特征行截到文件尾即可；旧块若留在前面会先于新版触发并永久卡死（等 EOF 的旧 ReadToEnd）
 	$截断位置 = -1
 	foreach ($特征 in @('$守卫标记 = ''Remote-SSH 管道执行守卫', '# Remote-SSH 管道执行守卫', '$stdinScriptText', '[Console]::IsInputRedirected')) {

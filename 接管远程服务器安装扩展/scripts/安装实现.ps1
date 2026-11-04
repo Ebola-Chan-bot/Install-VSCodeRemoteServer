@@ -1497,7 +1497,15 @@ function 执行-扩展安装 {
 		$压缩器.Write($正文字节, 0, $正文字节.Length)
 		$压缩器.Close()
 		$载荷 = [Convert]::ToBase64String($压缩流.ToArray())
-		$引导脚本 = $script:脚本_单会话引导.Replace('__载荷__', $载荷)
+		# 守卫文件也压缩成载荷：引导把它写到远端临时目录与安装脚本同目录，$PSScriptRoot 可直接引用
+		$守卫正文 = (Get-Content -Path (Join-Path $script:模块根目录 'private\ssh-pipe-guard.ps1') -Raw -Encoding UTF8)
+		$守卫压缩流 = New-Object System.IO.MemoryStream
+		$守卫压缩器 = New-Object System.IO.Compression.GZipStream($守卫压缩流, [System.IO.Compression.CompressionMode]::Compress)
+		$守卫字节 = [System.Text.Encoding]::UTF8.GetBytes($守卫正文)
+		$守卫压缩器.Write($守卫字节, 0, $守卫字节.Length)
+		$守卫压缩器.Close()
+		$守卫载荷 = [Convert]::ToBase64String($守卫压缩流.ToArray())
+		$引导脚本 = $script:脚本_单会话引导.Replace('__载荷__', $载荷).Replace('__守卫载荷__', $守卫载荷)
 		$引导码 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($引导脚本))
 		# ===== 传输通道：载荷走 stdin，argv 只装固定引导 =====
 		$固定引导码 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($script:脚本_stdin引导))
