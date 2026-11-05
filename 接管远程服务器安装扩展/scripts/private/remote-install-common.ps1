@@ -354,6 +354,8 @@ function 竞速-全部产物 {
 							$状态表[$产物名].已下载 = [long]$进度.已下载
 							$状态表[$产物名].总长度 = [long]$进度.总长度
 						} catch { }
+					} elseif ($行.StartsWith('__VSI_EVENT__')) {
+						Write-Output $行
 					} elseif (-not [string]::IsNullOrWhiteSpace($行)) {
 						Write-Host $行
 					}
@@ -364,7 +366,10 @@ function 竞速-全部产物 {
 				if ($null -ne $获胜方) {
 					New-Item -ItemType File -Force $项.本地取消标记 | Out-Null
 					Stop-Job -Job $项.下载作业 -ErrorAction SilentlyContinue
-					Receive-Job -Job $项.下载作业 -ErrorAction SilentlyContinue | Where-Object { -not ([string]$_).StartsWith('__VSI_PROGRESS__') } | ForEach-Object { Write-Host ([string]$_) }
+					Receive-Job -Job $项.下载作业 -ErrorAction SilentlyContinue | Where-Object { -not ([string]$_).StartsWith('__VSI_PROGRESS__') } | ForEach-Object {
+						$剩余行 = [string]$_
+						if ($剩余行.StartsWith('__VSI_EVENT__')) { Write-Output $剩余行 } else { Write-Host $剩余行 }
+					}
 					Remove-Job -Job $项.下载作业 -Force -ErrorAction SilentlyContinue
 					$获胜包路径 = if ($获胜方 -eq '本地供给') { $项.本地包路径 } else { $项.远程包路径 }
 					if (-not (Test-Path -LiteralPath $获胜包路径)) { throw ('竞速决出的包不存在: {0}' -f $获胜包路径) }
@@ -562,6 +567,16 @@ function 通过HTTP断点续传下载 {
 	function 写-进度主机([string]$文本) {
 		if (-not $结构化进度) { Write-Host $文本 }
 	}
+	function 写-竞速事件([string]$文本) {
+		# 结构化模式只发送协议事件，不能直接 Write-Host；主流程统一决定这些事件的汇报时点。
+		if ($结构化进度) {
+			$产物名 = ''
+			if ($端标注 -match '^\[远程自下载-(?<产物>[^\]]+)\]$') { $产物名 = $Matches['产物'] }
+			Write-Output ('__VSI_EVENT__' + (@{ 端 = '远程'; 产物 = $产物名; 文本 = $文本 } | ConvertTo-Json -Compress))
+		} else {
+			Write-Host $文本
+		}
+	}
 
 	# 基于 HTTP Range 头的断点续传：本地已存在部分文件时从偏移处继续。
 	# 不限重试次数与总时长；重试时刻对齐到下个汇报周期（见下方单一时钟），所有输出带时间戳。
@@ -648,7 +663,7 @@ function 通过HTTP断点续传下载 {
 					try { $Web请求.Abort() } catch { }
 					# 停滞重建事件也只放宽一档（+1，与无进展汇报同规则）：无上限、基于当时值，绝不翻倍也不重置回初值——重建只重置计时起点，窗口按 1,2,3,4,5… 等差增长
 					$报告周期秒数++
-					Write-Host ('{0} 连接持续无新字节，已确认停滞：干净重建 HTTP 连接（续传点 {1} 字节，不算失败）' -f $端标注, $已存在字节数)
+					写-竞速事件 ('{0} 连接持续无新字节，已确认停滞：干净重建 HTTP 连接（续传点 {1} 字节，不算失败）' -f $端标注, $已存在字节数)
 					$上次汇报时刻 = Get-Date
 					$上次汇报字节数 = $已存在字节数
 					continue
@@ -726,7 +741,7 @@ function 通过HTTP断点续传下载 {
 					$已写入字节数 = 0
 					# 停滞重建事件也只放宽一档（+1，与无进展汇报同规则）：无上限、基于当时值，绝不翻倍也不重置回初值——重建只重置计时起点，窗口按 1,2,3,4,5… 等差增长
 					$报告周期秒数++
-					Write-Host ('{0} 连接持续无新字节，已确认停滞：干净重建 HTTP 连接（续传点 {1} 字节，不算失败）' -f $端标注, $已存在字节数)
+					写-竞速事件 ('{0} 连接持续无新字节，已确认停滞：干净重建 HTTP 连接（续传点 {1} 字节，不算失败）' -f $端标注, $已存在字节数)
 					$上次汇报时刻 = Get-Date
 					$上次汇报字节数 = $已存在字节数
 					continue
@@ -789,7 +804,7 @@ function 通过HTTP断点续传下载 {
 			$等待秒数 = [Math]::Max(1, [int][Math]::Ceiling($报告周期秒数 - ($此刻 - $上次汇报时刻).TotalSeconds))
 			Start-Sleep -Seconds $等待秒数
 			$上次汇报时刻 = Get-Date
-			Write-Host ('{0} 上个汇报周期内第 {1} 次下载中断（续传点 {2} 字节）：{3}。本次汇报即续传重试' -f $端标注, $重试次数, $续传点字节数, $中断原因)
+			写-竞速事件 ('{0} 上个汇报周期内第 {1} 次下载中断（续传点 {2} 字节）：{3}。本次汇报即续传重试' -f $端标注, $重试次数, $续传点字节数, $中断原因)
 		}
 	}
 }

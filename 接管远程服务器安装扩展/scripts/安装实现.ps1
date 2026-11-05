@@ -957,7 +957,10 @@ function 执行-扩展安装 {
 		if ($收尾) {
 			foreach ($登记 in @($script:供给日志登记)) {
 				if (-not [string]::IsNullOrEmpty($登记.残段)) {
-					if ($登记.残段 -match '^\[本地供给-') { Write-Host $登记.残段 } else { Write-Host ('[本地供给-{0}] {1}' -f $登记.产物名, $登记.残段) }
+					# 残段也可能是统一事件协议，必须继续入队，不能在收尾时把协议文本当普通日志直出。
+					if (-not (登记-竞速快照 $登记.残段)) {
+						if ($登记.残段 -match '^\[本地供给-') { Write-Host $登记.残段 } else { Write-Host ('[本地供给-{0}] {1}' -f $登记.产物名, $登记.残段) }
+					}
 					$登记.残段 = ''
 				}
 			}
@@ -1376,10 +1379,18 @@ function 执行-扩展安装 {
 		foreach ($产物名 in $产物列表) {
 			$状态[$产物名] = @{ 完成 = $false; 本地 = @{ 已下载 = 0L; 总长度 = 0L; 完成 = $false }; 远程 = @{ 已下载 = 0L; 总长度 = 0L; 完成 = $false } }
 		}
-		$script:统一竞速汇报 = @{ 活跃 = $true; 周期 = 1; 起始时刻 = Get-Date; 下次汇报时刻 = (Get-Date).AddSeconds(1); 状态 = $状态 }
+		$script:统一竞速汇报 = @{ 活跃 = $true; 周期 = 1; 起始时刻 = Get-Date; 下次汇报时刻 = (Get-Date).AddSeconds(1); 状态 = $状态; 事件队列 = (New-Object System.Collections.ArrayList) }
 	}
 
 	function 登记-竞速快照([string]$行) {
+		if ($行.StartsWith('__VSI_EVENT__')) {
+			# 重建/中断等事件只登记，不在这里输出；输出统一由 推进-统一竞速汇报 在共享时钟到达时完成。
+			try {
+				$事件 = $行.Substring(13) | ConvertFrom-Json
+				if ($null -ne $script:统一竞速汇报) { [void]$script:统一竞速汇报.事件队列.Add($事件) }
+			} catch { }
+			return $true
+		}
 		if (-not $行.StartsWith('__VSI_SNAPSHOT__')) { return $false }
 		if ($null -eq $script:统一竞速汇报) { return $true }
 		try {
@@ -1407,7 +1418,15 @@ function 执行-扩展安装 {
 
 	function 推进-统一竞速汇报 {
 		if ($null -eq $script:统一竞速汇报 -or -not $script:统一竞速汇报.活跃 -or (Get-Date) -lt $script:统一竞速汇报.下次汇报时刻) { return }
+		# 唯一输出点：本次周期内收到的重建/中断事件与四端进度一起提交，任何下载器都不得在此之外直接输出周期日志。
+		$本周期事件 = @($script:统一竞速汇报.事件队列.ToArray())
+		$script:统一竞速汇报.事件队列.Clear()
+		foreach ($事件 in $本周期事件) {
+			if (-not [string]::IsNullOrWhiteSpace([string]$事件.文本)) { Write-Host ([string]$事件.文本) }
+		}
 		$意见 = @()
+		$已用秒 = ((Get-Date) - $script:统一竞速汇报.起始时刻).TotalSeconds
+		$周期 = $script:统一竞速汇报.周期
 		foreach ($产物名 in @('CLI', '服务端')) {
 			if (-not $script:统一竞速汇报.状态.ContainsKey($产物名)) { continue }
 			$产物状态 = $script:统一竞速汇报.状态[$产物名]
@@ -1426,11 +1445,10 @@ function 执行-扩展安装 {
 			}
 			$已下载 = [Math]::Max([long]$产物状态.本地.已下载, [long]$产物状态.远程.已下载)
 			$总长度 = [Math]::Max([long]$产物状态.本地.总长度, [long]$产物状态.远程.总长度)
-			$已用秒 = ((Get-Date) - $script:统一竞速汇报.起始时刻).TotalSeconds
-			$周期 = $script:统一竞速汇报.周期
 			if ($总长度 -gt 0 -and $已下载 -gt 0 -and (($总长度 - $已下载) * $已用秒 * 2 -lt $周期 * ($周期 - 1) * $已下载)) { $意见 += -1 } else { $意见 += 1 }
 		}
 		if ($意见.Count -eq 0) { $script:统一竞速汇报.活跃 = $false; return }
+		# 只由本调度器推进周期；各下载器不再维护可见汇报周期，事件也不重置时钟。
 		if ($意见 -contains 1) { $script:统一竞速汇报.周期++ } elseif (@($意见 | Where-Object { $_ -ne -1 }).Count -eq 0) { $script:统一竞速汇报.周期 = [Math]::Max(1, $script:统一竞速汇报.周期 - 1) }
 		$script:统一竞速汇报.下次汇报时刻 = (Get-Date).AddSeconds($script:统一竞速汇报.周期)
 	}

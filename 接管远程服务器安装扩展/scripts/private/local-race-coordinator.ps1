@@ -30,6 +30,11 @@ function 接收-作业输出($产物名) {
 			} catch { }
 			continue
 		}
+		if ($行.StartsWith('__VSI_EVENT__')) {
+			# 事件协议必须原样透出，主流程统一入队；此处不得加端标注或直接上屏，否则又会形成独立汇报点。
+			Write-Output $行
+			continue
+		}
 		if ([string]::IsNullOrWhiteSpace($行)) { continue }
 		if ($行 -match '本地下载完成') { $状态表[$产物名].汇报完成 = $true }
 		Write-Output ('[本地供给-{0}] {1}' -f $产物名, $行)
