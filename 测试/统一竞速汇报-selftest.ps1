@@ -20,6 +20,15 @@ foreach ($名字 in @('初始化-统一竞速汇报', '登记-竞速快照', '�
 }
 
 初始化-统一竞速汇报 -产物列表 @('CLI', '服务端')
+# 启动门槛：初始化状态不能凭空显示 0 字节；只有收到该端真实快照后才允许输出进度（即使真实的 0 字节也可以）。
+$script:统一竞速汇报.下次汇报时刻 = (Get-Date).AddSeconds(-1)
+$启动前输出 = @(调用-推进)
+断言 ($启动前输出.Count -eq 0) '供给启动前不输出默认的已传 0 字节'
+foreach ($端 in @('本地', '远程')) {
+	foreach ($产物 in @('CLI', '服务端')) {
+		断言 (-not $script:统一竞速汇报.状态[$产物][$端].已就绪) ('初始化时未伪造已就绪状态：' + $产物 + '/' + $端)
+	}
+}
 # 用完整的四端快照模拟竞速期间的原始协议输入；这些输入本身不应产生任何日志。
 $快照列表 = @(
 	(@{ 端 = '本地'; 产物 = 'CLI'; 已下载 = 1000; 总长度 = 100000 } | ConvertTo-Json -Compress),
@@ -101,6 +110,20 @@ Remove-Job -Job $作业表['CLI'] -Force -ErrorAction SilentlyContinue
 断言 ($转发事件.Count -eq 1 -and $转发事件[0].StartsWith('__VSI_EVENT__')) '真实协调器原样转发事件，不产生独立端标注日志'
 [void](登记-竞速快照 $转发事件[0])
 断言 ($script:统一竞速汇报.事件队列.Count -eq 1) '协调器转发的事件进入同一个主流程队列'
+
+# 真实 0 字节不是伪造状态：收到快照后允许显示，且启动消息必须先于它出现。
+$script:统一竞速汇报.下次汇报时刻 = (Get-Date).AddSeconds(-1)
+$零快照 = @{ 端 = '本地'; 产物 = 'CLI'; 已下载 = 0; 总长度 = 0 } | ConvertTo-Json -Compress
+[void](登记-竞速快照 ('__VSI_SNAPSHOT__' + $零快照))
+$零输出 = @(调用-推进)
+断言 ($script:统一竞速汇报.状态['CLI']['本地'].已就绪) '真实 0 字节快照将该端标记为已就绪'
+断言 ((@($零输出 | Where-Object { $_.Contains('[本地供给-CLI]') -and $_.Contains('已传 0 字节') }).Count) -eq 1) '真实 0 字节快照允许显示为已传 0 字节'
+$协调源 = Get-Content (Join-Path $仓库 '接管远程服务器安装扩展\scripts\private\local-race-coordinator.ps1') -Raw -Encoding UTF8
+$启动登记位置 = $协调源.IndexOf("Write-Output ('[本地供给-{0}] 本地供给已启动")
+$启动作业位置 = $协调源.IndexOf('$作业表[$产物名] = Start-Job')
+断言 ($启动登记位置 -ge 0 -and $启动作业位置 -gt $启动登记位置) '真实协调器先输出已启动，再创建供给作业'
+$本地源全文 = Get-Content $本地源 -Raw -Encoding UTF8
+断言 ($本地源全文.Contains('if (-not $结构化进度)') -and $本地源全文.Contains('组合竞速由 local-race-coordinator.ps1 在启动作业前播报')) '本地供给在组合模式下不重复播报已启动'
 
 Write-Output ''
 Write-Output ('统一竞速汇报回归失败数: ' + $失败)

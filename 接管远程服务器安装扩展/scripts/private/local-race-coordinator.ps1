@@ -62,6 +62,8 @@ try {
 		$产物 | Add-Member -MemberType NoteProperty -Name 结构化进度 -Value $true -Force
 		$产物 | Export-Clixml -LiteralPath $单参数文件
 		$供给脚本 = Join-Path $PSScriptRoot 'local-supply.ps1'
+		# 在启动作业前先登记启动状态，保证“已启动”早于该端任何真实进度；子进程随后发出的首份快照才允许主流程显示进度。
+		Write-Output ('[本地供给-{0}] 本地供给已启动：直接开始下载（产物 {0}），不为预检单开 SSH 连接。' -f $产物名)
 		$作业表[$产物名] = Start-Job -ArgumentList $供给脚本, $单参数文件 -ScriptBlock {
 			param($脚本, $单参数)
 			& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $脚本 $单参数 2>&1 | ForEach-Object { [string]$_ }

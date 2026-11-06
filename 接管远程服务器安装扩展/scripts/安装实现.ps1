@@ -1377,7 +1377,8 @@ function 执行-扩展安装 {
 		param([string[]]$产物列表)
 		$状态 = @{}
 		foreach ($产物名 in $产物列表) {
-			$状态[$产物名] = @{ 完成 = $false; 本地 = @{ 已下载 = 0L; 总长度 = 0L; 完成 = $false }; 远程 = @{ 已下载 = 0L; 总长度 = 0L; 完成 = $false } }
+			# 已就绪 = 收到真实快照，而不是“尚未启动”的默认零值。否则初始化后的第一次时钟汇报会先于供给启动消息打印“已传 0 字节”。
+			$状态[$产物名] = @{ 完成 = $false; 本地 = @{ 已下载 = 0L; 总长度 = 0L; 完成 = $false; 已就绪 = $false }; 远程 = @{ 已下载 = 0L; 总长度 = 0L; 完成 = $false; 已就绪 = $false } }
 		}
 		$script:统一竞速汇报 = @{ 活跃 = $true; 周期 = 1; 起始时刻 = Get-Date; 下次汇报时刻 = (Get-Date).AddSeconds(1); 状态 = $状态; 事件队列 = (New-Object System.Collections.ArrayList) }
 	}
@@ -1400,6 +1401,7 @@ function 执行-扩展安装 {
 			if ($script:统一竞速汇报.状态.ContainsKey($产物名) -and $script:统一竞速汇报.状态[$产物名].ContainsKey($端)) {
 				$script:统一竞速汇报.状态[$产物名][$端].已下载 = [long]$快照.已下载
 				$script:统一竞速汇报.状态[$产物名][$端].总长度 = [long]$快照.总长度
+				$script:统一竞速汇报.状态[$产物名][$端].已就绪 = $true
 			}
 		} catch { }
 		return $true
@@ -1433,7 +1435,7 @@ function 执行-扩展安装 {
 			if ($产物状态.完成) { continue }
 			foreach ($端 in @('本地', '远程')) {
 				$快照 = $产物状态[$端]
-				if ($快照.完成) { continue }
+				if ($快照.完成 -or -not $快照.已就绪) { continue }
 				$标签 = if ($端 -eq '本地') { '本地供给' } else { '远程自下载' }
 				$句式 = if ($端 -eq '本地') { '本地下载进度' } else { '远程下载进度' }
 				if ($快照.总长度 -gt 0) {
@@ -1480,7 +1482,9 @@ function 执行-扩展安装 {
 					产物列表 = @($竞速上下文.产物列表 | Where-Object { ($待装列表 -contains $_.产物名) -and -not $已启动产物.Contains($_.产物名) })
 				}
 				foreach ($单个 in (& $启动动作 -竞速上下文 $待装上下文 -连接目标 $连接目标 -端口 $端口 -系统类型 $系统类型)) { [void]$供给容器.Add($单个) }
-				foreach ($产物 in $待装上下文.产物列表) { [void]$已启动产物.Add([string]$产物.产物名) }
+				foreach ($产物 in $待装上下文.产物列表) {
+					[void]$已启动产物.Add([string]$产物.产物名)
+				}
 			}
 			if ($行 -match '竞速获胜|本轮零下载') {
 				$调度状态.已结束 = $true
