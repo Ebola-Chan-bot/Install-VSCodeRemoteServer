@@ -125,6 +125,27 @@ $启动作业位置 = $协调源.IndexOf('$作业表[$产物名] = Start-Job')
 $本地源全文 = Get-Content $本地源 -Raw -Encoding UTF8
 断言 ($本地源全文.Contains('if (-not $结构化进度)') -and $本地源全文.Contains('组合竞速由 local-race-coordinator.ps1 在启动作业前播报')) '本地供给在组合模式下不重复播报已启动'
 
+# 重入回归：模拟 Write-Host 触发的嵌套回调，同一周期内再次推进不得重复打印同一份快照。
+初始化-统一竞速汇报 -产物列表 @('服务端')
+$重入快照 = @{ 端 = '本地'; 产物 = '服务端'; 已下载 = 20986865; 总长度 = 208914841 } | ConvertTo-Json -Compress
+[void](登记-竞速快照 ('__VSI_SNAPSHOT__' + $重入快照))
+$script:统一竞速汇报.下次汇报时刻 = (Get-Date).AddSeconds(-1)
+$script:测试重入次数 = 0
+$script:测试进度打印次数 = 0
+function Write-Host {
+	[CmdletBinding()]
+	param([Parameter(ValueFromRemainingArguments = $true)]$参数)
+	$script:测试进度打印次数++
+	if ($script:测试重入次数 -eq 0) {
+		$script:测试重入次数++
+		推进-统一竞速汇报
+	}
+}
+$重入输出 = @(调用-推进)
+Remove-Item Function:\Write-Host
+断言 ($script:测试进度打印次数 -eq 1) '输出期间发生重入时，同一端同一周期仍只打印一次'
+断言 (-not $script:统一竞速汇报.正在输出) '重入调用结束后正在输出标记已复位'
+
 Write-Output ''
 Write-Output ('统一竞速汇报回归失败数: ' + $失败)
 exit $(if ($失败 -eq 0) { 0 } else { 1 })
