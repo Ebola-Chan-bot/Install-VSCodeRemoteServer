@@ -1182,7 +1182,11 @@ function 执行-扩展安装 {
 				$文本行 = $读取任务.Result
 				if ($null -eq $文本行) { break }
 				if ($文本行 -match '^__FRAME_TRUNCATED__') {
-					throw ('远端报告帧数据不完整（发端字节被改写或传输错位）：{0}' -f $文本行)
+					$详情 = 取-会话诊断摘要 -会话 $会话 -标准输出 @()
+					if ($详情 -match 'Disk quota exceeded') {
+						throw ("远端用户存储配额已满，安装文件无法落盘：{0}`n{1}" -f $文本行, $详情)
+					}
+					throw ("远端帧文件接收或落盘失败：{0}`n{1}" -f $文本行, $详情)
 				}
 				if ($文本行 -match '^__ORCH_EXIT__=(\d+)') {
 					$编排退出码 = [int]$Matches[1]
