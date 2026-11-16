@@ -999,8 +999,8 @@ function 清理-未认证SSH残留代理 {
 # 竞速暂存目录：本地模块与远程脚本约定在同一目录交换压缩包与标记文件；空串表示未启用竞速，回退远程单独下载
 $暂存目录 = '__暂存目录__'
 if ($暂存目录 -eq 'AUTO') {
-	# 单会话模式的哨兵值：暂存目录由本脚本自行推算，本地模块不探测登录目录、scp 只用相对路径。
-	# 必须解析成登录目录基准的绝对路径：相对路径随执行上下文漂移（实测 Start-Job 的 CWD 是「文档」目录，AUTO\REMOTE_CLI.zip 被解析成 文档\AUTO\... 直接报 Cannot find path 中断安装），而 scp 相对路径的落点实测就是登录目录，锚定 $env:USERPROFILE 与之对齐。
+	# 单会话模式的哨兵值：暂存目录由本脚本自行推算，本地模块不探测登录目录、交接改名命令只用 $env:USERPROFILE 基准的相对路径。
+	# 必须解析成登录目录基准的绝对路径：相对路径随执行上下文漂移（实测 Start-Job 的 CWD 是「文档」目录，AUTO\REMOTE_CLI.zip 被解析成 文档\AUTO\... 直接报 Cannot find path 中断安装）；帧通道的落盘点恒为登录目录（%USERPROFILE%，见 Windows单会话引导.ps1 的帧接收器），锚定 $env:USERPROFILE 与之对齐。
 	$数据目录名 = if ($发布通道 -eq 'insider') { '.vscode-server-insiders' } else { '.vscode-server' }
 	$暂存目录 = ('{0}\{1}\race-{2}' -f $env:USERPROFILE, $数据目录名, $提交号)
 }

@@ -26,7 +26,8 @@ $script:脚本_服务保活改名器 = (Get-Content -Path (Join-Path $script:模
 # 会话引导与编排的脚本正文一律独立成文件（不在 psm1 里内嵌字符串），sh 正文加载时归一 LF 行尾（sh 对 \r 零容忍）
 # stdin 引导是「固定极小」的一层：载荷经标准输入送达、argv 只装本引导的 EncodedCommand，命令行长度与安装脚本大小彻底解耦
 $script:脚本_单会话引导 = Get-Content -Path (Join-Path $script:模块根目录 'private\Windows单会话引导.ps1') -Raw -Encoding UTF8
-$script:脚本_stdin引导 = Get-Content -Path (Join-Path $script:模块根目录 'private\windows-stdin-bootstrap.ps1') -Raw -Encoding UTF8
+# stdin 引导加载时剔除整行注释与空行（同安装脚本正文的纪律）：注释只服务维护、不占 argv 预算——此前原文编码已占 6400 字符，帧通道改造后的代码体若连注释一起编码会顶穿守卫线
+$script:脚本_stdin引导 = ((Get-Content -Path (Join-Path $script:模块根目录 'private\windows-stdin-bootstrap.ps1') -Raw -Encoding UTF8) -split "`r?`n" | Where-Object { $_ -notmatch '^\s*#' -and $_.Trim() -ne '' }) -join "`n"
 $script:脚本_会话帧循环 = (Get-Content -Path (Join-Path $script:模块根目录 'private\会话帧循环.sh') -Raw -Encoding UTF8) -replace "`r`n", "`n"
 $script:脚本_环境探测命令 = (Get-Content -Path (Join-Path $script:模块根目录 'private\环境探测命令.txt') -Raw -Encoding UTF8) -replace "`r`n", "`n"
 $script:脚本_接管编排模板 = (Get-Content -Path (Join-Path $script:模块根目录 'private\接管编排脚本模板.sh') -Raw -Encoding UTF8) -replace "`r`n", "`n"
@@ -514,57 +515,6 @@ function 执行-扩展安装 {
 		}
 	}
 
-	function 执行-SSH命令 {
-		param(
-			[string]$连接目标,
-			[int]$端口,
-			[string]$命令文本,
-			[string]$标准输入,
-			[switch]$TTY,
-			[scriptblock]$每行回调
-		)
-
-		$ssh命令 = Get-Command ssh -ErrorAction SilentlyContinue | Select-Object -First 1
-		if ($null -eq $ssh命令) {
-			throw '未找到 ssh 命令，无法连接远程服务器。'
-		}
-
-		$ssh参数 = @('-p', $端口) + $script:SSH密码选项
-		if ($TTY) { $ssh参数 += '-t' }
-		$ssh参数 += $连接目标
-		$ssh参数 += $命令文本
-
-		# 流式转发并逐行回调（用于竞速判胜等事件监听）：Write-Host 保持原有的控制台实时输出；转发前剥离远端控制序列，避免本地终端照做执行造成乱行。
-		# PS 5.1 下原生命令 stderr 一旦被重定向即变终止性错误，捕获期间临时切 Continue 并在 finally 恢复
-		$原始EAP = $ErrorActionPreference
-		$退出码 = 0
-		try {
-			$ErrorActionPreference = 'Continue'
-			$script:标题序列未闭合 = $false
-			$处理行 = {
-				$文本 = 剥离-终端控制序列 ([string]$_)
-				# 远端 powershell 在非控制台 stdio 下会把进度记录序列化成 CLIXML 噪声（#< CLIXML / <Objs>…），滤掉不进日志
-				if ($文本 -match '^(#< CLIXML|<Objs|</Objs>)') { return }
-				Write-Host $文本
-				if ($每行回调) { & $每行回调 $文本 }
-				转发-供给日志
-			}
-			# 大载荷一律走标准输入：argv 只装固定引导，命令行长度不再随安装脚本膨胀。
-			# 实测教训（2026-10-22）：双重 base64 后 argv 达 37,950 字符 > CreateProcess 上限 32,767，本地 ssh.exe 直接拒绝启动（Program 'ssh.exe' failed to run: The filename or extension is too long），退出码 1 冒到 preconnect → Remote-SSH 判 PreconnectScriptFailure，整条连接夭折。管道结束时 PowerShell 会关闭原生进程的标准输入，EOF 确定送达，远端 ReadToEnd 才能返回。
-			if ([string]::IsNullOrEmpty($标准输入)) {
-				& $ssh命令.Source $ssh参数 2>&1 | ForEach-Object $处理行
-			} else {
-				$标准输入 | & $ssh命令.Source $ssh参数 2>&1 | ForEach-Object $处理行
-			}
-			$退出码 = $LASTEXITCODE
-		} finally {
-			$ErrorActionPreference = $原始EAP
-		}
-		if ($退出码 -ne 0) {
-			throw ('SSH 执行失败，退出码: {0}' -f $退出码)
-		}
-	}
-
 	function 抛出-stdin启动中断($进程, $错误任务) {
 		# 专用抛出点保证调用方能收到带类型的通道异常，而不是 PowerShell 对函数内终止错误的通用包装。
 		$null = $进程.WaitForExit(30000)
@@ -574,7 +524,8 @@ function 执行-扩展安装 {
 		throw ('[stdin通道中断] SSH 在完整接收安装载荷前关闭了标准输入，远端安装尚未开始（{0}）。{1}' -f $退出描述, $错误摘要)
 	}
 
-	# 走标准输入下发大载荷的 SSH 调用（Windows 单会话引导专用）：自己起 ssh 进程、把载荷一次性写入 StandardInput 后**显式 Close()**，输出异步读并配硬超时看门狗。为什么不用 PowerShell 管道（`$文本 | & ssh …`）：管道收尾不可靠是**偶发真实故障**——实测同一条通道 2KB/40KB/400KB 三档都在约 1 秒内无损送达（长度 + SHA256 双判据一致、退出码 0），但 120KB 那一档**挂死约 66 分钟**（退出码 -1、哈希无法核对）。无声挂死会把 Remote-SSH 的整个连接一起拖死，所以这里改成：EOF 由我们自己关闭（确定性），并加超时看门狗——超时即 taskkill 整树 + 抛类型化错误，让调用方重试而不是干等。
+	# 走标准输入下发大载荷的 SSH 调用（Windows 单会话引导专用）：自己起 ssh 进程、把载荷 + 引导结束标记经 BaseStream 写出，输出异步读并配硬超时看门狗。为什么不用 PowerShell 管道（`$文本 | & ssh …`）：管道收尾不可靠是**偶发真实故障**——实测同一条通道 2KB/40KB/400KB 三档都在约 1 秒内无损送达（长度 + SHA256 双判据一致、退出码 0），但 120KB 那一档**挂死约 66 分钟**（退出码 -1、哈希无法核对）。无声挂死会把 Remote-SSH 的整个连接一起拖死，所以这里改成：载荷边界由我们自己发出的 __BOOTSTRAP_END__ 标记划定（确定性），并加超时看门狗——超时即 taskkill 整树 + 抛类型化错误，让调用方重试而不是干等。
+	# -保留帧通道（Windows 单会话安装）：载荷送出后 stdin 不关闭而是保留为帧通道，并按 交接匹配 启动帧上传器线程——本地供给的竞速产物（.job 交接文件）经**同一条**连接的 __FILE__/__CMD__ 帧送出，全流程零额外 SSH/scp。非帧通道模式（平台探针）仍在写完后关闭 stdin 送出 EOF（探针命令不读 stdin）。
 	function 执行-SSH命令带标准输入 {
 		param(
 			[string]$连接目标,
@@ -582,7 +533,9 @@ function 执行-扩展安装 {
 			[string]$命令文本,
 			[string]$标准输入文本,
 			[int]$超时秒 = 240,
-			[scriptblock]$每行回调
+			[scriptblock]$每行回调,
+			[switch]$保留帧通道,
+			[string]$交接匹配 = ''
 		)
 
 		$ssh命令 = Get-Command ssh -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -614,7 +567,8 @@ function 执行-扩展安装 {
 		$进程 = [System.Diagnostics.Process]::Start($psi)
 		# stderr 必须异步抽干：只重定向不读取，缓冲区写满（约 4KB）就会把远端进程堵住 → 表现为"挂死"，与被替换掉的管道式写法是同一类故障，这里一并根除（仓库既有的 预热直连 也是这么做的）
 		$错误任务 = $进程.StandardError.ReadToEndAsync()
-		$标准输入关闭 = $false
+		$载荷已送出 = $false
+		$帧上传器 = $null
 		$截止 = (Get-Date).AddSeconds($超时秒)
 		$已超时 = $false
 		$有效行数 = 0
@@ -624,30 +578,47 @@ function 执行-扩展安装 {
 		$原EAP = $ErrorActionPreference
 		try {
 			$ErrorActionPreference = 'Continue'
-			# 载荷一次性写入并立刻关闭：EOF 由我们决定，不给通道留"收尾不确定"的空间
-			# 载荷是 base64 分块（纯 ASCII，不含 CR 也容忍被加 CRLF），用 ASCII 写字节即可
+			# 载荷一次性写入后紧跟引导结束标记行：标记只划定载荷边界。帧通道模式下 stdin 不关闭——它随后就是帧通道（本地供给产物由帧上传器线程送入）；非帧通道模式（平台探针）仍显式 Close() 送 EOF，不给通道留"收尾不确定"的空间
+			# 载荷是 base64 文本（纯 ASCII），BaseStream 裸字节写出，避开 StreamWriter 编码层（BOM/换行转换会污染帧流）
 			$载荷字节 = [System.Text.Encoding]::ASCII.GetBytes($标准输入文本)
+			$标记字节 = [System.Text.Encoding]::ASCII.GetBytes("`n__BOOTSTRAP_END__`n")
 			try {
 				$进程.StandardInput.BaseStream.Write($载荷字节, 0, $载荷字节.Length)
+				$进程.StandardInput.BaseStream.Write($标记字节, 0, $标记字节.Length)
 				$进程.StandardInput.Flush()
-				$进程.StandardInput.Close()
-				$标准输入关闭 = $true
+				if (-not $保留帧通道) { $进程.StandardInput.Close() }
+				$载荷已送出 = $true
 			} catch {
 				抛出-stdin启动中断 $进程 $错误任务
 			}
-			# 本地侧检查点：写出+关闭完成说明 EOF 已交给 ssh.exe，此后若再无任何有效输出，挂点必在远端/连接层而非载荷没送出去——事后取证时这行日志就是分界线
-			Write-Host ('[单会话] 载荷已写出 {0} 字节并关闭标准输入，等待远端引导回执…' -f $载荷字节.Length)
+			if ($保留帧通道 -and $交接匹配 -ne '') {
+				# 帧上传器 = 独立 runspace 线程（与 Linux 编排路径同一套 启动-帧上传器）：主线程只读输出、stdin 只由上传器写，双工占用同一条连接、无并发写入风险
+				$帧上传器 = 启动-帧上传器 -会话 ([pscustomobject]@{ 标准输入 = $进程.StandardInput }) -扫描目录 $env:TEMP -匹配模式 $交接匹配
+			}
+			# 本地侧检查点：写出完成说明载荷与标记已交给 ssh.exe，此后若再无任何有效输出，挂点必在远端/连接层而非载荷没送出去——事后取证时这行日志就是分界线
+			if ($保留帧通道) {
+				Write-Host ('[单会话] 载荷已写出 {0} 字节并送出引导结束标记，标准输入保留为帧通道，等待远端引导回执…' -f $载荷字节.Length)
+			} else {
+				Write-Host ('[单会话] 载荷已写出 {0} 字节并关闭标准输入，等待远端引导回执…' -f $载荷字节.Length)
+			}
 
 			$script:标题序列未闭合 = $false
 			# 注意：本循环以 `& $处理行 $行` 直接调用（不是 ForEach-Object 的管道调用），
 			# 所以行处理器**必须用 param 接收实参**。写成 `[string]$_` 只在管道调用下才取到内容：
 			# 实测那样取值恒为空串，后果是远端每一行都变空行——竞速标记进不了回调、本地供给永不启动（只剩远端独自下载），
 			# 且空行仍算“有进展”把看门狗截止时间一路顺延（实测 448 秒 > 240 秒也没被杀），表现为“远端在跑、本地一片静默”。
+			$诊断源 = [pscustomobject]@{ 进程 = $进程; 错误任务 = $错误任务 }
 			$处理行 = {
 				param([string]$文本行)
 				$文本 = 剥离-终端控制序列 $文本行
 				# 远端 powershell 在非控制台 stdio 下会把进度记录序列化成 CLIXML 噪声，滤掉不进日志
 				if ($文本 -match '^(#< CLIXML|<Objs|</Objs>)') { return }
+				# 帧文件落盘失败（远端接收器核对字节数不符或写盘异常，磁盘满/配额最常见）：立即带 stderr 诊断中止并杀掉进程树，不得只归因“传输错位”，与 Linux 编排路径同一语义
+				if ($文本 -match '^__FRAME_TRUNCATED__') {
+					$详情 = 取-会话诊断摘要 -会话 $诊断源 -标准输出 @()
+					try { & taskkill /PID $进程.Id /T /F 2>&1 | Out-Null } catch { }
+					throw ("远端帧文件接收或落盘失败：{0}`n{1}" -f $文本, $详情)
+				}
 				if (-not (登记-竞速快照 $文本)) {
 					Write-Host $文本
 					if ($每行回调) { & $每行回调 $文本 }
@@ -686,10 +657,13 @@ function 执行-扩展安装 {
 				if ($有效行数 -eq 0 -and (Get-Date) -gt $启动截止) { $已超时 = $true; $启动层挂死 = $true; break }
 			}
 		} finally {
+			# 收尾次序：先停帧上传（可能正卡在大帧写入，异步等待+超时强停）再关 stdin；读循环抛异常（含 __FRAME_TRUNCATED__）时同样必经此处，不留挂着的上传器线程
+			停止-帧上传器 $帧上传器
+			try { $进程.StandardInput.Close() } catch { }
 			$ErrorActionPreference = $原EAP
 		}
 
-		if (-not $标准输入关闭) { 抛出-stdin启动中断 $进程 $错误任务 }
+		if (-not $载荷已送出) { 抛出-stdin启动中断 $进程 $错误任务 }
 		if ($已超时) {
 			# 看门狗：挂死的会话必须连整棵进程树一起清掉，否则本地 ssh 与远端 powershell 会双双留着占会话
 			try { & taskkill /PID $进程.Id /T /F 2>&1 | Out-Null } catch { }
@@ -816,12 +790,10 @@ function 执行-扩展安装 {
 	function 启动-本地竞速供给 {
 		param(
 			[pscustomobject]$竞速上下文,
-			[string]$连接目标,
-			[int]$端口,
 			[string]$系统类型
 		)
 
-		# 供给以独立子 powershell 进程运行（不再是 Start-Job 的同进程 runspace）：Start-Job 无法中断阻塞的网络调用，而子进程可在任意步骤被 taskkill /T /F 连同其派生的 ssh/scp 一起终止，实现真正的零轮询即时取消。CLI 与服务端交给同一个组合协调器同时启动、共享汇报周期；sysroot 素材仍按独立产物供给。参数经 Clixml 文件传入子进程（避开命令行转义与 PS 5.1 原生 stderr 陷阱）；stdout/stderr 重定向到日志文件，收尾时回收打印。
+		# 供给以独立子 powershell 进程运行（不再是 Start-Job 的同进程 runspace）：Start-Job 无法中断阻塞的网络调用，而子进程可在任意步骤被 taskkill /T /F 整树终止，实现真正的零轮询即时取消。单连接纪律：供给进程只下载、不建任何 SSH/scp 连接，产物经 .job 交接给主会话帧上传器。CLI 与服务端交给同一个组合协调器同时启动、共享汇报周期；sysroot 素材仍按独立产物供给。参数经 Clixml 文件传入子进程（避开命令行转义与 PS 5.1 原生 stderr 陷阱）；stdout/stderr 重定向到日志文件，收尾时回收打印。
 		$组合产物 = @($竞速上下文.产物列表 | Where-Object { $_.产物名 -in @('CLI', '服务端') })
 		if ($组合产物.Count -eq @($竞速上下文.产物列表).Count -and $组合产物.Count -gt 0) {
 			$控制目录 = Join-Path $env:TEMP ('race-coordinator-' + ([guid]::NewGuid().ToString('N')))
@@ -829,7 +801,7 @@ function 执行-扩展安装 {
 			$参数文件 = Join-Path $控制目录 '组合参数.xml'
 			$配置列表 = @($组合产物 | ForEach-Object {
 				[pscustomobject]@{
-					产物名 = $_.产物名; 连接目标 = $连接目标; 端口 = $端口; 密码选项 = @($script:SSH密码选项); 暂存目录 = $竞速上下文.暂存目录
+					产物名 = $_.产物名; 暂存目录 = $竞速上下文.暂存目录
 					下载地址列表 = @($_.下载地址列表); 本地文件名 = [string]$_.本地文件名; 远程包名 = $_.远程包名; 完成标记名 = $_.完成标记名; 取消标记名 = $_.取消标记名
 					系统类型 = $系统类型; 分隔符 = $竞速上下文.分隔符; 提交号 = $竞速上下文.提交号; 架构标识 = $竞速上下文.架构标识; 父进程ID = $PID
 				}
@@ -853,9 +825,6 @@ function 执行-扩展安装 {
 
 			@{
 				产物名 = $产物.产物名
-				连接目标 = $连接目标
-				端口 = $端口
-				密码选项 = @($script:SSH密码选项)
 				暂存目录 = $竞速上下文.暂存目录
 				下载地址列表 = @($产物.下载地址列表)
 				本地文件名 = [string]$产物.本地文件名
@@ -895,8 +864,8 @@ function 执行-扩展安装 {
 			$供给
 		)
 
-		# 击杀供给进程树（$供给 可为单个供给对象或数组，逐个处理）：taskkill /T 连同其派生的 ssh/scp 子进程一起终止；
-		# PS 5.1 的 .NET Process.Kill() 只杀单进程不含子进程，更无法中断子进程内阻塞的下载/上传，故用 taskkill。
+		# 击杀供给进程树（$供给 可为单个供给对象或数组，逐个处理）：taskkill /T 整树终止（供给只下载不建连接，终止的就是阻塞中的下载与其派生子进程）；
+		# PS 5.1 的 .NET Process.Kill() 只杀单进程不含子进程，更无法中断子进程内阻塞的网络调用，故用 taskkill。
 		foreach ($单个供给 in @($供给)) {
 			if ($null -eq $单个供给 -or $null -eq $单个供给.进程) { continue }
 			$proc = $单个供给.进程
@@ -1105,8 +1074,14 @@ function 执行-扩展安装 {
 		$进程 = [System.Diagnostics.Process]::Start($psi)
 		$错误任务 = $进程.StandardError.ReadToEndAsync()
 		# 牺牲行吸收 StreamWriter 首次写入的 UTF-8 BOM 前导（实测 ef bb bf 会贴在第一帧行首导致帧型匹配失败、整条帧流错位）：带换行的整行连 BOM 一起被远端帧循环当未知帧忽略，其后的真帧（BaseStream 字节直写）不受污染
-		$进程.StandardInput.Write('预热行-吸收编码前导' + "`n")
-		$进程.StandardInput.Flush()
+		try {
+			$进程.StandardInput.Write('预热行-吸收编码前导' + "`n")
+			$进程.StandardInput.Flush()
+		} catch {
+			# 单连接纪律：会话尚未交还调用方就写失败时，连整棵 ssh 进程树一起清掉再抛，不留占远程会话名额的泄漏连接
+			try { & taskkill /PID $进程.Id /T /F 2>&1 | Out-Null } catch { }
+			throw
+		}
 
 		return [pscustomobject]@{
 			进程 = $进程
@@ -1274,8 +1249,6 @@ function 执行-扩展安装 {
 
 	function 执行-接管编排 {
 		param(
-			[string]$连接目标,
-			[int]$端口,
 			[string]$远程登录目录,
 			[string]$提交号,
 			[string]$发布通道,
@@ -1289,7 +1262,7 @@ function 执行-扩展安装 {
 		$会话
 	)
 
-		# 阶段文件经帧通道送入同一远程会话，依次执行 sysroot → 安装 → 原生补丁 → 保活 → 清理；未见「编排完成」标记时在 finally 兜底清理远端暂存文件。
+		# 阶段文件经帧通道送入同一远程会话，依次执行 sysroot → 安装 → 原生补丁 → 保活 → 清理。任何退出路径（含失败）的远端阶段文件清理都由编排脚本的 EXIT trap 保证；单连接纪律：本地不再为失败清理另开 SSH 连接。
 		$根目录 = $远程登录目录.TrimEnd('/', '\')
 		$暂存目录 = if ($null -ne $竞速上下文) { $竞速上下文.暂存目录 } else { '' }
 		$兼容性目录 = $根目录 + '/vscode-sysroot'
@@ -1304,13 +1277,6 @@ function 执行-扩展安装 {
 			[System.IO.File]::WriteAllText($路径, ($内容 -replace "`r`n", "`n"), [System.Text.UTF8Encoding]::new($false))
 			[void]$上传清单.Add($路径)
 		}
-
-		$编排状态 = @{ 已完成 = $false }
-		$包装回调 = {
-			param($行)
-			if ($null -ne $每行回调) { & $每行回调 $行 }
-			if ($行 -match '接管安装-编排\] 编排完成') { $编排状态.已完成 = $true }
-		}.GetNewClosure()
 
 		try {
 			& $落盘 'vsi-stage-orch.sh' (生成-接管编排脚本 -暂存目录 $暂存目录 -兼容性目录 $兼容性目录)
@@ -1338,17 +1304,13 @@ function 执行-扩展安装 {
 			foreach ($路径 in $上传清单) {
 				$帧清单 += @{ 路径 = $路径; 名 = [System.IO.Path]::GetFileName($路径) }
 			}
-			发送-会话阶段 -会话 $会话 -文件清单 $帧清单 -运行命令 'sh vsi-stage-orch.sh' -每行回调 $包装回调 -交接目录 $env:TEMP -交接匹配 ('race-supply-{0}-*.job' -f $提交号)
+			发送-会话阶段 -会话 $会话 -文件清单 $帧清单 -运行命令 'sh vsi-stage-orch.sh' -每行回调 $每行回调 -交接目录 $env:TEMP -交接匹配 ('race-supply-{0}-*.job' -f $提交号)
 		} finally {
 			Remove-Item -LiteralPath $本地目录 -Recurse -Force -ErrorAction SilentlyContinue
 			if ($null -ne $会话) {
 				关闭-接管会话 $会话
 			}
-			if (-not $编排状态.已完成) {
-				# 异常退出兜底：清掉远端暂存的阶段文件与竞速暂存目录（失败无害；正常路径已由编排脚本收尾）
-				$清理命令 = if ($暂存目录 -ne '') { ('rm -f vsi-stage-*; rm -rf ''{0}'' 2>/dev/null' -f $暂存目录) } else { 'rm -f vsi-stage-*' }
-				try { 执行-SSH命令 -连接目标 $连接目标 -端口 $端口 -命令文本 $清理命令 } catch { }
-			}
+			# 失败清理不另开连接：阶段文件由远端编排的 EXIT trap 清；竞速暂存目录残留交给下次连接的预清理与 6 小时在途回收。旧兜底还会 rm -rf 整个暂存目录——并发连接可能正在往里传在途文件，整删本身就违反并发安全纪律，一并废除。
 		}
 	}
 
@@ -1468,8 +1430,6 @@ function 执行-扩展安装 {
 	function 新建-供给回调 {
 		param(
 			[pscustomobject]$竞速上下文,
-			[string]$连接目标,
-			[int]$端口,
 			[string]$系统类型
 		)
 
@@ -1491,7 +1451,7 @@ function 执行-扩展安装 {
 					暂存目录 = $竞速上下文.暂存目录; 包扩展名 = $竞速上下文.包扩展名; 提交号 = $竞速上下文.提交号; 分隔符 = $竞速上下文.分隔符; 架构标识 = $竞速上下文.架构标识
 					产物列表 = @($竞速上下文.产物列表 | Where-Object { ($待装列表 -contains $_.产物名) -and -not $已启动产物.Contains($_.产物名) })
 				}
-				foreach ($单个 in (& $启动动作 -竞速上下文 $待装上下文 -连接目标 $连接目标 -端口 $端口 -系统类型 $系统类型)) { [void]$供给容器.Add($单个) }
+				foreach ($单个 in (& $启动动作 -竞速上下文 $待装上下文 -系统类型 $系统类型)) { [void]$供给容器.Add($单个) }
 				foreach ($产物 in $待装上下文.产物列表) {
 					[void]$已启动产物.Add([string]$产物.产物名)
 				}
@@ -1516,7 +1476,7 @@ function 执行-扩展安装 {
 			[pscustomobject]$竞速上下文
 		)
 
-		# Windows 单会话全流程：探测/预备/安装/竞速监控/暂存收尾一条 ssh 全包。载荷（安装脚本正文去整行注释与空行后 gzip+base64）嵌进单会话引导后，整段走 **stdin** 下发；argv里只放固定极小的 stdin 引导（private\windows-stdin-bootstrap.ps1）的 EncodedCommand，命令行长度从此与安装脚本大小解耦。
+		# Windows 单会话全流程：探测/预备/安装/竞速监控/竞速产物帧上传/暂存收尾一条 ssh 全包（供给产物经 stdin 帧通道送入，零 scp/额外连接）。载荷（安装脚本正文去整行注释与空行后 gzip+base64）嵌进单会话引导后，整段走 **stdin** 下发；argv里只放固定极小的 stdin 引导（private\windows-stdin-bootstrap.ps1）的 EncodedCommand，命令行长度从此与安装脚本大小解耦。
 		# 旧结论「不走 stdin（实测远端默认 shell 对 stdin 收尾不可靠，挂死率高且远端留僵尸进程）」已被 2026-10-22 真机实测推翻：
 		#   ① 远端 sshd DefaultShell = powershell.exe（不是 cmd.exe，故无 8191 字符命令行上限）；
 		#   ② 远端读全量 stdin → 去掉一切空白 → base64 解码，2KB/40KB/120KB/400KB 四档的长度与 SHA256 双判据全部一致、退出码 0、单程约 1 秒（本地 PowerShell 在管道结束时关闭 ssh 的标准输入，EOF 确定送达，无需赌收尾）。
@@ -1548,7 +1508,7 @@ function 执行-扩展安装 {
 		$载荷标准输入 = $引导码
 		# 整段一次写入、不分块：远端 windows-stdin-bootstrap.ps1 是 ReadToEndAsync 读全量后 `-replace '\s',''` 剔掉**全部空白**再 base64 解码，行结构对传输没有任何意义（实测 2KB/40KB/120KB/400KB 四档长度与 SHA256 双判据全一致）。旧写法把载荷切成 4000 字符一块、join 换行、再校验「拼接后长度 == 引导码长度 + 块数」：那是自己切、自己拼、自己校，只可能拦下“我自己写错了切分/拼接代码”（开发期测一次就会暴露的事），拦不下任何传输层问题（损坏由远端 base64 解码失败与安装脚本自身校验兜底），“避开超长单行的未知处理”也只是没有实测依据的猜测——卡 32767 的从来只是 argv 通道（载荷已改走 stdin）。故删掉分块与那道无效不变式，少三步复杂度。
 		Write-Host ('[单会话] 引导码 {0} 字符整段走标准输入下发；argv 上只剩 {1} 字符的固定引导代码，远低于 Windows 命令行 32767 上限。' -f $引导码.Length, $固定引导码.Length)
-		$回调包 = 新建-供给回调 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $端口 -系统类型 'Windows'
+		$回调包 = 新建-供给回调 -竞速上下文 $竞速上下文 -系统类型 'Windows'
 		$script:单会话PS2标记 = $false
 		$内部回调 = $回调包.回调
 		$检测回调 = {
@@ -1562,7 +1522,8 @@ function 执行-扩展安装 {
 			$尝试上限 = 2
 			for ($轮次 = 1; $轮次 -le $尝试上限; $轮次++) {
 				try {
-					执行-SSH命令带标准输入 -连接目标 $连接目标 -端口 $端口 -命令文本 $命令行 -标准输入文本 $载荷标准输入 -超时秒 240 -每行回调 $检测回调
+					# 全单连接：载荷送出后 stdin 保留为帧通道，本地供给的竞速产物（.job 交接）由帧上传器经同一条连接的 __FILE__/__CMD__ 帧送入，与 Linux 编排路径同一套纪律，不再有独立 scp/ssh 上传
+					执行-SSH命令带标准输入 -连接目标 $连接目标 -端口 $端口 -命令文本 $命令行 -标准输入文本 $载荷标准输入 -超时秒 240 -每行回调 $检测回调 -保留帧通道 -交接匹配 ('race-supply-{0}-*.job' -f $竞速上下文.提交号)
 					break
 				} catch {
 					if ($_.Exception.Message -notmatch '^\[stdin(超时|通道中断)\]') { throw }
@@ -1673,6 +1634,11 @@ function 执行-扩展安装 {
 			$环境 = 初始化-SSH会话 -会话 $接管会话
 		} catch {
 			# Linux 单会话建立或探测失败：若对方实际是 Windows（没有 sh/base64、PowerShell 不支持 &&），按其引导回执自动改走 Windows 单会话，不再依赖任何平台设置。
+			# 单连接纪律：探测新平台前先关掉失败的旧会话，任何时刻不并存两条连接（旧会话可能仍活着占远程会话名额）。
+			if ($null -ne $接管会话) {
+				try { 关闭-接管会话 $接管会话 } catch { }
+				$接管会话 = $null
+			}
 			$回退标记 = 执行-Windows平台探测 -连接目标 $连接目标 -端口 $SSH端口
 			if (-not $回退标记) { throw }
 		}
@@ -1715,7 +1681,7 @@ function 执行-扩展安装 {
 		$保活动作 = if ($移除服务保活) { '移除' } else { '部署' }
 		Write-Host ('执行服务保活{0}...' -f $保活动作)
 		try {
-			执行-接管编排 -连接目标 $连接目标 -端口 $SSH端口 -远程登录目录 $环境.登录目录 `
+			执行-接管编排 -远程登录目录 $环境.登录目录 `
 				-提交号 $本地信息.提交号 -发布通道 $本地信息.发布通道 `
 				-安装脚本文本 $null -需要sysroot阶段 $false -需要保活阶段 $true -保活动作 $保活动作 -竞速上下文 $null -每行回调 $null -会话 $接管会话
 		} finally {
@@ -1770,11 +1736,11 @@ function 执行-扩展安装 {
 				产物列表 = @($竞速上下文.产物列表 | Where-Object { $_.产物名 -notin @('CLI', '服务端') })
 			}
 			if ($素材上下文.产物列表.Count -gt 0) {
-				foreach ($单个 in (启动-本地竞速供给 -竞速上下文 $素材上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型)) {
+				foreach ($单个 in (启动-本地竞速供给 -竞速上下文 $素材上下文 -系统类型 $环境.系统类型)) {
 					[void]$本地供给.Add($单个)
 				}
 			}
-			$回调包 = 新建-供给回调 -竞速上下文 $竞速上下文 -连接目标 $连接目标 -端口 $SSH端口 -系统类型 $环境.系统类型
+			$回调包 = 新建-供给回调 -竞速上下文 $竞速上下文 -系统类型 $环境.系统类型
 			$调度回调 = $回调包.回调
 			$停止供给动作 = ${function:停止-供给进程树}
 			$停止产物动作 = ${function:停止-指定产物供给}
@@ -1800,7 +1766,7 @@ function 执行-扩展安装 {
 
 		# 全阶段合并执行：sysroot → 安装 → 原生补丁 →（可选）保活检修 → 清理 全部在单次上传后的单次远程会话里完成
 		try {
-			执行-接管编排 -连接目标 $连接目标 -端口 $SSH端口 -远程登录目录 $环境.登录目录 `
+			执行-接管编排 -远程登录目录 $环境.登录目录 `
 				-提交号 $本地信息.提交号 -发布通道 $本地信息.发布通道 `
 				-安装脚本文本 $远程安装脚本 -需要sysroot阶段 (-not [string]::IsNullOrWhiteSpace($兼容性sysroot目录)) `
 				-需要保活阶段 $含服务保活 -保活动作 '部署' -竞速上下文 $竞速上下文 -每行回调 $每行回调 -会话 $接管会话

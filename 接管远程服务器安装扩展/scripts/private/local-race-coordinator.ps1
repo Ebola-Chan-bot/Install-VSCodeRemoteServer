@@ -1,4 +1,4 @@
-# CLI 与服务端的本地组合竞速协调器：两个下载同时运行，进度快照统一交给 preconnect 的单一汇报器。
+﻿# CLI 与服务端的本地组合竞速协调器：两个下载同时运行，进度快照统一交给 preconnect 的单一汇报器。
 [CmdletBinding()]
 param(
 	[Parameter(Mandatory = $true, Position = 0)]

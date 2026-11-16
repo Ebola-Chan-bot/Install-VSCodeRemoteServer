@@ -1,5 +1,7 @@
 #!/bin/sh
 # 接管安装编排（由 Install-VSCodeRemoteServer 模块取本模板填入占位符后生成）：单会话依次完成各阶段，每段以对应阶段文件是否上传为门，未上传即整段跳过（与按需拼接等价）；阶段脚本随同一批上传带入登录目录（vsi-stage-* 前缀），本脚本负责串接、降级与收尾清理。阶段失败语义：安装按其退出码中止、sysroot/保活失败中止（20/21）、原生补丁失败仅告警。
+# EXIT trap：任何退出路径（含失败提前退出）都清掉登录目录的阶段文件。单连接纪律：本地不再为失败清理另开 SSH 连接，清理责任全部落在远端本脚本；竞速暂存目录不在此整删（并发安全，见收尾段），残留由下次连接预清理与 6 小时在途回收。
+trap 'rm -f "$HOME"/vsi-stage-* 2>/dev/null' EXIT
 if [ -f "$HOME/vsi-stage-sysroot.sh" ]; then
 	echo '[接管安装-编排] 阶段: sysroot 兼容性环境'
 	if find '__兼容性目录__/glibc' -name 'ld-*.so' -type f 2>/dev/null | grep -q . && '__兼容性目录__/bin/bin/patchelf' --version >/dev/null 2>&1 && grep -q 'vscode-sysroot (' "$HOME/.bashrc"; then

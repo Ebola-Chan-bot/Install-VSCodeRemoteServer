@@ -1,5 +1,6 @@
-﻿# 本地竞速供给子进程脚本（每个竞速产物一个实例：CLI 与服务端各由 启动-本地竞速供给 起一个，并行下载/上传互不阻塞）
-# 由 启动-本地竞速供给 通过 Start-Process 作为独立 powershell 进程运行，与主模块进程隔离；竞速全部决出的瞬间，主流程用 taskkill /T /F 直接击杀本进程及其派生的 ssh/scp，下载或上传无论进行到哪一步都被立即终止（真正的事件驱动即时取消，零轮询）。参数经 Clixml 文件传入，避开命令行转义与 PS 5.1 原生命令 stderr 终止性错误陷阱。
+﻿# 本地竞速供给子进程脚本（每个竞速产物一个实例：CLI 与服务端各由 启动-本地竞速供给 起一个，并行下载互不阻塞）
+# 由 启动-本地竞速供给 通过 Start-Process 作为独立 powershell 进程运行，与主模块进程隔离；竞速全部决出的瞬间，主流程用 taskkill /T /F 直接击杀本进程，下载无论进行到哪一步都被立即终止（真正的事件驱动即时取消，零轮询）。参数经 Clixml 文件传入，避开命令行转义与 PS 5.1 原生命令 stderr 终止性错误陷阱。
+# 单连接纪律：本进程绝不建立任何 SSH/scp 连接——下载完成后写 .job 交接文件即退出，上传由主会话的帧上传器线程经**同一条** SSH 连接的帧通道完成（Linux 与 Windows 相同）。
 [CmdletBinding()]
 param(
 	[Parameter(Mandatory = $true, Position = 0)]
@@ -11,15 +12,11 @@ try {
 	[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 	$参数 = Import-Clixml -LiteralPath $参数文件路径
-	$连接目标 = [string]$参数.连接目标
-	$端口 = [int]$参数.端口
-	$密码选项 = @($参数.密码选项)
 	$暂存目录 = [string]$参数.暂存目录
 	$下载地址 = [string]$参数.下载地址
 	$远程包名 = [string]$参数.远程包名
 	$完成标记名 = [string]$参数.完成标记名
 	$系统类型 = [string]$参数.系统类型
-	$分隔符 = [string]$参数.分隔符
 	$提交号 = [string]$参数.提交号
 	$产物名 = [string]$参数.产物名
 	$取消标记名 = [string]$参数.取消标记名
@@ -40,37 +37,8 @@ try {
 	if ($地址列表.Count -eq 0) { $地址列表 = @([string]$参数.下载地址) }
 	$本地文件名 = [string]$参数.本地文件名
 	if ([string]::IsNullOrWhiteSpace($本地文件名)) { $本地文件名 = 'race-supply-{0}-{1}' -f $提交号, $远程包名 }
-	# Windows 远端相对暂存目录（单会话模式约定）锚定登录目录：scp 相对路径落点与 ssh 会话位置实测都是登录目录，但命令里的相对路径随执行上下文可能漂移（实测 Start-Job 的 CWD 是「文档」目录），统一改写成 $env:USERPROFILE 绝对表达式由远端展开，与远端脚本解析出的绝对暂存目录严格同目录。
+	# Windows 远端相对暂存目录（单会话模式约定）锚定登录目录：改名命令经帧通道在远端 PowerShell 里执行，$env:USERPROFILE 由远端展开，与远端脚本解析出的绝对暂存目录严格同目录；帧文件的落盘点恒为登录目录（见 Windows单会话引导.ps1 的帧接收器）。
 	$远端暂存目录文本 = if ($暂存目录 -match '^[A-Za-z]:[\\/]' -or $暂存目录.StartsWith('\\')) { $暂存目录 } else { ('$env:USERPROFILE\' + ($暂存目录 -replace '/', '\')) }
-
-	function 调用-远程命令([string]$命令文本) {
-		# 返回 {退出码, 输出} 对象（不用元组：命令无 stdout 时 PowerShell 会展平数组导致下标错位），失败时把远端报错一并带回展示
-		$ssh命令 = Get-Command ssh -ErrorAction SilentlyContinue | Select-Object -First 1
-		$输出 = @(& $ssh命令.Source (@('-n', '-p', $端口) + $密码选项 + @($连接目标, $命令文本)) 2>&1)
-		$输出文本 = ($输出 | ForEach-Object { [string]$_ }) -join ' | '
-		return [pscustomobject]@{ 退出码 = $LASTEXITCODE; 原始输出 = $输出文本; 输出 = (取-远端命令摘要 $输出文本) }
-	}
-
-	function 取-远端命令摘要([string]$原始输出) {
-		# 把远端命令的混合输出收敛成「人能读的真因」：① 优先取 __VSI_ERR__: 标记后的真实异常；
-		# ② 没有标记则剔掉已知噪声（ssh 对中文主机名的 mDNS 警告、PowerShell 把进度记录序列化成 CLIXML 的垃圾、PS 5.1 对原生 stderr 包装的 NativeCommandError/CategoryInfo 模板与 '+ ~~~' 位置行）只留正文。
-		# 旧写法把未经过滤的混合输出当成「远端报错」直接上报，真因被淹没在千余字的 CLIXML 里、日志完全不可读。
-		if ([string]::IsNullOrWhiteSpace($原始输出)) { return '' }
-		$段 = @($原始输出 -split '[\r\n|]+')
-		$标记行 = @($段 | Where-Object { $_ -match '__VSI_ERR__\s*:\s*' })
-		if ($标记行.Count -gt 0) {
-			return (($标记行 -join ' / ') -replace '.*__VSI_ERR__\s*:\s*', '').Trim()
-		}
-		$噪声模式 = 'ignoring bad CNAME', '#< CLIXML', '<Objs Version', '</Objs>', '<AV>', '<PR N=', '<MS>', '<TN RefId', 'NativeCommandError', 'CategoryInfo', 'FullyQualifiedErrorId', 'At line:', '^\s*\+', '^\s*~+', '^\s*$', 'Preparing modules for first use'
-		$正文 = @($段 | Where-Object {
-			$行 = $_.Trim()
-			$是噪声 = $false
-			foreach ($模式 in $噪声模式) { if ($行 -match $模式) { $是噪声 = $true; break } }
-			-not $是噪声
-		})
-		if ($正文.Count -eq 0) { return '' }
-		return (($正文 | Select-Object -First 3) -join ' / ').Trim()
-	}
 
 	function 测-文件被占用([string]$路径) {
 		# 独占探测：能以 ReadWrite 打开 = 无人持有（随即关闭）；抛共享异常 = 另一进程正在写同一产物。
@@ -117,14 +85,6 @@ try {
 		# 读不到对方启动时刻（权限等）就保守认为仍在，宁可多下也不误停别人的有效供给
 		if ($null -eq $现启动) { return $true }
 		return ($现启动 -eq $父进程启动时刻)
-	}
-
-	function 转换-远程PowerShell命令([string]$脚本文本) {
-		# Windows 远程命令统一走 powershell -EncodedCommand：命令行只剩 base64，不含双引号/圆括号/管道等会被 PS5.1 传参剥掉或被远端 cmd 解析的字符（同 取-环境探测命令 的硬约束）
-		# 开头必置 $ProgressPreference='SilentlyContinue'：不置时 PowerShell 会把模块首次加载等进度记录序列化成 CLIXML 写到 stderr（实测「Preparing modules for first use.」），混进输出后成为上千字的 `#< CLIXML | <Objs …>` 垃圾，把真实报错挤得看不见
-		$脚本文本 = '$ProgressPreference = ''SilentlyContinue''; ' + $脚本文本
-		$编码 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($脚本文本))
-		return ('powershell -NoProfile -EncodedCommand {0}' -f $编码)
 	}
 
 	function 测试-本地包完整([string]$路径) {
@@ -526,91 +486,21 @@ try {
 		}
 	}
 
+	# ===== 交接主会话上传（Linux 与 Windows 同一条纪律，供给进程零 SSH/scp 连接）=====
+	# 本进程只负责下载，完成后写 .job 交接文件即退出；主会话的帧上传器线程按「文件帧→改名帧」序送入**同一条** SSH 连接。
+	# 原子性：帧序天然保证「先文件后改名」；改名命令自带取消标记检查——远程已获胜时顺手清掉在途文件再跳过就位（旧版取消分支会把上百 MB 的 .uploading 永久遗留在家目录吃配额，这里一并清理）；目标已存在且长度一致时只补写标记（幂等，文件名含提交号，同名即同版本）。坏包/截断包绝不会被就位。帧通道的落盘点恒为远端登录目录（Linux $HOME，见 会话帧循环.sh / Windows %USERPROFILE%，见 Windows单会话引导.ps1 的帧接收器），改名命令从登录目录取件移入暂存目录；.job 恒落 TEMP 根目录按 race-supply-<提交号>-<远程包名> 固定模式命名（见上方注释）。
 	if ($系统类型 -eq 'Linux') {
-		# 交接主会话上传：本进程只负责下载，完成后写 .job 交接文件即退出，主会话的上传器线程按“文件帧→改名帧”序送入同一条连接。
-		# 原子性与 scp 方案一致：帧序天然保证“先文件后改名”，改名命令内含远端取消检查，坏包/截断包绝不会被就位。
-		# 帧通道的落盘点恒为 $HOME/<远端名>（见 会话帧循环.sh），故改名从 ~ 取件再移入暂存目录；.job 恒落 TEMP 根目录按固定模式命名（见上方注释）。
-		$改名命令 = ("sh -c 'if [ -f {0}/{3} ]; then exit 2; fi; mv ~/{1}.uploading {0}/{1} && touch {0}/{2}'" -f $暂存目录, $远程包名, $完成标记名, $取消标记名)
-		$交接 = @{ 数据文件 = $本地包路径; 远端名 = ('{0}.uploading' -f $远程包名); 完成命令 = $改名命令 }
-		$交接 | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:TEMP ('race-supply-{0}-{1}.job' -f $提交号, $远程包名)) -Encoding UTF8
-		Write-Output ('本地下载完成：共 {0} 字节，已交接主会话上传（{1}）。' -f (Get-Item -LiteralPath $本地包路径).Length, $远程包名)
-		return
+		$改名命令 = ("sh -c 'if [ -f {0}/{3} ]; then rm -f ~/{1}.uploading; exit 2; fi; mv ~/{1}.uploading {0}/{1} && touch {0}/{2}'" -f $暂存目录, $远程包名, $完成标记名, $取消标记名)
 	}
-
-	# Windows：独立 scp 上传 + 改名（LAN 快，不走单会话）。上传→核对→改名整体最多两轮：并发连接会在自己竞速起步时把整个暂存目录删掉重建（暂存目录只按提交号命名、不带连接唯一性），把本进程刚上传的在途文件连目录一起清走→改名命令报「在途文件不在」（实测退出码 1 + 真因被 CLIXML 垃圾淹没）。此时（且仅此时）自动重传一次即自愈，不再只报一句失败就放弃本地供给。
-	for ($上传轮 = 1; $上传轮 -le 2; $上传轮++) {
-		# 上传前不再单开连接复检取消标记：远端获胜的瞬间主流程即按「竞速获胜」行击杀本进程树（事件驱动，约 1 秒内），且远端改名命令自带取消检查（退出码 2 即跳过就位）——复检只堵约 1 秒的窗口，却要一次完整 SSH 连接（慢主机上以分钟计）
-
-		$scp命令 = Get-Command scp -ErrorAction SilentlyContinue | Select-Object -First 1
-		if ($上传轮 -eq 1) {
-			Write-Output '开始上传本地压缩包到暂存目录...'
-		}
-		else {
-			Write-Output '远端暂存文件已被并发连接清走，重新上传一次...'
-		}
-		$上传目标 = ('{0}:{1}{2}{3}.uploading' -f $连接目标, $暂存目录, $分隔符, $远程包名)
-		# 必须保留 scp 自己的 stderr/stdout：scp 的具体原因（连接被拒、远端目录不存在、磁盘满、协议/认证失败）都在原生命令输出里，$null 会把它们全部吞掉，只剩一个没有诊断价值的 255。输出先收集，失败时逐行原样回传；成功时不把 scp 噪声混进正常进度日志。
-		$scp输出 = @(& $scp命令.Source (@('-P', $端口) + $密码选项 + @($本地包路径, $上传目标)) 2>&1)
-		$scp退出码 = $LASTEXITCODE
-		if ($scp退出码 -ne 0) {
-			Write-Output ('上传失败，退出码 {0}，目标: {1}。scp 原始输出:' -f $scp退出码, $上传目标)
-			foreach ($行 in @($scp输出)) {
-				if (-not [string]::IsNullOrWhiteSpace([string]$行)) { Write-Output ([string]$行) }
-			}
-			Write-Output '本地供给退出（远程将继续自下载）。'
-			return
-		}
-
-		# 上传完整性核对：远端字节数必须与本地一致才写完成标记（scp 断流截断时绝不放行，否则远端会拿坏包解压）
-		$本地大小 = (Get-Item -LiteralPath $本地包路径).Length
-		$核对命令 = 转换-远程PowerShell命令 ('if (Test-Path -LiteralPath "{0}\{1}.uploading") {{ Write-Output ("__VSI_SIZE__:" + [long](Get-Item -LiteralPath "{0}\{1}.uploading").Length) }} else {{ Write-Output "__VSI_SIZE__:-1" }}' -f $远端暂存目录文本, $远程包名)
-		$核对结果 = 调用-远程命令 $核对命令
-		# 只认 __VSI_SIZE__: 后的数字（避开 ssh 的 CNAME 警告、CLIXML 垃圾与本地 PowerShell 对原生 stderr 的包装模板把它误当成大小）；-1 = 上传后又没了
-		$远端大小 = -1
-		foreach ($段 in @($核对结果.原始输出 -split '[\r\n|]+')) {
-			if ($段 -match '__VSI_SIZE__\s*:\s*(-?\d+)') { $远端大小 = [long]$matches[1] }
-		}
-		if ($核对结果.退出码 -ne 0 -or $远端大小 -ne $本地大小) {
-			if ($远端大小 -lt 0) {
-				Write-Output ('上传核对失败：远端已无在途文件（本地 {0} 字节），疑似被并发连接清走。' -f $本地大小)
-				if ($上传轮 -lt 2) { continue }
-				return
-			}
-			Write-Output ('上传核对失败：远端 {0} 字节 ≠ 本地 {1} 字节，放弃本次改名与标记。' -f $远端大小, $本地大小)
-			return
-		}
-
-		# 原子改名 + 写完成标记。**结果码走 stdout 标记 __VSI_RC__:n，不得依赖退出码**：实测两台 Windows 主机的 OpenSSH sshd 把**任何非零退出码压平成 1**（`exit 2`/`exit 3`/`cmd /c exit 7` 全部变 1，只有 0 原样传回），于是「远程已获胜」与「真失败」在调用方看来一模一样：旧代码的 exit 2 分支根本进不去，本属正常的「远程已获胜」被报成了「改名/标记命令失败（退出码 1）」。约定：0 = 已就位并写标记；2 = 远程已获胜；3 = 在途文件不在（可重传自愈）；1 = 其它失败。目标已存在且长度一致时直接当成功（幂等）：文件名含提交号，同名即同版本；并发窗口先一步改过名时本进程不该再报失败。
-		# 异常真因用 __VSI_ERR__: 标记回传：旧写法只把 $_.Exception.Message 丢进 stdout，一旦同时吐 CLIXML 与 ssh 的 mDNS 噪声，真因就被上千字噪声淹没成完全不可读的日志（实测只看到 ignoring bad CNAME 与 #< CLIXML，看不出任何错误）。
-		$改名脚本 = ('if (Test-Path -LiteralPath "{0}\{3}") {{ Write-Output "__VSI_RC__:2"; exit 2 }}; ' +
-			'if (-not (Test-Path -LiteralPath "{0}\{1}.uploading")) {{ Write-Output "__VSI_RC__:3"; Write-Output "__VSI_ERR__:在途文件不在（暂存目录被并发连接重建或已被清理）"; exit 3 }}; ' +
-			'try {{ ' +
-			'if (Test-Path -LiteralPath "{0}\{1}") {{ if ((Get-Item -LiteralPath "{0}\{1}.uploading").Length -eq (Get-Item -LiteralPath "{0}\{1}").Length) {{ New-Item -ItemType File -Force "{0}\{2}" -ErrorAction Stop | Out-Null; Write-Output "__VSI_RC__:0"; Write-Output "__VSI_ERR__:目标已存在且长度一致，沿用已就位包并补写标记"; exit 0 }} }}; ' +
-			'Move-Item -LiteralPath "{0}\{1}.uploading" -Destination "{0}\{1}" -Force -ErrorAction Stop; ' +
-			'New-Item -ItemType File -Force "{0}\{2}" -ErrorAction Stop | Out-Null; Write-Output "__VSI_RC__:0" ' +
-			'}} catch {{ Write-Output "__VSI_RC__:1"; Write-Output ("__VSI_ERR__:" + $_.Exception.GetType().Name + ": " + ($_.Exception.Message -replace "\s+", " ")); exit 1 }}') -f $远端暂存目录文本, $远程包名, $完成标记名, $取消标记名
-		$改名结果 = 调用-远程命令 (转换-远程PowerShell命令 $改名脚本)
-		# 结果码优先取 stdout 标记；拿不到标记时退回退出码（只保留 0/非0 语义，此时 2/3 不可分，按失败处理并报清两个码）
-		$改名码 = $改名结果.退出码
-		foreach ($段 in @($改名结果.原始输出 -split '[\r\n|]+')) {
-			if ($段 -match '__VSI_RC__\s*:\s*(\d+)') { $改名码 = [int]$matches[1] }
-		}
-		$码说明 = $(if ($改名码 -eq $改名结果.退出码) { $改名码 } else { '' + $改名码 + '（ssh 退出码 ' + $改名结果.退出码 + '）' })
-		if ($改名码 -eq 0) {
-			Write-Output ('本地供给完成：包已就位并写入完成标记（{0} 字节）。{1}' -f $本地大小, $改名结果.输出)
-			return
-		}
-		if ($改名码 -eq 2) {
-			Write-Output '远程侧已获胜，本地供给取消（改名前）。'
-			return
-		}
-		if ($改名码 -eq 3 -and $上传轮 -lt 2) {
-			Write-Output ('远端改名未完成：{0}' -f $改名结果.输出)
-			continue
-		}
-		Write-Output ('改名/标记未完成（结果码 {0}），远端原因：{1}，远程将继续自下载。' -f $码说明, $(if ([string]::IsNullOrWhiteSpace($改名结果.输出)) { '远端未回传可读原因（仅噪声，已过滤）' } else { $改名结果.输出 }))
-		return
+	else {
+		# 单行 PowerShell（帧协议以 LF 断行，命令体内不得含换行），由远端帧接收器以 scriptblock 静默执行；路径里的 $env:USERPROFILE 在远端展开。不再需要旧 scp 方案的两轮重传与 __VSI_RC__ 结果码协商：帧接收器逐字节核对长度，坏帧根本不会落盘，也就没有「传完再开一条连接核对字节数」的必要
+		$改名命令 = ('$S="' + $远端暂存目录文本 + '"; $U="$env:USERPROFILE\' + $远程包名 + '.uploading"; $P="$S\' + $远程包名 + '"; if (Test-Path -LiteralPath "$S\' + $取消标记名 + '") { Remove-Item -LiteralPath $U -Force -ErrorAction SilentlyContinue } elseif (Test-Path -LiteralPath $U) { if ((Test-Path -LiteralPath $P) -and ((Get-Item -LiteralPath $P).Length -eq (Get-Item -LiteralPath $U).Length)) { New-Item -ItemType File -Force "$S\' + $完成标记名 + '" -ErrorAction SilentlyContinue | Out-Null } else { Move-Item -LiteralPath $U -Destination $P -Force -ErrorAction SilentlyContinue; if (Test-Path -LiteralPath $P) { New-Item -ItemType File -Force "$S\' + $完成标记名 + '" -ErrorAction SilentlyContinue | Out-Null } } }')
 	}
+	$交接 = @{ 数据文件 = $本地包路径; 远端名 = ('{0}.uploading' -f $远程包名); 完成命令 = $改名命令 }
+	$交接 | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:TEMP ('race-supply-{0}-{1}.job' -f $提交号, $远程包名)) -Encoding UTF8
+	Write-Output ('本地下载完成：共 {0} 字节，已交接主会话上传（{1}）。' -f (Get-Item -LiteralPath $本地包路径).Length, $远程包名)
+	return
+
 }
 catch {
 	Write-Output ('本地供给任务异常终止: {0}' -f $_.Exception.Message)
