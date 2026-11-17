@@ -33,6 +33,10 @@ $script:脚本_环境探测命令 = (Get-Content -Path (Join-Path $script:模块
 $script:脚本_接管编排模板 = (Get-Content -Path (Join-Path $script:模块根目录 'private\接管编排脚本模板.sh') -Raw -Encoding UTF8) -replace "`r`n", "`n"
 # 供给子进程日志的实时转发登记：{产物名; 路径; 已读字节; 残段}。子进程 stdout/stderr 重定向到日志文件，这里按字节偏移增量读出立刻上屏，本地下载/上传进度不再积压到收尾统一打印
 $script:供给日志登记 = New-Object System.Collections.ArrayList
+# 供给线程事件队列（同步列表）：Linux 帧上传器与 Windows HTTP 供给监听器都在独立 runspace 里，其 Write-Host 不可靠，事件经队列交主线程读循环上屏（2026-11-17 B 服务器 207MB 交接无任何动静的排障教训）
+$script:帧上传事件队列 = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+# Windows 平台探针顺带上报的待装产物清单（CLI/服务端）：-R 供给路径据此在连接前启动本地供给；探针未报时保守按双产物供给
+$script:探测待装产物 = $null
 
 # SSH 密码复用状态（由 初始化-SSH会话 设置）
 $script:SSH密码选项 = @()
@@ -456,21 +460,31 @@ function 执行-扩展安装 {
 	}
 
 	# 平台自动探测的 Windows 引导回执：用最小 PowerShell 探针（带连字符标记，避开官方安装脚本回显的干扰）经 ssh 直接执行。PS2 版打 __WINPROBE_PS2__，其余打 __WINPROBE_OK__；Linux 上命令会被当成不存在的 powershell 而报错退出（且无标记）。
-	# 复用 执行-SSH命令带标准输入 的进程封装（免密参数与异步抽干 stderr），传一个无实际用途的极小 stdin 载荷（探针不读 stdin）；每行回调检查标记。
+	# 顺带上报待装产物（__WINPROBE_PENDING__ CLI 服务端）：判据与 remote-install-common.ps1 的已就位判定同源（CLI 落地 exe 存在；server 目录 product.json+bin 齐全），-R 供给路径据此在连接前只下载真正缺失的包，已装好的重连零下载。
+	# 复用 执行-SSH命令带标准输入 的进程封装（免密参数与异步抽干 stderr），传一个无实际用途的极小 stdin 载荷（写完即关流）；每行回调检查标记。
 	function 执行-Windows平台探测 {
 		param(
 			[string]$连接目标,
-			[int]$端口
+			[int]$端口,
+			[string]$发布通道,
+			[string]$提交号
 		)
 
-		$探针码 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes("if (`$PSVersionTable.PSVersion.Major -le 2) { Write-Output '__WINPROBE_PS2__' } else { Write-Output '__WINPROBE_OK__' }"))
+		$数据目录名 = if ($发布通道 -eq 'insider') { '.vscode-server-insiders' } else { '.vscode-server' }
+		$cli基础名 = if ($发布通道 -eq 'insider') { 'code-insiders' } else { 'code' }
+		$质量名 = if ($发布通道 -eq 'insider') { 'Insiders' } else { 'Stable' }
+		$探针正文 = "if (`$PSVersionTable.PSVersion.Major -le 2) { Write-Output '__WINPROBE_PS2__'; exit 0 }`nWrite-Output '__WINPROBE_OK__'`n`$d = Join-Path `$HOME '__数据目录名__'`n`$p = @()`nif (-not (Test-Path -LiteralPath (Join-Path `$d '__CLI落地名__'))) { `$p += 'CLI' }`n`$s = Join-Path `$d 'cli\servers\__质量名__-__提交号__\server'`nif (-not ((Test-Path -LiteralPath (Join-Path `$s 'product.json')) -and (Test-Path -LiteralPath (Join-Path `$s 'bin')))) { `$p += '服务端' }`nWrite-Output ('__WINPROBE_PENDING__' + (`$p -join ' '))"
+		$探针正文 = $探针正文.Replace('__数据目录名__', $数据目录名).Replace('__CLI落地名__', ('{0}-{1}.exe' -f $cli基础名, $提交号)).Replace('__质量名__', $质量名).Replace('__提交号__', $提交号)
+		$探针码 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($探针正文))
 		$命令行 = 'powershell -NoProfile -EncodedCommand {0}' -f $探针码
 		$script:探测Windows标记 = $false
 		$script:探测PS2标记 = $false
+		$script:探测待装产物 = $null
 		$标记回调 = {
 			param($行)
 			if ($行 -match '__WINPROBE_PS2__') { $script:探测PS2标记 = $true }
 			if ($行 -match '__WINPROBE_OK__') { $script:探测Windows标记 = $true }
+			if ($行 -match '__WINPROBE_PENDING__(.*)$') { $script:探测待装产物 = @($Matches[1].Trim() -split '\s+' | Where-Object { $_ }) }
 		}
 		try {
 			执行-SSH命令带标准输入 -连接目标 $连接目标 -端口 $端口 -命令文本 $命令行 -标准输入文本 '__WINPROBE__' -超时秒 30 -每行回调 $标记回调
@@ -524,8 +538,9 @@ function 执行-扩展安装 {
 		throw ('[stdin通道中断] SSH 在完整接收安装载荷前关闭了标准输入，远端安装尚未开始（{0}）。{1}' -f $退出描述, $错误摘要)
 	}
 
-	# 走标准输入下发大载荷的 SSH 调用（Windows 单会话引导专用）：自己起 ssh 进程、把载荷 + 引导结束标记经 BaseStream 写出，输出异步读并配硬超时看门狗。为什么不用 PowerShell 管道（`$文本 | & ssh …`）：管道收尾不可靠是**偶发真实故障**——实测同一条通道 2KB/40KB/400KB 三档都在约 1 秒内无损送达（长度 + SHA256 双判据一致、退出码 0），但 120KB 那一档**挂死约 66 分钟**（退出码 -1、哈希无法核对）。无声挂死会把 Remote-SSH 的整个连接一起拖死，所以这里改成：载荷边界由我们自己发出的 __BOOTSTRAP_END__ 标记划定（确定性），并加超时看门狗——超时即 taskkill 整树 + 抛类型化错误，让调用方重试而不是干等。
-	# -保留帧通道（Windows 单会话安装）：载荷送出后 stdin 不关闭而是保留为帧通道，并按 交接匹配 启动帧上传器线程——本地供给的竞速产物（.job 交接文件）经**同一条**连接的 __FILE__/__CMD__ 帧送出，全流程零额外 SSH/scp。非帧通道模式（平台探针）仍在写完后关闭 stdin 送出 EOF（探针命令不读 stdin）。
+	# 走标准输入下发载荷的 SSH 调用（Windows 单会话引导与平台探针专用）：自己起 ssh 进程、把载荷 + 引导结束标记经 BaseStream 写出后**立即关闭 stdin**，输出异步读并配硬超时看门狗。
+	# 【Win32-OpenSSH exec stdin 的真实约束（2026-11-17 第六轮实测定论）】数据只在关流(EOF)后才整体送达远端：不关流时远端只读到首批字节；关流前本地可写出的上限约 2MB（2MB+关流 PASS，4MB 起 Write 永久阻塞——SSH 流控窗口耗尽）。故本函数只用于≤2MB 的载荷（安装脚本 gzip+base64 约 9KB、探针几十字节），写完必关流；大数据（安装包）绝不再走 stdin，改经 -R 远程端口转发 + 本地 HTTP 供给（direct-tcpip 通道，与 scp 同路径，实测 8MB 0.5s 哈希一致）。
+	# -转发选项：形如 '-o ExitOnForwardFailure=yes -R 127.0.0.1:<远端端口>:127.0.0.1:<本地端口>'，原样拼在连接目标之前；转发失败时 ssh 立即退出（ExitOnForwardFailure），调用方换端口重试。
 	function 执行-SSH命令带标准输入 {
 		param(
 			[string]$连接目标,
@@ -534,8 +549,7 @@ function 执行-扩展安装 {
 			[string]$标准输入文本,
 			[int]$超时秒 = 240,
 			[scriptblock]$每行回调,
-			[switch]$保留帧通道,
-			[string]$交接匹配 = ''
+			[string]$转发选项 = ''
 		)
 
 		$ssh命令 = Get-Command ssh -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -545,6 +559,7 @@ function 执行-扩展安装 {
 
 		$参数串 = '-p ' + $端口
 		foreach ($项 in $script:SSH密码选项) { $参数串 = $参数串 + ' "' + $项 + '"' }
+		if ($转发选项 -ne '') { $参数串 = $参数串 + ' ' + $转发选项 }
 		$参数串 = $参数串 + ' ' + $连接目标 + ' "' + $命令文本 + '"'
 
 		$psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -568,7 +583,6 @@ function 执行-扩展安装 {
 		# stderr 必须异步抽干：只重定向不读取，缓冲区写满（约 4KB）就会把远端进程堵住 → 表现为"挂死"，与被替换掉的管道式写法是同一类故障，这里一并根除（仓库既有的 预热直连 也是这么做的）
 		$错误任务 = $进程.StandardError.ReadToEndAsync()
 		$载荷已送出 = $false
-		$帧上传器 = $null
 		$截止 = (Get-Date).AddSeconds($超时秒)
 		$已超时 = $false
 		$有效行数 = 0
@@ -578,29 +592,21 @@ function 执行-扩展安装 {
 		$原EAP = $ErrorActionPreference
 		try {
 			$ErrorActionPreference = 'Continue'
-			# 载荷一次性写入后紧跟引导结束标记行：标记只划定载荷边界。帧通道模式下 stdin 不关闭——它随后就是帧通道（本地供给产物由帧上传器线程送入）；非帧通道模式（平台探针）仍显式 Close() 送 EOF，不给通道留"收尾不确定"的空间
-			# 载荷是 base64 文本（纯 ASCII），BaseStream 裸字节写出，避开 StreamWriter 编码层（BOM/换行转换会污染帧流）
+			# 载荷一次性写入后紧跟引导结束标记行，随即 Close() 送 EOF：Win32-OpenSSH exec 会话的 stdin 数据只在关流后整体送达（见函数头注释），载荷远小于 2MB 写窗口，写完即关是唯一可靠形态。
+			# 载荷是 base64 文本（纯 ASCII），BaseStream 裸字节写出，避开 StreamWriter 的字符编码/换行转换。注意 .NET Framework 的 Process.StandardInput 属性首次访问即把 UTF-8 BOM 前导写进管道（发生在我们写载荷之前，裸写躲不开；2026-11-17 实测取证），故远端 windows-stdin-bootstrap.ps1 负责剥掉流开头的 EF BB BF（前导只出现一次、在载荷之前）。
 			$载荷字节 = [System.Text.Encoding]::ASCII.GetBytes($标准输入文本)
 			$标记字节 = [System.Text.Encoding]::ASCII.GetBytes("`n__BOOTSTRAP_END__`n")
 			try {
 				$进程.StandardInput.BaseStream.Write($载荷字节, 0, $载荷字节.Length)
 				$进程.StandardInput.BaseStream.Write($标记字节, 0, $标记字节.Length)
 				$进程.StandardInput.Flush()
-				if (-not $保留帧通道) { $进程.StandardInput.Close() }
+				$进程.StandardInput.Close()
 				$载荷已送出 = $true
 			} catch {
 				抛出-stdin启动中断 $进程 $错误任务
 			}
-			if ($保留帧通道 -and $交接匹配 -ne '') {
-				# 帧上传器 = 独立 runspace 线程（与 Linux 编排路径同一套 启动-帧上传器）：主线程只读输出、stdin 只由上传器写，双工占用同一条连接、无并发写入风险
-				$帧上传器 = 启动-帧上传器 -会话 ([pscustomobject]@{ 标准输入 = $进程.StandardInput }) -扫描目录 $env:TEMP -匹配模式 $交接匹配
-			}
-			# 本地侧检查点：写出完成说明载荷与标记已交给 ssh.exe，此后若再无任何有效输出，挂点必在远端/连接层而非载荷没送出去——事后取证时这行日志就是分界线
-			if ($保留帧通道) {
-				Write-Host ('[单会话] 载荷已写出 {0} 字节并送出引导结束标记，标准输入保留为帧通道，等待远端引导回执…' -f $载荷字节.Length)
-			} else {
-				Write-Host ('[单会话] 载荷已写出 {0} 字节并关闭标准输入，等待远端引导回执…' -f $载荷字节.Length)
-			}
+			# 本地侧检查点：写出完成并关流说明载荷已交给 ssh.exe，此后若再无任何有效输出，挂点必在远端/连接层而非载荷没送出去——事后取证时这行日志就是分界线
+			Write-Host ('[单会话] 载荷已写出 {0} 字节并关闭标准输入，等待远端引导回执…' -f $载荷字节.Length)
 
 			$script:标题序列未闭合 = $false
 			# 注意：本循环以 `& $处理行 $行` 直接调用（不是 ForEach-Object 的管道调用），
@@ -613,11 +619,15 @@ function 执行-扩展安装 {
 				$文本 = 剥离-终端控制序列 $文本行
 				# 远端 powershell 在非控制台 stdio 下会把进度记录序列化成 CLIXML 噪声，滤掉不进日志
 				if ($文本 -match '^(#< CLIXML|<Objs|</Objs>)') { return }
-				# 帧文件落盘失败（远端接收器核对字节数不符或写盘异常，磁盘满/配额最常见）：立即带 stderr 诊断中止并杀掉进程树，不得只归因“传输错位”，与 Linux 编排路径同一语义
+				# 帧文件落盘失败：分两类。①目标文件被占用（并发/卡死会话的同名落盘，2026-11-17 B 服务器实证）：只告警不中止——远端接收器已排干帧体保持通道对齐，本地上传器会换会话唯一落盘名重试，杀掉会话反而把本能自愈的竞速整条打死；②其余（磁盘满/配额/真截断）：立即带 stderr 诊断中止并杀进程树，不得只归因“传输错位”
 				if ($文本 -match '^__FRAME_TRUNCATED__') {
-					$详情 = 取-会话诊断摘要 -会话 $诊断源 -标准输出 @()
-					try { & taskkill /PID $进程.Id /T /F 2>&1 | Out-Null } catch { }
-					throw ("远端帧文件接收或落盘失败：{0}`n{1}" -f $文本, $详情)
+					if ($文本 -match 'being used by another process') {
+						Write-Host ('[帧上传] 远端落盘目标被占用（将换唯一名重试，不中止会话）：' + $文本)
+					} else {
+						$详情 = 取-会话诊断摘要 -会话 $诊断源 -标准输出 @()
+						try { & taskkill /PID $进程.Id /T /F 2>&1 | Out-Null } catch { }
+						throw ("远端帧文件接收或落盘失败：{0}`n{1}" -f $文本, $详情)
+					}
 				}
 				if (-not (登记-竞速快照 $文本)) {
 					Write-Host $文本
@@ -657,8 +667,7 @@ function 执行-扩展安装 {
 				if ($有效行数 -eq 0 -and (Get-Date) -gt $启动截止) { $已超时 = $true; $启动层挂死 = $true; break }
 			}
 		} finally {
-			# 收尾次序：先停帧上传（可能正卡在大帧写入，异步等待+超时强停）再关 stdin；读循环抛异常（含 __FRAME_TRUNCATED__）时同样必经此处，不留挂着的上传器线程
-			停止-帧上传器 $帧上传器
+			# 收尾兜底关 stdin（正常路径已在写出段关闭；读循环抛异常时此处保证不留半开管道）
 			try { $进程.StandardInput.Close() } catch { }
 			$ErrorActionPreference = $原EAP
 		}
@@ -897,6 +906,7 @@ function 执行-扩展安装 {
 	function 转发-供给日志 {
 		param([switch]$收尾)
 
+		转发-帧上传事件
 		# 增量转出供给子进程日志（[本地供给-产物名] 前缀，与收尾打印同格式）：按登记的字节偏移续读，半行残段留待拼齐再发；-收尾 把残段也作为一行发出。日志文件用共享读打开（子进程仍在写），读不到按缺失跳过
 		foreach ($登记 in @($script:供给日志登记)) {
 			$新增文本 = ''
@@ -1073,7 +1083,7 @@ function 执行-扩展安装 {
 		$psi.CreateNoWindow = $true
 		$进程 = [System.Diagnostics.Process]::Start($psi)
 		$错误任务 = $进程.StandardError.ReadToEndAsync()
-		# 牺牲行吸收 StreamWriter 首次写入的 UTF-8 BOM 前导（实测 ef bb bf 会贴在第一帧行首导致帧型匹配失败、整条帧流错位）：带换行的整行连 BOM 一起被远端帧循环当未知帧忽略，其后的真帧（BaseStream 字节直写）不受污染
+		# 牺牲行吸收 UTF-8 BOM 前导（.NET Framework 的 Process.StandardInput 属性首次访问即把 ef bb bf 写进管道，实测会贴在第一帧行首导致帧型匹配失败、整条帧流错位）：带换行的整行连 BOM 一起被远端帧循环当未知帧忽略，其后的真帧（BaseStream 字节直写）不受污染。Windows stdin 引导路径的同源问题由远端逐行剥前导解决（见 windows-stdin-bootstrap.ps1）。
 		try {
 			$进程.StandardInput.Write('预热行-吸收编码前导' + "`n")
 			$进程.StandardInput.Flush()
@@ -1157,11 +1167,16 @@ function 执行-扩展安装 {
 				$文本行 = $读取任务.Result
 				if ($null -eq $文本行) { break }
 				if ($文本行 -match '^__FRAME_TRUNCATED__') {
-					$详情 = 取-会话诊断摘要 -会话 $会话 -标准输出 @()
-					if ($详情 -match 'Disk quota exceeded') {
-						throw ("远端用户存储配额已满，安装文件无法落盘：{0}`n{1}" -f $文本行, $详情)
+					# 占用类失败不中止（与 Windows 单会话路径同语义）：接收器已排干帧体，上传器换唯一名重试
+					if ($文本行 -match 'being used by another process') {
+						Write-Host ('[帧上传] 远端落盘目标被占用（将换唯一名重试，不中止会话）：' + $文本行)
+					} else {
+						$详情 = 取-会话诊断摘要 -会话 $会话 -标准输出 @()
+						if ($详情 -match 'Disk quota exceeded') {
+							throw ("远端用户存储配额已满，安装文件无法落盘：{0}`n{1}" -f $文本行, $详情)
+						}
+						throw ("远端帧文件接收或落盘失败：{0}`n{1}" -f $文本行, $详情)
 					}
-					throw ("远端帧文件接收或落盘失败：{0}`n{1}" -f $文本行, $详情)
 				}
 				if ($文本行 -match '^__ORCH_EXIT__=(\d+)') {
 					$编排退出码 = [int]$Matches[1]
@@ -1191,35 +1206,95 @@ function 执行-扩展安装 {
 		}
 	}
 
+	function 转发-帧上传事件 {
+		# 主线程读循环侧的取空转发：队列原子取走后逐条上屏（上传器线程自己不 Write-Host，runspace 宿主输出不可靠）
+		while ($script:帧上传事件队列.Count -gt 0) {
+			$事件 = $null
+			try { $事件 = $script:帧上传事件队列[0]; $script:帧上传事件队列.RemoveAt(0) } catch { break }
+			if ($null -ne $事件) { Write-Host ([string]$事件) }
+		}
+	}
+
 	function 启动-帧上传器 {
 		param($会话, [string]$扫描目录, [string]$匹配模式)
 
 		# 上传器 = 独立 runspace 线程：消费本次运行的 race-supply-<提交号>-*.job 交接文件（供给下载完成后写入）并按“文件帧→命令帧”序送出；按提交号过滤，历史残留的交接文件（旧提交号大包）不碰，否则会被拖死。
 		# 与主线程（读输出）双工占用同一会话：写 stdin 的只有本线程（阶段帧在它启动前已送完），无并发写入风险。
+		# 事件经 $script:帧上传事件队列 交主线程上屏（开始/写毕/失败原因）；大帧 Write 在远端接收器消费前会合法阻塞（管道背压），事件行让等待可见而非静默。同一交接连续失败 5 次即丢弃并上报（数据文件保留），防坏交接无限重试；每次尝试用新的会话唯一落盘名。
 		$运行空间 = [runspacefactory]::CreateRunspace()
 		$运行空间.Open()
 		$运行空间.SessionStateProxy.SetVariable('输入流', $会话.标准输入.BaseStream)
 		$运行空间.SessionStateProxy.SetVariable('扫描目录', $扫描目录)
 		$运行空间.SessionStateProxy.SetVariable('匹配模式', $匹配模式)
 		$运行空间.SessionStateProxy.SetVariable('停止标志', $false)
+		$运行空间.SessionStateProxy.SetVariable('事件队列', $script:帧上传事件队列)
 		$ps = [powershell]::Create()
 		$ps.Runspace = $运行空间
 		[void]$ps.AddScript({
+			# 空队列兜底：调用方未初始化事件队列时退化为本地丢弃（事件不可见但上传功能不受影响），绝不让上报路径炸死上传线程
+			if ($null -eq $事件队列) { $事件队列 = New-Object System.Collections.ArrayList }
+			$失败计数 = @{}
 			while ($true) {
 				if ((Get-Variable -Name 停止标志 -ValueOnly)) { break }
 				Get-ChildItem -LiteralPath $扫描目录 -Filter $匹配模式 -ErrorAction SilentlyContinue | ForEach-Object {
+					$交接路径 = $_.FullName
 					try {
-						$交接 = Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+						$交接 = Get-Content -LiteralPath $交接路径 -Raw -Encoding UTF8 | ConvertFrom-Json
 						$字节 = [System.IO.File]::ReadAllBytes([string]$交接.数据文件)
-						$头 = [System.Text.Encoding]::UTF8.GetBytes("__FILE__`n" + $字节.Length + "`n" + [string]$交接.远端名 + "`n")
+						# 会话唯一落盘名（2026-11-17 B 服务器实证教训）：共享固定名 LOCAL.zip.uploading 会被并发/卡死会话的同名落盘占用（being used by another process → Create 失败 → 帧失败）。与远端自下载的 .downloading-<PID> 同思路：落盘名插入 本进程PID-尝试序号，跨会话/跨重试天然不撞；改名命令里的原远端名同步替换（最终成品名不含 .uploading，不受影响），成品发布的原子性不变
+						$尝试序 = 1
+						if ($失败计数.ContainsKey($交接路径)) { $尝试序 = $失败计数[$交接路径] + 1 }
+						$原远端名 = [string]$交接.远端名
+						$落盘名 = $原远端名 -replace '\.uploading$', ('-u' + $PID + 'a' + $尝试序 + '.uploading')
+						$完成命令 = ([string]$交接.完成命令).Replace($原远端名, $落盘名)
+						[void]$事件队列.Add(('[帧上传] 开始上传 {0}（{1} 字节），经主会话帧通道送出…' -f $落盘名, $字节.Length))
+						$头 = [System.Text.Encoding]::UTF8.GetBytes("__FILE__`n" + $字节.Length + "`n" + $落盘名 + "`n")
 						$输入流.Write($头, 0, $头.Length)
-						$输入流.Write($字节, 0, $字节.Length)
-						$尾 = [System.Text.Encoding]::UTF8.GetBytes("__CMD__`n" + [string]$交接.完成命令 + "`n")
+						# 分块写 + 双观测（2026-11-17 排障：单次 207MB Write 全程黑箱，堵在本地→ssh 还是 ssh→远端无从分辨）：每 1MB 一块；单块 Write 耗时 ≥2 秒说明管道背压（ssh.exe 或远端消费不动），立即报数与等待秒数；每 3 秒报累计进度与瞬时速率。与远端 [帧接收器] 的已收字节对照即可精确定位堵点：本地已写涨而远端已收不涨=SSH 通道/远端消费问题；本地已写就停=本地 ssh.exe 不读 stdin
+						$已写 = 0
+						$上传起 = Get-Date
+						$上次报 = $上传起
+						$上次报字节 = 0
+						while ($已写 -lt $字节.Length) {
+							$本块 = [int][Math]::Min(1048576, $字节.Length - $已写)
+							$写前 = Get-Date
+							$输入流.Write($字节, $已写, $本块)
+							$已写 += $本块
+							$写耗 = ((Get-Date) - $写前).TotalSeconds
+							if ($写耗 -ge 2) {
+								[void]$事件队列.Add(('[帧上传] 管道背压：单块写入等待 {0:N1} 秒（已写 {1} / {2} 字节）——ssh 或远端消费缓慢' -f $写耗, $已写, $字节.Length))
+							}
+							$此刻 = Get-Date
+							if (($此刻 - $上次报).TotalSeconds -ge 3) {
+								$速率 = ($已写 - $上次报字节) / [Math]::Max(0.1, ($此刻 - $上次报).TotalSeconds) / 1MB
+								[void]$事件队列.Add(('[帧上传] 已写 {0} / {1} 字节（{2:N1} MB/s）' -f $已写, $字节.Length, $速率))
+								$上次报 = $此刻
+								$上次报字节 = $已写
+							}
+						}
+						$尾 = [System.Text.Encoding]::UTF8.GetBytes("__CMD__`n" + $完成命令 + "`n")
 						$输入流.Write($尾, 0, $尾.Length)
 						$输入流.Flush()
-						Remove-Item -LiteralPath $_.FullName -Force
-						Remove-Item -LiteralPath ([string]$交接.数据文件) -Force -ErrorAction SilentlyContinue
-					} catch { }
+						Remove-Item -LiteralPath $交接路径 -Force
+						# 缓存保护（2026-11-17 用户抓到回归）：数据文件可能是**稳定成品缓存**（race-supply-<提交号>-<包名>，跨连接复用的就是它），上传成功绝不删——旧 scp 方案上传后保留缓存，交接改造引入的无条件删除把 217MB 缓存删光，下次连接被迫从零重下。只删私有在途文件（名含 .downloading-，本就是一次性半成品）；成品名一律保留
+						if ([string]$交接.数据文件 -match '\.downloading-') {
+							Remove-Item -LiteralPath ([string]$交接.数据文件) -Force -ErrorAction SilentlyContinue
+						}
+						$失败计数.Remove($交接路径)
+						[void]$事件队列.Add(('[帧上传] {0} 帧已写毕并交接改名命令（{1} 字节）。' -f $落盘名, $字节.Length))
+					} catch {
+						if (-not $失败计数.ContainsKey($交接路径)) { $失败计数[$交接路径] = 0 }
+						$失败计数[$交接路径]++
+						$原因 = ($_.Exception.Message -replace '\s+', ' ').Trim()
+						if ($失败计数[$交接路径] -ge 5) {
+							[void]$事件队列.Add(('[帧上传] 交接 {0} 连续失败 5 次，丢弃本次交接（数据文件保留，远程将继续自下载）：{1}' -f (Split-Path $交接路径 -Leaf), $原因))
+							Remove-Item -LiteralPath $交接路径 -Force -ErrorAction SilentlyContinue
+							$失败计数.Remove($交接路径)
+						} else {
+							[void]$事件队列.Add(('[帧上传] 上传失败（第 {0} 次，将换唯一落盘名重试）：{1}' -f $失败计数[$交接路径], $原因))
+							Start-Sleep -Seconds 2
+						}
+					}
 				}
 				Start-Sleep -Milliseconds 500
 			}
@@ -1385,6 +1460,7 @@ function 执行-扩展安装 {
 	}
 
 	function 推进-统一竞速汇报 {
+		转发-帧上传事件
 		if ($null -eq $script:统一竞速汇报 -or -not $script:统一竞速汇报.活跃 -or $script:统一竞速汇报.正在输出 -or (Get-Date) -lt $script:统一竞速汇报.下次汇报时刻) { return }
 		# 先抢占本次周期边界：打印过程可能触发转发回调，若到末尾才更新“下次汇报时刻”，重入会把同一批快照再打印一次。
 		$script:统一竞速汇报.正在输出 = $true
@@ -1430,10 +1506,12 @@ function 执行-扩展安装 {
 	function 新建-供给回调 {
 		param(
 			[pscustomobject]$竞速上下文,
-			[string]$系统类型
+			[string]$系统类型,
+			[switch]$批处理
 		)
 
 		# 预备完成后 CLI 与服务端同时交给组合协调器；产物各自判胜、各自停止，另一产物继续下载。
+		# -批处理（Windows -R 供给路径）：供给已在连接前由调用方启动并终局，远端预备标记不再触发供给启动（否则会重复下载）；竞速决出/获胜的止损分支保留。
 		$供给容器 = New-Object System.Collections.ArrayList
 		$已启动产物 = New-Object 'System.Collections.Generic.HashSet[string]'
 		$调度状态 = @{ 已结束 = $false }
@@ -1444,7 +1522,7 @@ function 执行-扩展安装 {
 		$完成汇报动作 = ${function:完成-竞速产物}
 		$回调 = {
 			param($行)
-			if (-not $调度状态.已结束 -and $行 -match '^__接管预备完成__(.*)$') {
+			if ((-not $批处理) -and (-not $调度状态.已结束) -and $行 -match '^__接管预备完成__(.*)$') {
 				$待装列表 = @($Matches[1] -split '\s+' | Where-Object { $_ })
 				& $初始化汇报动作 -产物列表 $待装列表
 				$待装上下文 = [pscustomobject]@{
@@ -1468,6 +1546,169 @@ function 执行-扩展安装 {
 		return [pscustomobject]@{ 回调 = $回调; 供给容器 = $供给容器 }
 	}
 
+	function 等待-Windows供给终局 {
+		param($供给容器)
+
+		# Windows -R 供给路径的前置等待：供给产物要先下载完整才能经 HTTP 供远端拉取，故连接前先等供给终局。
+		# 终局判据 = 供给子进程全部退出（下载完成写好 .job 后自行退出；异常终止也退出）+ .job 落盘宽限 3 秒；最多等 30 分钟（本地下载极慢时止损，未完成的包交远程自下载）。
+		$容器 = @($供给容器)
+		if ($容器.Count -eq 0) { return }
+		$截止 = (Get-Date).AddMinutes(30)
+		Write-Host '[单会话] 等待本地供给终局（下载完成或失败退出）后经转发通道供远端拉取…'
+		while ($true) {
+			转发-供给日志
+			刷新-接管输出缓冲
+			$仍在跑 = $false
+			foreach ($单个 in $容器) {
+				if ($null -eq $单个.进程) { continue }
+				try { $单个.进程.Refresh() } catch { }
+				try { if (-not $单个.进程.HasExited) { $仍在跑 = $true } } catch { }
+			}
+			if (-not $仍在跑) {
+				# 全部退出：给 .job 落盘留 3 秒宽限（写交接是退出前最后一步，正常先于退出可见），再收一次日志尾
+				Start-Sleep -Seconds 3
+				转发-供给日志 -收尾
+				break
+			}
+			if ((Get-Date) -gt $截止) {
+				Write-Host '[单会话] 本地供给 30 分钟未终局，按已有交接继续（未完成的包交远程自下载）。'
+				转发-供给日志 -收尾
+				break
+			}
+			Start-Sleep -Milliseconds 500
+		}
+	}
+
+	function 收集-供给交接表 {
+		param([pscustomobject]$竞速上下文)
+
+		# 把 TEMP 里本次提交号的 .job 交接（供给下载完成的产品）收成 远程包名→数据文件路径 的供给表，供 HTTP 监听器按路径取件。
+		# 缓存纪律与旧帧上传器一致：消费 .job 后只删名含 .downloading- 的私有在途数据文件，稳定成品缓存保留跨连接复用。
+		$供给表 = @{}
+		$模式 = 'race-supply-{0}-*.job' -f $竞速上下文.提交号
+		foreach ($交接文件 in @(Get-ChildItem -LiteralPath $env:TEMP -Filter $模式 -ErrorAction SilentlyContinue)) {
+			try {
+				$交接 = Get-Content -LiteralPath $交接文件.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+				$数据文件 = [string]$交接.数据文件
+				if (-not (Test-Path -LiteralPath $数据文件)) { throw '数据文件不存在' }
+				# 远端名带 .uploading 后缀（帧时代落盘名），HTTP 路径用成品包名（LOCAL.zip / LOCAL_CLI.zip）
+				$包名 = ([string]$交接.远端名) -replace '\.uploading$', ''
+				$供给表[$包名] = $数据文件
+				Write-Host ('[单会话] 供给就绪：{0}（{1} 字节）' -f $包名, (Get-Item -LiteralPath $数据文件).Length)
+				Remove-Item -LiteralPath $交接文件.FullName -Force -ErrorAction SilentlyContinue
+				if ($数据文件 -match '\.downloading-') {
+					Remove-Item -LiteralPath $数据文件 -Force -ErrorAction SilentlyContinue
+				}
+			} catch {
+				Write-Host ('[单会话] 交接文件读取失败（该包交远程自下载，不中止）：{0}：{1}' -f $交接文件.Name, $_.Exception.Message)
+			}
+		}
+		return $供给表
+	}
+
+	function 启动-本地HTTP供给 {
+		param([hashtable]$供给表)
+
+		# 本地 HTTP 供给监听器（仅回环 127.0.0.1，HttpListener 实测无需管理员）：独立 runspace 线程按 供给表（包名→文件路径）服务 GET/Range 请求。
+		# 远端经 ssh -R 转发通道拉 http://127.0.0.1:<远端端口>/<包名>，数据走 direct-tcpip 通道（与 scp 同路径），彻底避开 Win32-OpenSSH exec stdin 的关流前≈2MB 写窗口缺陷。
+		# 端口由系统分配（先 TcpListener 占 0 端口取号再释放给 HttpListener，竞态窗口极小且仅供回环）；监听失败返回 $null，调用方降级为仅远程自下载。
+		$端口 = 0
+		try {
+			$占位 = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+			$占位.Start()
+			$端口 = ([System.Net.IPEndPoint]$占位.LocalEndpoint).Port
+			$占位.Stop()
+		} catch { return $null }
+		$监听 = New-Object System.Net.HttpListener
+		try {
+			$监听.Prefixes.Add(('http://127.0.0.1:{0}/' -f $端口))
+			$监听.Start()
+		} catch {
+			try { $监听.Close() } catch { }
+			return $null
+		}
+		$运行空间 = [runspacefactory]::CreateRunspace()
+		$运行空间.Open()
+		$运行空间.SessionStateProxy.SetVariable('监听器', $监听)
+		$运行空间.SessionStateProxy.SetVariable('供给表', $供给表)
+		$运行空间.SessionStateProxy.SetVariable('事件队列', $script:帧上传事件队列)
+		$ps = [powershell]::Create()
+		$ps.Runspace = $运行空间
+		[void]$ps.AddScript({
+			if ($null -eq $事件队列) { $事件队列 = New-Object System.Collections.ArrayList }
+			while ($true) {
+				$ctx = $null
+				try { $ctx = $监听器.GetContext() } catch { break }   # 停止时 Close 会打断阻塞中的 GetContext
+				try {
+					$包名 = $ctx.Request.Url.AbsolutePath.TrimStart('/')
+					if (-not $供给表.ContainsKey($包名)) {
+						$ctx.Response.StatusCode = 404
+						$ctx.Response.Close()
+						continue
+					}
+					$路径 = $供给表[$包名]
+					$流 = [System.IO.File]::OpenRead($路径)
+					try {
+						$总长 = $流.Length
+						$起点 = [long]0
+						$范围头 = $ctx.Request.Headers['Range']
+						if ($范围头 -match '^bytes=(\d+)-') {
+							$起点 = [long]$Matches[1]
+							if ($起点 -ge $总长) {
+								# 416：续传点已达/超文件尾（远端判完整），带 Content-Range 告知真实长度
+								$ctx.Response.StatusCode = 416
+								$ctx.Response.Headers.Add('Content-Range', ('bytes */{0}' -f $总长))
+								$ctx.Response.Close()
+								continue
+							}
+							$ctx.Response.StatusCode = 206
+							$ctx.Response.Headers.Add('Content-Range', ('bytes {0}-{1}/{2}' -f $起点, ($总长 - 1), $总长))
+							$ctx.Response.ContentLength64 = $总长 - $起点
+							[void]$流.Seek($起点, [System.IO.SeekOrigin]::Begin)
+						} else {
+							$ctx.Response.StatusCode = 200
+							$ctx.Response.ContentLength64 = $总长
+						}
+						$ctx.Response.ContentType = 'application/octet-stream'
+						$缓冲 = New-Object byte[] 65536
+						$已发 = [long]0
+						$上次报 = Get-Date
+						while ($true) {
+							$n = $流.Read($缓冲, 0, $缓冲.Length)
+							if ($n -le 0) { break }
+							$ctx.Response.OutputStream.Write($缓冲, 0, $n)
+							$已发 += $n
+							if (((Get-Date) - $上次报).TotalSeconds -ge 3) {
+								[void]$事件队列.Add(('[本地供给] 已经转发通道发出 {0}：{1} / {2} 字节' -f $包名, $已发, ($总长 - $起点)))
+								$上次报 = Get-Date
+							}
+						}
+						$ctx.Response.Close()
+						[void]$事件队列.Add(('[本地供给] {0} 供给完成（{1} 字节）。' -f $包名, $已发))
+					} finally {
+						$流.Dispose()
+					}
+				} catch {
+					# 单请求失败（远端中断/连接重置）不杀监听器：远端断点续传会带 Range 重来
+					try { $ctx.Response.Abort() } catch { }
+				}
+			}
+		})
+		$句柄 = $ps.BeginInvoke()
+		return @{ 监听器 = $监听; 运行空间 = $运行空间; PS = $ps; 句柄 = $句柄; 端口 = $端口 }
+	}
+
+	function 停止-本地HTTP供给 {
+		param($供给器)
+		if ($null -eq $供给器) { return }
+		# 先关监听打断阻塞中的 GetContext，再短等线程收尾；弃管不阻碍进程退出（runspace 线程是后台线程）
+		try { $供给器.监听器.Stop() } catch { }
+		try { $供给器.监听器.Close() } catch { }
+		try { if (-not $供给器.句柄.AsyncWaitHandle.WaitOne(3000)) { $供给器.PS.Stop() } } catch { }
+		try { $供给器.PS.Dispose() } catch { }
+		try { $供给器.运行空间.Dispose() } catch { }
+	}
+
 	function 执行-Windows单会话安装 {
 		param(
 			[string]$连接目标,
@@ -1476,20 +1717,44 @@ function 执行-扩展安装 {
 			[pscustomobject]$竞速上下文
 		)
 
-		# Windows 单会话全流程：探测/预备/安装/竞速监控/竞速产物帧上传/暂存收尾一条 ssh 全包（供给产物经 stdin 帧通道送入，零 scp/额外连接）。载荷（安装脚本正文去整行注释与空行后 gzip+base64）嵌进单会话引导后，整段走 **stdin** 下发；argv里只放固定极小的 stdin 引导（private\windows-stdin-bootstrap.ps1）的 EncodedCommand，命令行长度从此与安装脚本大小解耦。
-		# 旧结论「不走 stdin（实测远端默认 shell 对 stdin 收尾不可靠，挂死率高且远端留僵尸进程）」已被 2026-10-22 真机实测推翻：
-		#   ① 远端 sshd DefaultShell = powershell.exe（不是 cmd.exe，故无 8191 字符命令行上限）；
-		#   ② 远端读全量 stdin → 去掉一切空白 → base64 解码，2KB/40KB/120KB/400KB 四档的长度与 SHA256 双判据全部一致、退出码 0、单程约 1 秒（本地 PowerShell 在管道结束时关闭 ssh 的标准输入，EOF 确定送达，无需赌收尾）。
-		# 而旧做法实测致命：双重 base64 使 argv 达 37,950 字符 > CreateProcess 上限 32,767 → ssh.exe 拒绝启动（Program 'ssh.exe' failed to run: The filename or extension is too long）→ preconnect 退出码 1→Remote-SSH 判 PreconnectScriptFailure（Session Summary「预连接脚本已失败」）→ 整条连接夭折，窗口再也重连不上。
+		# Windows 单会话全流程（第六轮重构：-R 转发供给）：一条 ssh 全包——载荷（安装脚本 gzip+base64 嵌进引导）走 stdin 写完即关流（≤2MB 安全窗口），安装包经 **-R 远程端口转发 + 本地 HTTP 供给** 由远端从 127.0.0.1 拉取（direct-tcpip 通道，与 scp 同路径）。
+		# 为什么不再走 stdin 帧通道：Win32-OpenSSH exec 会话的 stdin 数据只在关流后整体送达，关流前可写上限约 2MB（2026-11-17 实测：2MB+关流 PASS、4MB 起 Write 永久阻塞），217MB 安装包"写完再关流"是死锁；边跑边发则远端永远收不到。转发通道实证 8MB 0.5s 哈希一致。
+		# 时序：探针已报待装产物 → 本地供给先行下载并等终局 → 收 .job 成供给表 → 起回环 HTTP 监听 → ssh -R 连接 → 远端安装脚本从转发地址拉包（复用断点续传下载，失败回退官方源远程自下载）。
+		# argv 只放固定极小的 stdin 引导（private\windows-stdin-bootstrap.ps1）的 EncodedCommand，命令行长度与安装脚本大小解耦（旧双重 base64 进 argv 曾达 37950 > 32767 上限致 ssh 拒绝启动）。
 		# 引导自带 PS2 版本门：命中打 __PS2__ 标记，调用方直接报错；返回 '完成' 或 'PS2'。
-		$精简正文 = (($脚本文本 -split "`r?`n") | Where-Object { $_ -notmatch '^\s*#' -and $_.Trim() -ne '' }) -join "`n"
-		$压缩流 = New-Object System.IO.MemoryStream
-		$压缩器 = New-Object System.IO.Compression.GZipStream($压缩流, [System.IO.Compression.CompressionMode]::Compress)
-		$正文字节 = [System.Text.Encoding]::UTF8.GetBytes($精简正文)
-		$压缩器.Write($正文字节, 0, $正文字节.Length)
-		$压缩器.Close()
-		$载荷 = [Convert]::ToBase64String($压缩流.ToArray())
-		# 守卫文件也压缩成载荷：引导把它写到远端临时目录与安装脚本同目录，$PSScriptRoot 可直接引用
+
+		# ===== 1. 本地供给先行（探针已报待装产物；供给只下载到本地缓存，零连接）=====
+		$待装名 = $script:探测待装产物
+		if ($null -eq $待装名) { $待装名 = @('CLI', '服务端') }   # 探针未报待装清单：保守按双产物供给
+		$批供给容器 = New-Object System.Collections.ArrayList
+		$待装上下文 = [pscustomobject]@{
+			暂存目录 = $竞速上下文.暂存目录; 包扩展名 = $竞速上下文.包扩展名; 提交号 = $竞速上下文.提交号; 分隔符 = $竞速上下文.分隔符; 架构标识 = $竞速上下文.架构标识
+			产物列表 = @($竞速上下文.产物列表 | Where-Object { $待装名 -contains $_.产物名 })
+		}
+		if ($待装上下文.产物列表.Count -gt 0) {
+			初始化-统一竞速汇报 -产物列表 @($待装上下文.产物列表 | ForEach-Object { $_.产物名 })
+			foreach ($单个 in (启动-本地竞速供给 -竞速上下文 $待装上下文 -系统类型 'Windows')) { [void]$批供给容器.Add($单个) }
+		}
+		等待-Windows供给终局 -供给容器 @($批供给容器.ToArray())
+		$供给表 = 收集-供给交接表 -竞速上下文 $竞速上下文
+
+		# ===== 2. 回环 HTTP 供给监听（供给表为空则不起，远端全走自下载）=====
+		$供给器 = $null
+		if ($供给表.Count -gt 0) {
+			$供给器 = 启动-本地HTTP供给 -供给表 $供给表
+			if ($null -eq $供给器) {
+				Write-Host '[单会话] 本地 HTTP 供给监听启动失败（端口占用/权限），本轮降级为仅远程自下载。'
+			} else {
+				Write-Host ('[单会话] 本地 HTTP 供给已就绪（127.0.0.1:{0}，{1} 个包），将经 ssh -R 转发通道供远端拉取。' -f $供给器.端口, $供给表.Count)
+			}
+		}
+
+		# ===== 3. 固定引导（argv 唯一随模板增长的部件，长度守卫）=====
+		$固定引导码 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($script:脚本_stdin引导))
+		if ($固定引导码.Length -gt 8000) {
+			throw ('stdin 固定引导过长（EncodedCommand {0} 字符 > 8000），请精简 private\windows-stdin-bootstrap.ps1；它的长度直接决定 argv 占用，必须远小于命令行上限 32767。' -f $固定引导码.Length)
+		}
+		# 守卫文件压缩成载荷：引导把它写到远端临时目录与安装脚本同目录，$PSScriptRoot 可直接引用（不随重试变化，只压一次）
 		$守卫正文 = (Get-Content -Path (Join-Path $script:模块根目录 'private\ssh-pipe-guard.ps1') -Raw -Encoding UTF8)
 		$守卫压缩流 = New-Object System.IO.MemoryStream
 		$守卫压缩器 = New-Object System.IO.Compression.GZipStream($守卫压缩流, [System.IO.Compression.CompressionMode]::Compress)
@@ -1497,18 +1762,8 @@ function 执行-扩展安装 {
 		$守卫压缩器.Write($守卫字节, 0, $守卫字节.Length)
 		$守卫压缩器.Close()
 		$守卫载荷 = [Convert]::ToBase64String($守卫压缩流.ToArray())
-		$引导脚本 = $script:脚本_单会话引导.Replace('__载荷__', $载荷).Replace('__守卫载荷__', $守卫载荷)
-		$引导码 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($引导脚本))
-		# ===== 传输通道：载荷走 stdin，argv 只装固定引导 =====
-		$固定引导码 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($script:脚本_stdin引导))
-		if ($固定引导码.Length -gt 8000) {
-			# 守卫：本文件是 argv 里**唯一**随模板增长的部件（载荷已不再进 argv），一旦变胖就可能把整条命令行顶穿上限。
-			throw ('stdin 固定引导过长（EncodedCommand {0} 字符 > 8000），请精简 private\windows-stdin-bootstrap.ps1；它的长度直接决定 argv 占用，必须远小于命令行上限 32767。' -f $固定引导码.Length)
-		}
-		$载荷标准输入 = $引导码
-		# 整段一次写入、不分块：远端 windows-stdin-bootstrap.ps1 是 ReadToEndAsync 读全量后 `-replace '\s',''` 剔掉**全部空白**再 base64 解码，行结构对传输没有任何意义（实测 2KB/40KB/120KB/400KB 四档长度与 SHA256 双判据全一致）。旧写法把载荷切成 4000 字符一块、join 换行、再校验「拼接后长度 == 引导码长度 + 块数」：那是自己切、自己拼、自己校，只可能拦下“我自己写错了切分/拼接代码”（开发期测一次就会暴露的事），拦不下任何传输层问题（损坏由远端 base64 解码失败与安装脚本自身校验兜底），“避开超长单行的未知处理”也只是没有实测依据的猜测——卡 32767 的从来只是 argv 通道（载荷已改走 stdin）。故删掉分块与那道无效不变式，少三步复杂度。
-		Write-Host ('[单会话] 引导码 {0} 字符整段走标准输入下发；argv 上只剩 {1} 字符的固定引导代码，远低于 Windows 命令行 32767 上限。' -f $引导码.Length, $固定引导码.Length)
-		$回调包 = 新建-供给回调 -竞速上下文 $竞速上下文 -系统类型 'Windows'
+
+		$回调包 = 新建-供给回调 -竞速上下文 $竞速上下文 -系统类型 'Windows' -批处理
 		$script:单会话PS2标记 = $false
 		$内部回调 = $回调包.回调
 		$检测回调 = {
@@ -1518,22 +1773,48 @@ function 执行-扩展安装 {
 		}
 		try {
 			$命令行 = 'powershell -NoProfile -EncodedCommand {0}' -f $固定引导码
-			# 启动前通道故障只重试一次：无输出挂死或对端提前关闭 stdin 都可能由瞬时 SSH 断连引起；认证失败、远端脚本异常等其它错误仍原样抛出。
-			$尝试上限 = 2
+			# 重试上限 3：stdin 通道瞬时故障重试 + 转发端口撞占换端口重试（ExitOnForwardFailure 让撞占立即失败而非静默降级）
+			$尝试上限 = 3
 			for ($轮次 = 1; $轮次 -le $尝试上限; $轮次++) {
+				$远端端口 = Get-Random -Minimum 20000 -Maximum 60000
+				$供给地址 = ''
+				$供给包列表 = ''
+				$转发选项 = ''
+				if ($null -ne $供给器) {
+					$供给地址 = 'http://127.0.0.1:{0}' -f $远端端口
+					$供给包列表 = @($供给表.Keys) -join ' '
+					$转发选项 = '-o ExitOnForwardFailure=yes -R 127.0.0.1:{0}:127.0.0.1:{1}' -f $远端端口, $供给器.端口
+				}
+				# 供给地址占位符替换后再压缩（地址随远端端口每轮可变）；去整行注释与空行减小载荷
+				$本轮文本 = $脚本文本.Replace('__供给地址__', $供给地址).Replace('__供给包列表__', $供给包列表)
+				$精简正文 = (($本轮文本 -split "`r?`n") | Where-Object { $_ -notmatch '^\s*#' -and $_.Trim() -ne '' }) -join "`n"
+				$压缩流 = New-Object System.IO.MemoryStream
+				$压缩器 = New-Object System.IO.Compression.GZipStream($压缩流, [System.IO.Compression.CompressionMode]::Compress)
+				$正文字节 = [System.Text.Encoding]::UTF8.GetBytes($精简正文)
+				$压缩器.Write($正文字节, 0, $正文字节.Length)
+				$压缩器.Close()
+				$载荷 = [Convert]::ToBase64String($压缩流.ToArray())
+				$引导脚本 = $script:脚本_单会话引导.Replace('__载荷__', $载荷).Replace('__守卫载荷__', $守卫载荷)
+				$引导码 = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($引导脚本))
+				Write-Host ('[单会话] 引导码 {0} 字符走标准输入（写完即关流）；argv 固定引导 {1} 字符；供给地址 [{2}]。' -f $引导码.Length, $固定引导码.Length, $供给地址)
 				try {
-					# 全单连接：载荷送出后 stdin 保留为帧通道，本地供给的竞速产物（.job 交接）由帧上传器经同一条连接的 __FILE__/__CMD__ 帧送入，与 Linux 编排路径同一套纪律，不再有独立 scp/ssh 上传
-					执行-SSH命令带标准输入 -连接目标 $连接目标 -端口 $端口 -命令文本 $命令行 -标准输入文本 $载荷标准输入 -超时秒 240 -每行回调 $检测回调 -保留帧通道 -交接匹配 ('race-supply-{0}-*.job' -f $竞速上下文.提交号)
+					执行-SSH命令带标准输入 -连接目标 $连接目标 -端口 $端口 -命令文本 $命令行 -标准输入文本 $引导码 -超时秒 240 -每行回调 $检测回调 -转发选项 $转发选项
 					break
 				} catch {
-					if ($_.Exception.Message -notmatch '^\[stdin(超时|通道中断)\]') { throw }
+					$错文 = $_.Exception.Message
+					if ($错文 -match 'port forwarding failed' -and $轮次 -lt $尝试上限) {
+						Write-Host ('[单会话] 远端转发端口 {0} 撞占（第 {1} 次尝试），换端口重试。' -f $远端端口, $轮次)
+						continue
+					}
+					if ($错文 -notmatch '^\[stdin(超时|通道中断)\]') { throw }
 					if ($轮次 -ge $尝试上限) { throw }
-					Write-Host ('[单会话] 标准输入通道中断（第 {0} 次尝试），重试第 {1} 次。{2}' -f $轮次, ($轮次 + 1), $_.Exception.Message)
+					Write-Host ('[单会话] 标准输入通道中断（第 {0} 次尝试），重试第 {1} 次。{2}' -f $轮次, ($轮次 + 1), $错文)
 					$script:单会话PS2标记 = $false
 				}
 			}
 		} finally {
-			等待-供给进程并回收日志 -供给 @($回调包.供给容器.ToArray())
+			停止-本地HTTP供给 $供给器
+			等待-供给进程并回收日志 -供给 @($批供给容器.ToArray())
 		}
 		if ($script:单会话PS2标记) { return 'PS2' }
 		return '完成'
@@ -1626,7 +1907,7 @@ function 执行-扩展安装 {
 		$接管会话 = 建立-接管会话 -连接目标 $连接目标 -端口 $SSH端口 -预备命令 $竞速预备命令
 	} catch {
 		# 会话建立失败：若为 Windows 回执则走 Windows 流程，否则原样抛出保留 ssh 真实错误。
-		if (-not (执行-Windows平台探测 -连接目标 $连接目标 -端口 $SSH端口)) { throw }
+		if (-not (执行-Windows平台探测 -连接目标 $连接目标 -端口 $SSH端口 -发布通道 $本地信息.发布通道 -提交号 $本地信息.提交号)) { throw }
 	}
 	$环境 = $null
 	if ($null -ne $接管会话) {
@@ -1639,7 +1920,7 @@ function 执行-扩展安装 {
 				try { 关闭-接管会话 $接管会话 } catch { }
 				$接管会话 = $null
 			}
-			$回退标记 = 执行-Windows平台探测 -连接目标 $连接目标 -端口 $SSH端口
+			$回退标记 = 执行-Windows平台探测 -连接目标 $连接目标 -端口 $SSH端口 -发布通道 $本地信息.发布通道 -提交号 $本地信息.提交号
 			if (-not $回退标记) { throw }
 		}
 	}
