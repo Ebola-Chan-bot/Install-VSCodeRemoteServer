@@ -1511,7 +1511,7 @@ function 执行-扩展安装 {
 		)
 
 		# 预备完成后 CLI 与服务端同时交给组合协调器；产物各自判胜、各自停止，另一产物继续下载。
-		# -批处理（Windows -R 供给路径）：供给已在连接前由调用方启动并终局，远端预备标记不再触发供给启动（否则会重复下载）；竞速决出/获胜的止损分支保留。
+		# -批处理（Windows -R 供给路径）：供给已在连接前启动，远端预备标记不再触发重复启动；下载与远端官方源下载并行，交付后才经转发供给。
 		$供给容器 = New-Object System.Collections.ArrayList
 		$已启动产物 = New-Object 'System.Collections.Generic.HashSet[string]'
 		$调度状态 = @{ 已结束 = $false }
@@ -1546,72 +1546,32 @@ function 执行-扩展安装 {
 		return [pscustomobject]@{ 回调 = $回调; 供给容器 = $供给容器 }
 	}
 
-	function 等待-Windows供给终局 {
-		param($供给容器)
-
-		# Windows -R 供给路径的前置等待：供给产物要先下载完整才能经 HTTP 供远端拉取，故连接前先等供给终局。
-		# 终局判据 = 供给子进程全部退出（下载完成写好 .job 后自行退出；异常终止也退出）+ .job 落盘宽限 3 秒；最多等 30 分钟（本地下载极慢时止损，未完成的包交远程自下载）。
-		$容器 = @($供给容器)
-		if ($容器.Count -eq 0) { return }
-		$截止 = (Get-Date).AddMinutes(30)
-		Write-Host '[单会话] 等待本地供给终局（下载完成或失败退出）后经转发通道供远端拉取…'
-		while ($true) {
-			转发-供给日志
-			刷新-接管输出缓冲
-			$仍在跑 = $false
-			foreach ($单个 in $容器) {
-				if ($null -eq $单个.进程) { continue }
-				try { $单个.进程.Refresh() } catch { }
-				try { if (-not $单个.进程.HasExited) { $仍在跑 = $true } } catch { }
-			}
-			if (-not $仍在跑) {
-				# 全部退出：给 .job 落盘留 3 秒宽限（写交接是退出前最后一步，正常先于退出可见），再收一次日志尾
-				Start-Sleep -Seconds 3
-				转发-供给日志 -收尾
-				break
-			}
-			if ((Get-Date) -gt $截止) {
-				Write-Host '[单会话] 本地供给 30 分钟未终局，按已有交接继续（未完成的包交远程自下载）。'
-				转发-供给日志 -收尾
-				break
-			}
-			Start-Sleep -Milliseconds 500
-		}
-	}
-
 	function 收集-供给交接表 {
-		param([pscustomobject]$竞速上下文)
+		param([pscustomobject]$竞速上下文, [hashtable]$供给表)
 
-		# 把 TEMP 里本次提交号的 .job 交接（供给下载完成的产品）收成 远程包名→数据文件路径 的供给表，供 HTTP 监听器按路径取件。
-		# 缓存纪律与旧帧上传器一致：消费 .job 后只删名含 .downloading- 的私有在途数据文件，稳定成品缓存保留跨连接复用。
-		$供给表 = @{}
+		# 连接建立前只收已有的交接；监听器运行后继续由后台线程接收新交接，不再等待供给终局。
+		# 缓存纪律：消费 .job 后只删名含 .downloading- 的私有在途数据文件，稳定成品缓存保留跨连接复用。
 		$模式 = 'race-supply-{0}-*.job' -f $竞速上下文.提交号
 		foreach ($交接文件 in @(Get-ChildItem -LiteralPath $env:TEMP -Filter $模式 -ErrorAction SilentlyContinue)) {
 			try {
 				$交接 = Get-Content -LiteralPath $交接文件.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
 				$数据文件 = [string]$交接.数据文件
 				if (-not (Test-Path -LiteralPath $数据文件)) { throw '数据文件不存在' }
-				# 远端名带 .uploading 后缀（帧时代落盘名），HTTP 路径用成品包名（LOCAL.zip / LOCAL_CLI.zip）
 				$包名 = ([string]$交接.远端名) -replace '\.uploading$', ''
 				$供给表[$包名] = $数据文件
 				Write-Host ('[单会话] 供给就绪：{0}（{1} 字节）' -f $包名, (Get-Item -LiteralPath $数据文件).Length)
 				Remove-Item -LiteralPath $交接文件.FullName -Force -ErrorAction SilentlyContinue
-				if ($数据文件 -match '\.downloading-') {
-					Remove-Item -LiteralPath $数据文件 -Force -ErrorAction SilentlyContinue
-				}
-			} catch {
-				Write-Host ('[单会话] 交接文件读取失败（该包交远程自下载，不中止）：{0}：{1}' -f $交接文件.Name, $_.Exception.Message)
-			}
+				if ($数据文件 -match '\.downloading-') { Remove-Item -LiteralPath $数据文件 -Force -ErrorAction SilentlyContinue }
+			} catch { Write-Host ('[单会话] 交接文件读取失败（该包交远程自下载，不中止）：{0}：{1}' -f $交接文件.Name, $_.Exception.Message) }
 		}
-		return $供给表
 	}
 
 	function 启动-本地HTTP供给 {
-		param([hashtable]$供给表)
+		param([hashtable]$供给表, [string]$提交号)
 
-		# 本地 HTTP 供给监听器（仅回环 127.0.0.1，HttpListener 实测无需管理员）：独立 runspace 线程按 供给表（包名→文件路径）服务 GET/Range 请求。
-		# 远端经 ssh -R 转发通道拉 http://127.0.0.1:<远端端口>/<包名>，数据走 direct-tcpip 通道（与 scp 同路径），彻底避开 Win32-OpenSSH exec stdin 的关流前≈2MB 写窗口缺陷。
-		# 端口由系统分配（先 TcpListener 占 0 端口取号再释放给 HttpListener，竞态窗口极小且仅供回环）；监听失败返回 $null，调用方降级为仅远程自下载。
+		# 本地 HTTP 供给监听器（仅回环 127.0.0.1）：后台线程持续扫描新交接，包一旦下载完整立即开放；远端可在本地继续下载时同时从官方源下载。
+		# 远端经 ssh -R 转发通道拉 http://127.0.0.1:<远端端口>/<包名>，数据走 direct-tcpip 通道，避开 exec stdin 的关流前写窗口缺陷。
+		# 端口由系统分配；监听失败返回 $null，调用方降级为仅远程自下载。
 		$端口 = 0
 		try {
 			$占位 = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
@@ -1632,11 +1592,25 @@ function 执行-扩展安装 {
 		$运行空间.SessionStateProxy.SetVariable('监听器', $监听)
 		$运行空间.SessionStateProxy.SetVariable('供给表', $供给表)
 		$运行空间.SessionStateProxy.SetVariable('事件队列', $script:帧上传事件队列)
+		$运行空间.SessionStateProxy.SetVariable('扫描目录', $env:TEMP)
+		$运行空间.SessionStateProxy.SetVariable('匹配模式', ('race-supply-{0}-*.job' -f $提交号))
 		$ps = [powershell]::Create()
 		$ps.Runspace = $运行空间
 		[void]$ps.AddScript({
 			if ($null -eq $事件队列) { $事件队列 = New-Object System.Collections.ArrayList }
 			while ($true) {
+				foreach ($交接文件 in @(Get-ChildItem -LiteralPath $扫描目录 -Filter $匹配模式 -ErrorAction SilentlyContinue)) {
+					try {
+						$交接 = Get-Content -LiteralPath $交接文件.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+						$数据文件 = [string]$交接.数据文件
+						if (-not (Test-Path -LiteralPath $数据文件)) { throw '数据文件不存在' }
+						$包名 = ([string]$交接.远端名) -replace '\.uploading$', ''
+						$供给表[$包名] = $数据文件
+						[void]$事件队列.Add(('[单会话] 供给就绪：{0}（{1} 字节）' -f $包名, (Get-Item -LiteralPath $数据文件).Length))
+						Remove-Item -LiteralPath $交接文件.FullName -Force -ErrorAction SilentlyContinue
+						if ($数据文件 -match '\.downloading-') { Remove-Item -LiteralPath $数据文件 -Force -ErrorAction SilentlyContinue }
+					} catch { [void]$事件队列.Add(('[单会话] 交接读取失败，等待重试：{0}' -f $_.Exception.Message)) }
+				}
 				$ctx = $null
 				try { $ctx = $监听器.GetContext() } catch { break }   # 停止时 Close 会打断阻塞中的 GetContext
 				try {
@@ -1719,11 +1693,11 @@ function 执行-扩展安装 {
 
 		# Windows 单会话全流程（第六轮重构：-R 转发供给）：一条 ssh 全包——载荷（安装脚本 gzip+base64 嵌进引导）走 stdin 写完即关流（≤2MB 安全窗口），安装包经 **-R 远程端口转发 + 本地 HTTP 供给** 由远端从 127.0.0.1 拉取（direct-tcpip 通道，与 scp 同路径）。
 		# 为什么不再走 stdin 帧通道：Win32-OpenSSH exec 会话的 stdin 数据只在关流后整体送达，关流前可写上限约 2MB（2026-11-17 实测：2MB+关流 PASS、4MB 起 Write 永久阻塞），217MB 安装包"写完再关流"是死锁；边跑边发则远端永远收不到。转发通道实证 8MB 0.5s 哈希一致。
-		# 时序：探针已报待装产物 → 本地供给先行下载并等终局 → 收 .job 成供给表 → 起回环 HTTP 监听 → ssh -R 连接 → 远端安装脚本从转发地址拉包（复用断点续传下载，失败回退官方源远程自下载）。
+		# 时序：本地供给启动但不等待终局 → 起回环 HTTP 监听 → ssh -R 连接 → 远端官方源下载与本地供给同时运行，任一先完成即停止另一方。
 		# argv 只放固定极小的 stdin 引导（private\windows-stdin-bootstrap.ps1）的 EncodedCommand，命令行长度与安装脚本大小解耦（旧双重 base64 进 argv 曾达 37950 > 32767 上限致 ssh 拒绝启动）。
 		# 引导自带 PS2 版本门：命中打 __PS2__ 标记，调用方直接报错；返回 '完成' 或 'PS2'。
 
-		# ===== 1. 本地供给先行（探针已报待装产物；供给只下载到本地缓存，零连接）=====
+		# ===== 1. 本地供给启动（探针已报待装产物；供给只下载到本地缓存，零连接，不阻塞连接建立）=====
 		$待装名 = $script:探测待装产物
 		if ($null -eq $待装名) { $待装名 = @('CLI', '服务端') }   # 探针未报待装清单：保守按双产物供给
 		$批供给容器 = New-Object System.Collections.ArrayList
@@ -1735,18 +1709,15 @@ function 执行-扩展安装 {
 			初始化-统一竞速汇报 -产物列表 @($待装上下文.产物列表 | ForEach-Object { $_.产物名 })
 			foreach ($单个 in (启动-本地竞速供给 -竞速上下文 $待装上下文 -系统类型 'Windows')) { [void]$批供给容器.Add($单个) }
 		}
-		等待-Windows供给终局 -供给容器 @($批供给容器.ToArray())
-		$供给表 = 收集-供给交接表 -竞速上下文 $竞速上下文
+		$供给表 = @{}
+		收集-供给交接表 -竞速上下文 $竞速上下文 -供给表 $供给表
 
-		# ===== 2. 回环 HTTP 供给监听（供给表为空则不起，远端全走自下载）=====
-		$供给器 = $null
-		if ($供给表.Count -gt 0) {
-			$供给器 = 启动-本地HTTP供给 -供给表 $供给表
-			if ($null -eq $供给器) {
-				Write-Host '[单会话] 本地 HTTP 供给监听启动失败（端口占用/权限），本轮降级为仅远程自下载。'
-			} else {
-				Write-Host ('[单会话] 本地 HTTP 供给已就绪（127.0.0.1:{0}，{1} 个包），将经 ssh -R 转发通道供远端拉取。' -f $供给器.端口, $供给表.Count)
-			}
+		# ===== 2. 回环 HTTP 供给监听始终启动，包在后台就绪后自动开放 =====
+		$供给器 = 启动-本地HTTP供给 -供给表 $供给表 -提交号 $竞速上下文.提交号
+		if ($null -eq $供给器) {
+			Write-Host '[单会话] 本地 HTTP 供给监听启动失败（端口占用/权限），本轮降级为仅远程自下载。'
+		} else {
+			Write-Host ('[单会话] 本地 HTTP 供给已就绪（127.0.0.1:{0}），本地包下载期间将自动接入。' -f $供给器.端口)
 		}
 
 		# ===== 3. 固定引导（argv 唯一随模板增长的部件，长度守卫）=====
@@ -1782,7 +1753,7 @@ function 执行-扩展安装 {
 				$转发选项 = ''
 				if ($null -ne $供给器) {
 					$供给地址 = 'http://127.0.0.1:{0}' -f $远端端口
-					$供给包列表 = @($供给表.Keys) -join ' '
+					$供给包列表 = 'LOCAL.zip LOCAL_CLI.zip'
 					$转发选项 = '-o ExitOnForwardFailure=yes -R 127.0.0.1:{0}:127.0.0.1:{1}' -f $远端端口, $供给器.端口
 				}
 				# 供给地址占位符替换后再压缩（地址随远端端口每轮可变）；去整行注释与空行减小载荷

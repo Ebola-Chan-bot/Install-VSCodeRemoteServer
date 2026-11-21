@@ -191,33 +191,6 @@ function 安装-CLI压缩包 {
 	}
 }
 
-function 获取-本地供给包 {
-	param(
-		[string]$产物名,
-		[string]$包名,
-		[string]$完成标记名,
-		[string]$暂存目录,
-		[string]$供给地址
-	)
-
-	# 经 -R 转发通道拉取本地供给包（本地模块已下载到缓存并经回环 HTTP 供给）：复用断点续传下载（带 Range，转发闪断可续传），私有在途名防并发，完成后改名发布+写标记（与远程自下载同一原子序）。
-	# 有限重试（5 次）：监听器已死/转发已断时快速失败返回 false，调用方回退官方源远程自下载，绝不阻塞安装。
-	$成品路径 = Join-Path $暂存目录 $包名
-	$在途路径 = $成品路径 + '.supplying-' + $PID
-	try {
-		通过HTTP断点续传下载 -下载地址 ($供给地址.TrimEnd('/') + '/' + $包名) -目标路径 $在途路径 -端标注 ('[本地供给-{0}]' -f $产物名) -最大重试次数 5
-		if (-not (测试-压缩包完整 $在途路径)) { throw '供给包完整性校验未通过' }
-		Move-Item -LiteralPath $在途路径 -Destination $成品路径 -Force -ErrorAction Stop
-		New-Item -ItemType File -Force (Join-Path $暂存目录 $完成标记名) | Out-Null
-		Write-Host ('[本地供给-{0}] 供给包已经转发通道拉取并落位（{1} 字节）。' -f $产物名, (Get-Item -LiteralPath $成品路径).Length)
-		return $true
-	} catch {
-		Remove-Item -LiteralPath $在途路径 -Force -ErrorAction SilentlyContinue
-		Write-Host ('[本地供给-{0}] 转发供给失败，回退远程自下载：{1}' -f $产物名, ($_.Exception.Message -replace '\s+', ' '))
-		return $false
-	}
-}
-
 function 竞速-单个产物 {
 	param(
 		[string]$产物名,
@@ -228,6 +201,8 @@ function 竞速-单个产物 {
 		[string]$本地完成标记,
 		[string]$本地取消标记,
 		[string]$下载函数文本,
+		[string]$供给地址 = '',
+		[string]$供给包名 = '',
 		[switch]$仅启动
 	)
 
@@ -317,8 +292,33 @@ function 竞速-单个产物 {
 			Write-Output ('{0} 远程自下载异常终止: {1}' -f $端标注, $_.Exception.Message)
 		}
 	}
+	$供给作业 = $null
+	if ($仅启动 -and $供给地址 -ne '' -and $供给包名 -ne '') {
+		$供给作业 = Start-Job -ScriptBlock {
+			param($下载函数文本, $地址, $产物, $包名, $标记名, $目录)
+			$ErrorActionPreference = 'Continue'
+			[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+			Invoke-Expression ('function 通过HTTP断点续传下载 { ' + $下载函数文本 + ' }')
+			$成品路径 = Join-Path $目录 $包名
+			$在途路径 = $成品路径 + '.supplying-' + $PID
+			Write-Output ('[本地供给-{0}] 已加入竞速：等待本地包就绪后经转发通道拉取。' -f $产物)
+			while ($true) {
+				try {
+					通过HTTP断点续传下载 -下载地址 ($地址.TrimEnd('/') + '/' + $包名) -目标路径 $在途路径 -端标注 ('[本地供给-{0}]' -f $产物) -最大重试次数 5 -结构化进度 $true
+					if (-not (Test-Path -LiteralPath $在途路径)) { throw '供给包未落盘' }
+					Move-Item -LiteralPath $在途路径 -Destination $成品路径 -Force -ErrorAction Stop
+					New-Item -ItemType File -Force (Join-Path $目录 $标记名) | Out-Null
+					Write-Output ('[本地供给-{0}] 供给包已经转发通道拉取并落位（{1} 字节）。' -f $产物, (Get-Item -LiteralPath $成品路径).Length)
+					break
+				} catch {
+					Remove-Item -LiteralPath $在途路径 -Force -ErrorAction SilentlyContinue
+					Start-Sleep -Seconds 2
+				}
+			}
+		} -ArgumentList $下载函数文本, $供给地址, $产物名, $供给包名, $本地完成标记, (Split-Path -Parent $本地包路径)
+	}
 	if ($仅启动) {
-		return [pscustomobject]@{ 产物名 = $产物名; 下载作业 = $下载作业; 远程包路径 = $远程包路径; 远程完成标记 = $远程完成标记; 本地包路径 = $本地包路径; 本地完成标记 = $本地完成标记; 本地取消标记 = $本地取消标记 }
+		return [pscustomobject]@{ 产物名 = $产物名; 下载作业 = $下载作业; 供给作业 = $供给作业; 远程包路径 = $远程包路径; 远程完成标记 = $远程完成标记; 本地包路径 = $本地包路径; 本地完成标记 = $本地完成标记; 本地取消标记 = $本地取消标记 }
 	}
 
 	$获胜方 = $null
@@ -362,7 +362,7 @@ function 竞速-全部产物 {
 		if ($null -eq $参数) { continue }
 		$项 = 竞速-单个产物 @参数 -仅启动
 		$项表[$产物名] = $项
-		$状态表[$产物名] = @{ 已下载 = 0L; 总长度 = 0L; 已完成 = $false }
+		$状态表[$产物名] = @{ 已下载 = 0L; 总长度 = 0L; 本地已下载 = 0L; 本地总长度 = 0L; 已完成 = $false }
 		if ($null -eq $项.PSObject.Properties['下载作业']) {
 			$状态表[$产物名].已完成 = $true
 			$结果表[$产物名] = $项.获胜包路径
@@ -373,6 +373,14 @@ function 竞速-全部产物 {
 			foreach ($产物名 in @($项表.Keys)) {
 				$项 = $项表[$产物名]
 				if ($状态表[$产物名].已完成) { continue }
+				if ($null -ne $项.供给作业) {
+					foreach ($供给输出 in @(Receive-Job -Job $项.供给作业 -ErrorAction SilentlyContinue)) {
+						$供给行 = [string]$供给输出
+						if ($供给行.StartsWith('__VSI_PROGRESS__')) {
+							try { $供给进度 = $供给行.Substring(16) | ConvertFrom-Json; $状态表[$产物名].本地已下载 = [long]$供给进度.已下载; $状态表[$产物名].本地总长度 = [long]$供给进度.总长度 } catch { }
+						} elseif (-not [string]::IsNullOrWhiteSpace($供给行)) { Write-Host ($供给行 -replace '^\[本地供给-', '[远端转发-') }
+					}
+				}
 				foreach ($输出项 in @(Receive-Job -Job $项.下载作业 -ErrorAction SilentlyContinue)) {
 					$行 = [string]$输出项
 					if ($行.StartsWith('__VSI_PROGRESS__')) {
@@ -393,11 +401,16 @@ function 竞速-全部产物 {
 				if ($null -ne $获胜方) {
 					New-Item -ItemType File -Force $项.本地取消标记 | Out-Null
 					Stop-Job -Job $项.下载作业 -ErrorAction SilentlyContinue
+					if ($null -ne $项.供给作业) {
+						Stop-Job -Job $项.供给作业 -ErrorAction SilentlyContinue
+						Receive-Job -Job $项.供给作业 -ErrorAction SilentlyContinue | Where-Object { -not ([string]$_).StartsWith('__VSI_PROGRESS__') } | ForEach-Object { Write-Host ([string]$_) }
+					}
 					Receive-Job -Job $项.下载作业 -ErrorAction SilentlyContinue | Where-Object { -not ([string]$_).StartsWith('__VSI_PROGRESS__') } | ForEach-Object {
 						$剩余行 = [string]$_
 						if ($剩余行.StartsWith('__VSI_EVENT__')) { Write-Output $剩余行 } else { Write-Host $剩余行 }
 					}
 					Remove-Job -Job $项.下载作业 -Force -ErrorAction SilentlyContinue
+					if ($null -ne $项.供给作业) { Remove-Job -Job $项.供给作业 -Force -ErrorAction SilentlyContinue }
 					$获胜包路径 = if ($获胜方 -eq '本地供给') { $项.本地包路径 } else { $项.远程包路径 }
 					if (-not (Test-Path -LiteralPath $获胜包路径)) { throw ('竞速决出的包不存在: {0}' -f $获胜包路径) }
 					$结果表[$产物名] = $获胜包路径
@@ -409,12 +422,14 @@ function 竞速-全部产物 {
 			foreach ($产物名 in @('CLI', '服务端')) {
 				if (-not $项表.ContainsKey($产物名) -or $状态表[$产物名].已完成) { continue }
 				Write-Host ('__VSI_SNAPSHOT__' + (@{ 端 = '远程'; 产物 = $产物名; 已下载 = [long]$状态表[$产物名].已下载; 总长度 = [long]$状态表[$产物名].总长度 } | ConvertTo-Json -Compress))
+				if ($状态表[$产物名].本地总长度 -gt 0) { Write-Host ('__VSI_SNAPSHOT__' + (@{ 端 = '本地'; 产物 = $产物名; 已下载 = [long]$状态表[$产物名].本地已下载; 总长度 = [long]$状态表[$产物名].本地总长度 } | ConvertTo-Json -Compress)) }
 			}
 			Start-Sleep -Seconds 1
 		}
 	} finally {
 		foreach ($项 in @($项表.Values)) {
 			if ($null -ne $项.PSObject.Properties['下载作业']) { Remove-Job -Job $项.下载作业 -Force -ErrorAction SilentlyContinue }
+			if ($null -ne $项.PSObject.Properties['供给作业'] -and $null -ne $项.供给作业) { Remove-Job -Job $项.供给作业 -Force -ErrorAction SilentlyContinue }
 		}
 	}
 	return $结果表
@@ -815,6 +830,8 @@ function 通过HTTP断点续传下载 {
 				try { $HTTP状态码 = [int]$异常.Response.StatusCode } catch { }
 				$异常 = $异常.InnerException
 			}
+			# 本地供给尚未发布时监听器返回 404；结构化供给作业本轮立即结束，等待下一次轮询，不产中断行也不消耗重试预算。
+			if ($结构化进度 -and $最大重试次数 -gt 0 -and ($HTTP状态码 -eq 404 -or $HTTP状态码 -eq 410)) { return }
 			if ($HTTP状态码 -eq 416 -and $已存在字节数 -gt 0) {
 				Write-Host ('服务器返回 416：文件 {0} 字节已完整，无需续传。' -f $已存在字节数)
 				return
@@ -1075,22 +1092,11 @@ if ($启用竞速) {
 	# 单边断网时由另一边补上：远端连不上下载服务器就等本地供给，本地下载失败就等远程自下载
 		# 清建暂存目录：只清会让本轮误判的标记与残留完成包，**绝不整删目录**（并发连接的在途上传会被毁掉，详见 清理-竞速暂存目录）
 		清理-竞速暂存目录 -暂存目录 $暂存目录
-	# -R 转发供给优先：本地模块已把待装包下载到本地缓存（连接前完成），这里经回环转发通道拉取（局域网速度）；成功即视为就位，失败回退官方源竞速自下载。
-	# 必须在清建之后拉取（清建会删残留完成包与标记），且只拉供给包列表里真正存在的包。
-	$CLI供给成功 = $false
-	$服务端供给成功 = $false
-	if ($供给地址 -ne '') {
-		if ((-not $CLI已就位) -and ($供给包列表 -contains 'LOCAL_CLI.zip')) {
-			$CLI供给成功 = 获取-本地供给包 -产物名 'CLI' -包名 'LOCAL_CLI.zip' -完成标记名 ('LOCAL_CLI_DONE.{0}' -f $系统架构) -暂存目录 $暂存目录 -供给地址 $供给地址
-		}
-		if ((-not $服务端已就绪) -and ($供给包列表 -contains 'LOCAL.zip')) {
-			$服务端供给成功 = 获取-本地供给包 -产物名 '服务端' -包名 'LOCAL.zip' -完成标记名 ('LOCAL_DONE.{0}' -f $系统架构) -暂存目录 $暂存目录 -供给地址 $供给地址
-		}
-	}
-	# 供给触发标记：Linux 帧路径的本地供给听到此行才启动（Windows -R 路径供给已在连接前终局，回调忽略此标记）；只报仍需竞速的产物。
+	# -R 转发供给与官方源自下载同时启动：供给作业等待本地包就绪后拉取，官方源作业立即开始，完成标记先到者获胜。
+	# 供给触发标记：Linux 帧路径的本地供给听到此行才启动（Windows -R 路径供给已在连接前启动，回调忽略此标记）；只报仍需竞速的产物。
 	$待装产物名 = @()
-	if ((-not $CLI已就位) -and (-not $CLI供给成功)) { $待装产物名 += 'CLI' }
-	if ((-not $服务端已就绪) -and (-not $服务端供给成功)) { $待装产物名 += '服务端' }
+	if (-not $CLI已就位) { $待装产物名 += 'CLI' }
+	if (-not $服务端已就绪) { $待装产物名 += '服务端' }
 	if ($待装产物名.Count -gt 0) {
 		Write-Host ('__接管预备完成__{0}' -f ($待装产物名 -join ' '))
 	}
@@ -1098,21 +1104,18 @@ if ($启用竞速) {
 	$下载函数文本 = (Get-Command '通过HTTP断点续传下载').Definition
 	$CLI参数 = $null
 	$服务端参数 = $null
-	if ((-not $CLI已就位) -and (-not $CLI供给成功)) {
-		$CLI参数 = @{ 产物名 = 'CLI'; 下载地址 = $CLI信息.下载地址; 远程包路径 = (Join-Path $暂存目录 'REMOTE_CLI.zip'); 远程完成标记 = (Join-Path $暂存目录 'REMOTE_CLI_DONE'); 本地包路径 = (Join-Path $暂存目录 'LOCAL_CLI.zip'); 本地完成标记 = (Join-Path $暂存目录 ('LOCAL_CLI_DONE.{0}' -f $系统架构)); 本地取消标记 = (Join-Path $暂存目录 'LOCAL_CLI_CANCEL'); 下载函数文本 = $下载函数文本 }
+	if (-not $CLI已就位) {
+		$CLI参数 = @{ 产物名 = 'CLI'; 下载地址 = $CLI信息.下载地址; 远程包路径 = (Join-Path $暂存目录 'REMOTE_CLI.zip'); 远程完成标记 = (Join-Path $暂存目录 'REMOTE_CLI_DONE'); 本地包路径 = (Join-Path $暂存目录 'LOCAL_CLI.zip'); 本地完成标记 = (Join-Path $暂存目录 ('LOCAL_CLI_DONE.{0}' -f $系统架构)); 本地取消标记 = (Join-Path $暂存目录 'LOCAL_CLI_CANCEL'); 下载函数文本 = $下载函数文本; 供给地址 = $供给地址; 供给包名 = 'LOCAL_CLI.zip' }
 	}
-	if ((-not $服务端已就绪) -and (-not $服务端供给成功)) {
-		$服务端参数 = @{ 产物名 = '服务端'; 下载地址 = $下载地址; 远程包路径 = (Join-Path $暂存目录 'REMOTE.zip'); 远程完成标记 = (Join-Path $暂存目录 'REMOTE_DONE'); 本地包路径 = (Join-Path $暂存目录 'LOCAL.zip'); 本地完成标记 = (Join-Path $暂存目录 ('LOCAL_DONE.{0}' -f $系统架构)); 本地取消标记 = (Join-Path $暂存目录 'LOCAL_CANCEL'); 下载函数文本 = $下载函数文本 }
+	if (-not $服务端已就绪) {
+		$服务端参数 = @{ 产物名 = '服务端'; 下载地址 = $下载地址; 远程包路径 = (Join-Path $暂存目录 'REMOTE.zip'); 远程完成标记 = (Join-Path $暂存目录 'REMOTE_DONE'); 本地包路径 = (Join-Path $暂存目录 'LOCAL.zip'); 本地完成标记 = (Join-Path $暂存目录 ('LOCAL_DONE.{0}' -f $系统架构)); 本地取消标记 = (Join-Path $暂存目录 'LOCAL_CANCEL'); 下载函数文本 = $下载函数文本; 供给地址 = $供给地址; 供给包名 = 'LOCAL.zip' }
 	}
 	$全部竞速结果 = 竞速-全部产物 -CLI参数 $CLI参数 -服务端参数 $服务端参数
-	$CLI获胜包路径 = if ($CLI供给成功) { Join-Path $暂存目录 'LOCAL_CLI.zip' } else { $全部竞速结果.CLI }
-	$获胜包路径 = if ($服务端供给成功) { Join-Path $暂存目录 'LOCAL.zip' } else { $全部竞速结果.服务端 }
+	$CLI获胜包路径 = $全部竞速结果.CLI
+	$获胜包路径 = $全部竞速结果.服务端
 	if ($待装产物名.Count -gt 0) {
 		# 至少一个产物竞速决出：该行触发主流程立即击杀本地供给进程树（零轮询即时取消）
 		Write-Host '竞速获胜：全部产物已就位，开始安装。'
-	}
-	elseif ($CLI供给成功 -or $服务端供给成功) {
-		Write-Host '供给包已经转发通道就位：跳过竞速，直接进入安装。'
 	}
 	else {
 		# CLI 与服务端均已就位时根本没发生竞速与下载，如实说明，避免"竞速获胜/下载地址"被误读成每次连接都在重新下载
