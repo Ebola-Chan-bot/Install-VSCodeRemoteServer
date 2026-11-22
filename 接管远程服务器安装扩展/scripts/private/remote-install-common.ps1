@@ -295,27 +295,46 @@ function 竞速-单个产物 {
 	$供给作业 = $null
 	if ($仅启动 -and $供给地址 -ne '' -and $供给包名 -ne '') {
 		$供给作业 = Start-Job -ScriptBlock {
-			param($下载函数文本, $地址, $产物, $包名, $标记名, $目录)
+			param($下载函数文本, $地址, $产物, $包名, $标记名, $取消标记, $目录)
 			$ErrorActionPreference = 'Continue'
 			[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 			Invoke-Expression ('function 通过HTTP断点续传下载 { ' + $下载函数文本 + ' }')
 			$成品路径 = Join-Path $目录 $包名
 			$在途路径 = $成品路径 + '.supplying-' + $PID
 			Write-Output ('[本地供给-{0}] 已加入竞速：等待本地包就绪后经转发通道拉取。' -f $产物)
-			while ($true) {
+			$就绪 = $false
+			$探测地址 = $地址.TrimEnd('/') + '/' + $包名
+			while (-not $就绪 -and -not (Test-Path -LiteralPath (Join-Path $目录 $取消标记))) {
 				try {
-					通过HTTP断点续传下载 -下载地址 ($地址.TrimEnd('/') + '/' + $包名) -目标路径 $在途路径 -端标注 ('[本地供给-{0}]' -f $产物) -最大重试次数 5 -结构化进度 $true
-					if (-not (Test-Path -LiteralPath $在途路径)) { throw '供给包未落盘' }
-					Move-Item -LiteralPath $在途路径 -Destination $成品路径 -Force -ErrorAction Stop
-					New-Item -ItemType File -Force (Join-Path $目录 $标记名) | Out-Null
-					Write-Output ('[本地供给-{0}] 供给包已经转发通道拉取并落位（{1} 字节）。' -f $产物, (Get-Item -LiteralPath $成品路径).Length)
-					break
+					$请求 = [System.Net.HttpWebRequest]::Create($探测地址)
+					$请求.Method = 'HEAD'
+					$请求.Timeout = 2000
+					$响应 = [System.Net.HttpWebResponse]$请求.GetResponse()
+					try { $就绪 = ([int]$响应.StatusCode -eq 200 -and $响应.ContentLength -gt 0) } finally { $响应.Close() }
 				} catch {
-					Remove-Item -LiteralPath $在途路径 -Force -ErrorAction SilentlyContinue
-					Start-Sleep -Seconds 2
+					Start-Sleep -Seconds 1
 				}
 			}
-		} -ArgumentList $下载函数文本, $供给地址, $产物名, $供给包名, $本地完成标记, (Split-Path -Parent $本地包路径)
+			if ($就绪 -and -not (Test-Path -LiteralPath (Join-Path $目录 $取消标记))) {
+				$阶段 = 'HTTP 下载'
+				try {
+					通过HTTP断点续传下载 -下载地址 $探测地址 -目标路径 $在途路径 -端标注 ('[远端转发-{0}]' -f $产物) -最大重试次数 5 -结构化进度 $true
+					$阶段 = '在途文件检查'
+					if (-not (Test-Path -LiteralPath $在途路径)) { throw '供给包未落盘' }
+					$阶段 = '改名发布'
+					Move-Item -LiteralPath $在途路径 -Destination $成品路径 -Force -ErrorAction Stop
+					$阶段 = '写完成标记'
+					New-Item -ItemType File -Force $标记名 | Out-Null
+					$阶段 = '读取成品信息'
+					Write-Output ('[远端转发-{0}] 本地供给包拉取完成（{1} 字节）。' -f $产物, (Get-Item -LiteralPath $成品路径).Length)
+				} catch {
+					$异常文本 = $_.Exception.ToString() -replace '\s+', ' '
+					Write-Output ('[远端转发-{0}] 供给阶段失败（{1}）：目录=[{2}] 成品=[{3}] 在途=[{4}] 标记=[{5}] 异常={6}' -f $产物, $阶段, $目录, $成品路径, $在途路径, $标记名, $异常文本)
+					Remove-Item -LiteralPath $在途路径 -Force -ErrorAction SilentlyContinue
+					if ($_.Exception -is [System.NotSupportedException] -or $_.Exception -is [System.ArgumentException]) { return }
+				}
+			}
+		} -ArgumentList $下载函数文本, $供给地址, $产物名, $供给包名, $本地完成标记, $本地取消标记, (Split-Path -Parent $本地包路径)
 	}
 	if ($仅启动) {
 		return [pscustomobject]@{ 产物名 = $产物名; 下载作业 = $下载作业; 供给作业 = $供给作业; 远程包路径 = $远程包路径; 远程完成标记 = $远程完成标记; 本地包路径 = $本地包路径; 本地完成标记 = $本地完成标记; 本地取消标记 = $本地取消标记 }
@@ -1123,80 +1142,83 @@ if ($启用竞速) {
 	}
 }
 
-# ===== 安装 CLI（Remote-SSH 引导的启动入口，server 由它拉起，二者缺一不可，故先补 CLI）=====
-if ($CLI已就位) {
-	Write-Host ('CLI 已存在，跳过安装: {0}' -f $CLI信息.落地路径)
-} elseif (($null -ne $CLI获胜包路径) -and (测试-压缩包完整 $CLI获胜包路径)) {
-	安装-CLI压缩包 -压缩包路径 $CLI获胜包路径 -CLI信息 $CLI信息
-} else {
-	if ($null -ne $CLI获胜包路径) {
-		Write-Host ('警告: 竞速决出的 CLI 包不完整（疑似截断），弃用并改由远程下载: {0}' -f $CLI获胜包路径)
-		Remove-Item -LiteralPath $CLI获胜包路径 -Force -ErrorAction SilentlyContinue
+# ===== 安装 CLI 与 Server 的共享目录变更串行化：下载竞速已在锁外完成；锁只覆盖 CLI 落位、Server 清理/解压，避免同提交号的并发连接互删目录。锁文件放在稳定数据目录，安装目录清理不会删除锁。=====
+$安装锁目录 = Join-Path (Join-Path $HOME $(if ($发布通道 -eq 'insider') { '.vscode-server-insiders' } else { '.vscode-server' })) 'install-locks'
+New-Item -ItemType Directory -Force -Path $安装锁目录 | Out-Null
+$安装锁路径 = Join-Path $安装锁目录 ('.vsi-install-{0}.lock' -f $提交号)
+$安装锁流 = $null
+$安装锁起始 = Get-Date
+Write-Host ('等待同提交号安装锁：{0}' -f $提交号)
+while ($null -eq $安装锁流) {
+	try { $安装锁流 = [System.IO.File]::Open($安装锁路径, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None) }
+	catch [System.IO.IOException] {
+		if (((Get-Date) - $安装锁起始).TotalMinutes -ge 30) { throw ('等待同提交号安装锁超过 30 分钟：{0}' -f $安装锁路径) }
+		Start-Sleep -Seconds 1
 	}
-	安装-远程CLI -CLI信息 $CLI信息
 }
-
-if ($服务端已就绪) {
-	# Remote-SSH 的 CLI 用 server 目录下的 product.json 与 bin 判定安装完整性，同提交号且结构完整则直接复用，避免重复下载约 190MB 的 Server 压缩包
-	Write-Host ('同提交号的 Server 已完整安装，跳过下载与解压: {0}' -f $最终安装目录)
-	# 表格经 Out-String 转为单字符串后由 Write-Host 输出：避免成功流与信息流在 SSH 管道合并时缺换行，导致表格与上一行粘连
+try {
+	Write-Host ('已取得同提交号安装锁（等待 {0:N1} 秒）。' -f ((Get-Date) - $安装锁起始).TotalSeconds)
+	$CLI已就位 = Test-Path -LiteralPath $CLI信息.落地路径
+	$服务端已就绪 = (Test-Path -LiteralPath (Join-Path $最终安装目录 'product.json')) -and (Test-Path -LiteralPath (Join-Path $最终安装目录 'bin'))
+	if ($服务端已就绪) {
+		Write-Host ('同提交号的 Server 已由并行安装会话完整安装，跳过清理与解压: {0}' -f $最终安装目录)
+		$目录表格 = (Get-ChildItem -Force $最终安装目录 | Select-Object Name, Length, Mode | Format-Table -AutoSize | Out-String).TrimEnd()
+		Write-Host $目录表格
+		if ('__清理未认证连接__' -eq '1') { 清理-未认证SSH残留代理 }
+		return
+	}
+	if ($CLI已就位 -and $null -ne $CLI获胜包路径) {
+		Write-Host ('CLI 已由并行安装会话就位，跳过重复安装: {0}' -f $CLI信息.落地路径)
+		$CLI获胜包路径 = $null
+	}
+	if ($CLI已就位) {
+		Write-Host ('CLI 已存在，跳过安装: {0}' -f $CLI信息.落地路径)
+	} elseif (($null -ne $CLI获胜包路径) -and (测试-压缩包完整 $CLI获胜包路径)) {
+		安装-CLI压缩包 -压缩包路径 $CLI获胜包路径 -CLI信息 $CLI信息
+	} else {
+		if ($null -ne $CLI获胜包路径) {
+			Write-Host ('警告: 竞速决出的 CLI 包不完整（疑似截断），弃用并改由远程下载: {0}' -f $CLI获胜包路径)
+			Remove-Item -LiteralPath $CLI获胜包路径 -Force -ErrorAction SilentlyContinue
+		}
+		安装-远程CLI -CLI信息 $CLI信息
+	}
+	if ($服务端已就绪) {
+		Write-Host ('同提交号的 Server 已完整安装，跳过下载与解压: {0}' -f $最终安装目录)
+		$目录表格 = (Get-ChildItem -Force $最终安装目录 | Select-Object Name, Length, Mode | Format-Table -AutoSize | Out-String).TrimEnd()
+		Write-Host $目录表格
+		if ('__清理未认证连接__' -eq '1') { 清理-未认证SSH残留代理 }
+		return
+	}
+	停止-占用安装目录的进程 -安装目录 $最终安装目录 -版本提交号 $提交号
+	if (Test-Path $最终安装目录) { Remove-Item $最终安装目录 -Recurse -Force -ErrorAction SilentlyContinue }
+	New-Item -ItemType Directory -Force $最终安装目录 | Out-Null
+	if (-not $启用竞速) {
+		Write-Host '开始通过 HTTP 断点续传下载压缩包。'
+		通过HTTP断点续传下载 -下载地址 $下载地址 -目标路径 $下载压缩包路径
+	}
+	$候选包列表 = @($获胜包路径)
+	if ($启用竞速) { $候选包列表 += (Join-Path $暂存目录 'LOCAL.zip'); $候选包列表 += (Join-Path $暂存目录 'REMOTE.zip') }
+	$候选包列表 += $下载压缩包路径
+	$可用包路径 = ''
+	foreach ($候选包 in ($候选包列表 | Select-Object -Unique)) {
+		if ([string]::IsNullOrWhiteSpace($候选包) -or -not (Test-Path -LiteralPath $候选包)) { continue }
+		if (测试-压缩包完整 $候选包) { $可用包路径 = $候选包; break }
+		Write-Host ('警告: 压缩包不完整（疑似截断），弃用: {0}' -f $候选包)
+		Remove-Item -LiteralPath $候选包 -Force -ErrorAction SilentlyContinue
+	}
+	if ($可用包路径 -eq '') {
+		Write-Host '所有候选压缩包均不可用，前台重新下载。'
+		Remove-Item -LiteralPath $下载压缩包路径 -Force -ErrorAction SilentlyContinue
+		通过HTTP断点续传下载 -下载地址 $下载地址 -目标路径 $下载压缩包路径
+		if (测试-压缩包完整 $下载压缩包路径) { $可用包路径 = $下载压缩包路径 } else { throw ('重新下载的压缩包仍不完整: {0}' -f $下载压缩包路径) }
+	}
+	Write-Host '下载完成，开始解压。'
+	展开-服务器压缩包 -压缩包路径 $可用包路径 -目标目录 $最终安装目录
+	if (-not [string]::IsNullOrWhiteSpace($暂存目录)) { 清理-竞速暂存目录 -暂存目录 $暂存目录 }
+	Write-Host '安装完成，当前目录内容如下。'
 	$目录表格 = (Get-ChildItem -Force $最终安装目录 | Select-Object Name, Length, Mode | Format-Table -AutoSize | Out-String).TrimEnd()
 	Write-Host $目录表格
 	if ('__清理未认证连接__' -eq '1') { 清理-未认证SSH残留代理 }
-	return
+} finally {
+	if ($null -ne $安装锁流) { $安装锁流.Dispose() }
 }
-
-停止-占用安装目录的进程 -安装目录 $最终安装目录 -版本提交号 $提交号
-
-if (Test-Path $最终安装目录) {
-	Remove-Item $最终安装目录 -Recurse -Force -ErrorAction SilentlyContinue
-}
-
-New-Item -ItemType Directory -Force $最终安装目录 | Out-Null
-
-if (-not $启用竞速) {
-	Write-Host '开始通过 HTTP 断点续传下载压缩包。'
-	通过HTTP断点续传下载 -下载地址 $下载地址 -目标路径 $下载压缩包路径
-}
-
-# 选取完整包：任何一侧的包都可能因网络截断损坏（坏包解压只会报晦涩的 End of Central Directory 错误），逐候选校验、坏包弃用换下一个，全不可用则回退前台重下自愈
-$候选包列表 = @($获胜包路径)
-if ($启用竞速) {
-	$候选包列表 += (Join-Path $暂存目录 'LOCAL.zip')
-	$候选包列表 += (Join-Path $暂存目录 'REMOTE.zip')
-}
-$候选包列表 += $下载压缩包路径
-$可用包路径 = ''
-foreach ($候选包 in ($候选包列表 | Select-Object -Unique)) {
-	if ([string]::IsNullOrWhiteSpace($候选包) -or -not (Test-Path -LiteralPath $候选包)) { continue }
-	if (测试-压缩包完整 $候选包) {
-		$可用包路径 = $候选包
-		break
-	}
-	Write-Host ('警告: 压缩包不完整（疑似截断），弃用: {0}' -f $候选包)
-	Remove-Item -LiteralPath $候选包 -Force -ErrorAction SilentlyContinue
-}
-if ($可用包路径 -eq '') {
-	Write-Host '所有候选压缩包均不可用，前台重新下载。'
-	Remove-Item -LiteralPath $下载压缩包路径 -Force -ErrorAction SilentlyContinue
-	通过HTTP断点续传下载 -下载地址 $下载地址 -目标路径 $下载压缩包路径
-	if (测试-压缩包完整 $下载压缩包路径) {
-		$可用包路径 = $下载压缩包路径
-	} else {
-		throw ('重新下载的压缩包仍不完整: {0}' -f $下载压缩包路径)
-	}
-}
-
-Write-Host '下载完成，开始解压。'
-展开-服务器压缩包 -压缩包路径 $可用包路径 -目标目录 $最终安装目录
-
-# 竞速暂存目录用完即清（本地模块收尾时也会再清一次，双保险）：同样不碰并发连接正在传的在途文件
-if (-not [string]::IsNullOrWhiteSpace($暂存目录)) {
-	清理-竞速暂存目录 -暂存目录 $暂存目录
-}
-
-Write-Host '安装完成，当前目录内容如下。'
-# 表格经 Out-String 转为单字符串后由 Write-Host 输出：避免成功流与信息流在 SSH 管道合并时缺换行，导致表格与上一行粘连
-$目录表格 = (Get-ChildItem -Force $最终安装目录 | Select-Object Name, Length, Mode | Format-Table -AutoSize | Out-String).TrimEnd()
-Write-Host $目录表格
-if ('__清理未认证连接__' -eq '1') { 清理-未认证SSH残留代理 }
