@@ -14,12 +14,13 @@ $开关名 = '安装VSCode远程服务.接管远程服务器安装'
 $配置文件 = Join-Path $PSScriptRoot $配置文件名
 $失败 = $false
 
-# ---- 输出：一律经「缓冲 + 周期批量刷出」，连早期错误也不例外 ----
-# Remote-SSH 记录 preconnect 输出时把每个数据块按换行切分：块内多行用 \n 连接、块尾不带换行，切分后即连续行，不会多出空行；逐行带换行写则每行后被补一个空行；两块紧挨着到达又会被读端合并成一个块，块间没有分隔符就会把前块末行与后块首行并成一行，故批间隔取 1 秒。不用独立刷写线程：PowerShell 的定时器回调必须在所属 runspace 的线程上执行，主线程忙于管道时回调根本不会触发。
-#
+# ---- 输出：缓冲 + 后台刷写线程（1 秒批间隔），连早期错误也不例外 ----
+# Remote-SSH 记录 preconnect 输出时把每个数据块按换行切分：块内多行用 \n 连接、块尾不带换行，切分后即连续行，不会多出空行；逐行带换行写则每行后被补一个空行；两块紧挨着到达又会被读端合并成一个块，块间没有分隔符就会把前块末行与后块首行并成一行，故批间隔取 1 秒。
+# 刷出必须按时间驱动、由独立线程完成，不能等下一行到达再刷：统一竞速汇报一个 tick 连打的「本地+远程」两行，旧行为在首行到达时立即刷出、次行滞留缓冲里等下一次任意输出才带出，VS Code 按刷出时刻盖时间戳，成对两行被错开十几秒，看起来像两处按不同节奏独立汇报（2026-11-24 用户实测误读）。PowerShell 的定时器回调要靠所属 runspace 泵消息、主线程忙于管道时根本不触发，故用独立 runspace 线程每 250 毫秒醒一次，缓冲非空且距上次写出满 1 秒即整块刷出——一个 tick 的行必然同批同刻送达。
 # 写出一律走标准输出的原始字节流，不用 Write-Host：实测 Write-Host 经宿主写出端按 256 字节缓冲切块，单次写出超过 256 字节必然被拆成多块，读端就会在行中间断开（如实测出现的“远程登录目录: /home_data/home/slst” + “/v-jiamh”），极端情况还会把一个 UTF-8 多字节字符切成两半变成乱码；而 OpenStandardOutput 的字节流一次 Write+Flush 实测能整批送达（600 B ~ 70 KB 均为完整一块、零乱码），于是每次刷出恰好对应读端一个数据块，行不会被腰斩。
-$缓冲 = [System.Collections.Generic.List[string]]::new()
-$上次刷出 = [DateTime]::MinValue
+$缓冲 = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+$缓冲锁 = New-Object object
+$共享状态 = [hashtable]::Synchronized(@{ 上次刷出 = [DateTime]::MinValue })
 $标准输出流 = $null
 try { $标准输出流 = [Console]::OpenStandardOutput() } catch { $标准输出流 = $null }
 
@@ -40,20 +41,56 @@ function 写出文本([string]$文本) {
 }
 
 function 刷出缓冲([switch]$补足间隔) {
-	$行 = @($script:缓冲 | Where-Object { $_ -ne '' })
-	$script:缓冲.Clear()
-	if ($行.Count -eq 0) { return }
 	# 收尾或报错时距上次写出可能不足 1 秒，补足间隔以免与上一块被读端合并成一行
-	if ($补足间隔 -and $script:上次刷出 -ne [DateTime]::MinValue) {
-		$等待 = 1.0 - ([DateTime]::Now - $script:上次刷出).TotalSeconds
+	if ($补足间隔 -and [datetime]$script:共享状态.上次刷出 -ne [DateTime]::MinValue) {
+		$等待 = 1.0 - ([DateTime]::Now - [datetime]$script:共享状态.上次刷出).TotalSeconds
 		if ($等待 -gt 0) { Start-Sleep -Seconds $等待 }
 	}
-	写出文本 ($行 -join [char]10)
-	$script:上次刷出 = [DateTime]::Now
+	# 排干与写出必须原子，否则后台刷写线程可能清掉刚入列还没写出的行；写出串行化避免两线程的字节互相穿插
+	[System.Threading.Monitor]::Enter($script:缓冲锁)
+	try {
+		$行 = @($script:缓冲)
+		$script:缓冲.Clear()
+		$行 = @($行 | Where-Object { $_ -ne '' })
+		if ($行.Count -gt 0) {
+			写出文本 ($行 -join [char]10)
+			$script:共享状态.上次刷出 = [DateTime]::Now
+		}
+	} finally { [System.Threading.Monitor]::Exit($script:缓冲锁) }
 }
 
+# 后台刷写线程：独立 runspace 每 250 毫秒醒一次，缓冲非空且距上次写出满 1 秒（读端合并粒度）即整块刷出；刷完即散，进程退出时随进程终止。
+$刷写空间 = [runspacefactory]::CreateRunspace()
+$刷写空间.Open()
+$刷写空间.SessionStateProxy.SetVariable('缓冲', $缓冲)
+$刷写空间.SessionStateProxy.SetVariable('缓冲锁', $缓冲锁)
+$刷写空间.SessionStateProxy.SetVariable('共享状态', $共享状态)
+$刷写空间.SessionStateProxy.SetVariable('标准输出流', $标准输出流)
+$刷写PS = [powershell]::Create()
+$刷写PS.Runspace = $刷写空间
+[void]$刷写PS.AddScript({
+	while ($true) {
+		Start-Sleep -Milliseconds 250
+		[System.Threading.Monitor]::Enter($缓冲锁)
+		try {
+			if ($缓冲.Count -gt 0 -and ((Get-Date) - ([datetime]$共享状态.上次刷出)).TotalSeconds -ge 1) {
+				$行 = @($缓冲)
+				$缓冲.Clear()
+				$行 = @($行 | Where-Object { $_ -ne '' })
+				if ($行.Count -gt 0) {
+					$字节 = [Text.Encoding]::UTF8.GetBytes(($行 -join [string][char]10))
+					$标准输出流.Write($字节, 0, $字节.Length)
+					$标准输出流.Flush()
+					$共享状态.上次刷出 = [DateTime]::Now
+				}
+			}
+		} catch { } finally { [System.Threading.Monitor]::Exit($缓冲锁) }
+	}
+})
+$null = $刷写PS.BeginInvoke()
+
 function 报错退出($消息) {
-	$script:缓冲.Add('[接管安装] ' + $消息)
+	$null = $script:缓冲.Add('[接管安装] ' + $消息)
 	刷出缓冲 -补足间隔
 	exit 1
 }
@@ -90,7 +127,7 @@ if (Test-Path -LiteralPath $脚本路径) {
 		if (Test-Path -LiteralPath $副本) { $替代 = $副本; break }
 	}
 	if ($null -eq $替代) { 报错退出 ('配置中的安装脚本不存在，且在 {0} 通道未找到替代副本：{1}' -f $通道目录名, $脚本路径) }
-	$script:缓冲.Add(('[接管安装] 配置中的旧脚本路径已失效，改用同一 VS Code 通道的现有脚本: {0}' -f $替代))
+		$null = $script:缓冲.Add(('[接管安装] 配置中的旧脚本路径已失效，改用同一 VS Code 通道的现有脚本: {0}' -f $替代))
 	$脚本路径 = $替代
 }
 $本地版本 = [string]$配置.本地版本
@@ -100,7 +137,7 @@ $启用保活 = @($配置.保活主机) -contains $远程主机
 $启用清理未认证连接 = @($配置.清理未认证连接主机) -contains $远程主机
 if (-not $启用接管 -and -not $启用保活) {
 	# 自调方式的薄脚本可能仍被用户粘贴的调用行引用；主机被取消勾选后这里应安静无事（非失败）
-	$script:缓冲.Add(('[接管安装] 主机 {0} 未启用接管或保活（可能刚被取消勾选），本次未处理。' -f $远程主机))
+	$null = $script:缓冲.Add(('[接管安装] 主机 {0} 未启用接管或保活（可能刚被取消勾选），本次未处理。' -f $远程主机))
 	刷出缓冲 -补足间隔
 	exit 0
 }
@@ -132,11 +169,9 @@ if (-not $启用接管 -and -not $启用保活) {
 		}
 	}
 } *>&1 | ForEach-Object {
-	$script:缓冲.Add([string]$_)
+	# 入列即可，刷出由后台线程按时间驱动（见上方注释）；同步列表保证与刷写线程并发安全，Add 的整型返回值必须吞掉否则索引数字混进输出流
+	$null = $script:缓冲.Add([string]$_)
 	if ($_ -is [System.Management.Automation.ErrorRecord]) { $script:失败 = $true }
-	if (([DateTime]::Now - $script:上次刷出).TotalSeconds -ge 1) {
-		刷出缓冲
-	}
 }
 
 刷出缓冲 -补足间隔

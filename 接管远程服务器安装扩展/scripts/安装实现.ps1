@@ -1221,7 +1221,6 @@ function 执行-扩展安装 {
 		# 上传器 = 独立 runspace 线程：消费本次运行的 race-supply-<提交号>-*.job 交接文件（供给下载完成后写入）并按“文件帧→命令帧”序送出；按提交号过滤，历史残留的交接文件（旧提交号大包）不碰，否则会被拖死。
 		# 与主线程（读输出）双工占用同一会话：写 stdin 的只有本线程（阶段帧在它启动前已送完），无并发写入风险。
 		# 事件经 $script:帧上传事件队列 交主线程上屏（开始/写毕/失败原因）；大帧 Write 在远端接收器消费前会合法阻塞（管道背压），事件行让等待可见而非静默。同一交接连续失败 5 次即丢弃并上报（数据文件保留），防坏交接无限重试；每次尝试用新的会话唯一落盘名。
-		$供给表 = [hashtable]::Synchronized($供给表)
 		$运行空间 = [runspacefactory]::CreateRunspace()
 		$运行空间.Open()
 		$运行空间.SessionStateProxy.SetVariable('输入流', $会话.标准输入.BaseStream)
@@ -1588,6 +1587,8 @@ function 执行-扩展安装 {
 			try { $监听.Close() } catch { }
 			return $null
 		}
+		# 供给表跨主线程与 runspace 共享，套同步包装防并发读写；必须在这里而不是别处（曾误插进 启动-帧上传器，那里没有供给表，Synchronized($null) 当场炸）
+		$供给表 = [hashtable]::Synchronized($供给表)
 		$运行空间 = [runspacefactory]::CreateRunspace()
 		$运行空间.Open()
 		$运行空间.SessionStateProxy.SetVariable('监听器', $监听)
