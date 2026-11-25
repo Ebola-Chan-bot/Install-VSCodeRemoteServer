@@ -381,7 +381,7 @@ function 竞速-全部产物 {
 		if ($null -eq $参数) { continue }
 		$项 = 竞速-单个产物 @参数 -仅启动
 		$项表[$产物名] = $项
-		$状态表[$产物名] = @{ 已下载 = 0L; 总长度 = 0L; 本地已下载 = 0L; 本地总长度 = 0L; 已完成 = $false }
+		$状态表[$产物名] = @{ 已下载 = 0L; 总长度 = 0L; 本地已下载 = 0L; 本地总长度 = 0L; 已完成 = $false; 已收进度 = $false }
 		if ($null -eq $项.PSObject.Properties['下载作业']) {
 			$状态表[$产物名].已完成 = $true
 			$结果表[$产物名] = $项.获胜包路径
@@ -407,6 +407,7 @@ function 竞速-全部产物 {
 							$进度 = $行.Substring(16) | ConvertFrom-Json
 							$状态表[$产物名].已下载 = [long]$进度.已下载
 							$状态表[$产物名].总长度 = [long]$进度.总长度
+							$状态表[$产物名].已收进度 = $true
 						} catch { }
 					} elseif ($行.StartsWith('__VSI_EVENT__')) {
 						Write-Output $行
@@ -440,6 +441,8 @@ function 竞速-全部产物 {
 			if (@($项表.Keys | Where-Object { -not $状态表[$_].已完成 }).Count -eq 0) { break }
 			foreach ($产物名 in @('CLI', '服务端')) {
 				if (-not $项表.ContainsKey($产物名) -or $状态表[$产物名].已完成) { continue }
+				# 下载作业首份真实进度之前不发快照：默认零值会被主流程标成「已就绪」而打印「已传 0 字节」（与本地协调器同一道门）。
+				if (-not $状态表[$产物名].已收进度) { continue }
 				Write-Host ('__VSI_SNAPSHOT__' + (@{ 端 = '远程'; 产物 = $产物名; 已下载 = [long]$状态表[$产物名].已下载; 总长度 = [long]$状态表[$产物名].总长度 } | ConvertTo-Json -Compress))
 				if ($状态表[$产物名].本地总长度 -gt 0) { Write-Host ('__VSI_SNAPSHOT__' + (@{ 端 = '本地'; 产物 = $产物名; 已下载 = [long]$状态表[$产物名].本地已下载; 总长度 = [long]$状态表[$产物名].本地总长度 } | ConvertTo-Json -Compress)) }
 			}

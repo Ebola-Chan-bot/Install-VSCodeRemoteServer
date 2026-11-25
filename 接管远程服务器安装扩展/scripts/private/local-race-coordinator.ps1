@@ -23,10 +23,11 @@ function 接收-作业输出($产物名) {
 			try {
 				$进度 = $行.Substring(16) | ConvertFrom-Json
 				if (-not $状态表.ContainsKey($产物名)) {
-					$状态表[$产物名] = @{ 已下载 = 0L; 总长度 = 0L; 起始时刻 = Get-Date; 汇报完成 = $false }
+					$状态表[$产物名] = @{ 已下载 = 0L; 总长度 = 0L; 起始时刻 = Get-Date; 汇报完成 = $false; 已收进度 = $false }
 				}
 				$状态表[$产物名].已下载 = [long]$进度.已下载
 				$状态表[$产物名].总长度 = [long]$进度.总长度
+				$状态表[$产物名].已收进度 = $true
 			} catch { }
 			continue
 		}
@@ -49,7 +50,8 @@ function 发送-统一快照 {
 		if (-not $作业表.ContainsKey($产物名)) { continue }
 		$状态 = $状态表[$产物名]
 		$作业 = $作业表[$产物名]
-		if ($状态.汇报完成 -or $作业.State -in @('Completed', 'Failed', 'Stopped')) { continue }
+		# 子进程首份真实进度之前不发快照：默认零值会被主流程标成「已就绪」，抢在启动消息后打印「已传 0 字节」；门必须设在源头，主流程分不清真实 0 与默认 0。
+		if ($状态.汇报完成 -or (-not $状态.已收进度) -or $作业.State -in @('Completed', 'Failed', 'Stopped')) { continue }
 		Write-Output ('__VSI_SNAPSHOT__' + (@{ 端 = '本地'; 产物 = $产物名; 已下载 = [long]$状态.已下载; 总长度 = [long]$状态.总长度 } | ConvertTo-Json -Compress))
 	}
 }
@@ -68,7 +70,7 @@ try {
 			param($脚本, $单参数)
 			& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $脚本 $单参数 2>&1 | ForEach-Object { [string]$_ }
 		}
-		$状态表[$产物名] = @{ 已下载 = 0L; 总长度 = 0L; 起始时刻 = Get-Date; 汇报完成 = $false }
+		$状态表[$产物名] = @{ 已下载 = 0L; 总长度 = 0L; 起始时刻 = Get-Date; 汇报完成 = $false; 已收进度 = $false }
 	}
 	while ($true) {
 		foreach ($产物名 in @($作业表.Keys)) {
